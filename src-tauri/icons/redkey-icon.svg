@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <mask id="r-cutout">
+    <rect width="1024" height="1024" fill="#fff"/>
+    <path fill="#000" fill-rule="evenodd" d="M320 724V300h218c112 0 178 55 178 150 0 65-32 118-96 146l126 128H596L488 620h-48v104H320Zm120-214h86c37 0 60-18 60-53 0-37-23-52-60-52h-86v105Z"/>
+  </mask>
+  <rect x="112" y="112" width="800" height="800" rx="192" fill="#fff" mask="url(#r-cutout)"/>
+</svg>

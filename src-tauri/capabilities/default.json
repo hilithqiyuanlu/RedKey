@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Permissions for RedKey desktop windows",
+  "windows": ["console", "pet", "quick-panel", "hud"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-cursor-position",
+    "core:window:allow-start-dragging",
+    "clipboard-manager:allow-read-text",
+    "clipboard-manager:allow-write-text"
+  ]
+}

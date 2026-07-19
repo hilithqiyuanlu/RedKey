@@ -1,0 +1,103 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "RedKey",
+  "version": "0.1.0",
+  "identifier": "com.hilith.redkey",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "console",
+        "title": "RedKey",
+        "url": "index.html?view=console",
+        "width": 1080,
+        "height": 720,
+        "minWidth": 860,
+        "minHeight": 600,
+        "center": true
+      },
+      {
+        "label": "pet",
+        "title": "RedKey Pet",
+        "url": "index.html?view=pet",
+        "width": 112,
+        "height": 112,
+        "visible": true,
+        "decorations": false,
+        "transparent": true,
+        "backgroundColor": "#00000000",
+        "alwaysOnTop": true,
+        "acceptFirstMouse": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "shadow": false
+      },
+      {
+        "label": "quick-panel",
+        "title": "RedKey Quick Panel",
+        "url": "index.html?view=quick",
+        "width": 320,
+        "height": 420,
+        "visible": false,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false
+      },
+      {
+        "label": "hud",
+        "title": "RedKey HUD",
+        "url": "index.html?view=hud",
+        "width": 2560,
+        "height": 680,
+        "visible": false,
+        "decorations": false,
+        "transparent": true,
+        "backgroundColor": "#00000000",
+        "alwaysOnTop": true,
+        "focusable": false,
+        "skipTaskbar": true,
+        "resizable": false,
+        "shadow": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; media-src 'self' blob: asset: http://asset.localhost; style-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "resources": {
+      "../workers/qwen_asr_worker.py": "workers/qwen_asr_worker.py",
+      "../workers/diarization_worker.py": "workers/diarization_worker.py"
+    },
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "Productivity",
+    "shortDescription": "A tactile task controller for Figma workflows",
+    "longDescription": "RedKey binds Figma tasks to keyboard shortcuts and keeps progress visible from a compact desktop controller.",
+    "macOS": {
+      "minimumSystemVersion": "10.15",
+      "infoPlist": "Info.plist",
+      "entitlements": "Entitlements.plist",
+      "signingIdentity": "D714C62392BCC2C26F114278A7734F18AF562AC8"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
+  }
+}

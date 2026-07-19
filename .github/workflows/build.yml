@@ -1,0 +1,39 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test-and-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Test frontend
+        run: npm run check
+      - name: Test Rust core
+        working-directory: src-tauri
+        run: cargo test
+      - name: Build macOS app
+        if: runner.os == 'macOS'
+        run: npm run tauri build -- --bundles app
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
+        run: npm run tauri build -- --bundles nsis
+      - uses: actions/upload-artifact@v4
+        with:
+          name: redkey-${{ matrix.os }}
+          path: src-tauri/target/release/bundle/**
