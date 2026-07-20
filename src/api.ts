@@ -7,8 +7,11 @@ import type {
   Snapshot,
   ShortcutSettings,
   ModelStatus,
-  ProgressHudPayload,
   TaskHudPayload,
+  TaskDocument,
+  TextCard,
+  DeepSeekSettings,
+  RecordingSummary,
   RecordingDetail,
   TitleSuggestion,
   UpdateTaskInput,
@@ -23,11 +26,11 @@ const EMPTY: Snapshot = {
   currentGroup: "red",
   groups: (["red", "amber", "purple", "green", "blue"] as const).map((id) => ({ id, name: "" })),
   settings: {
-    autostart: false,
+    autostart: true,
     petVisible: true,
-    multiGroupEnabled: true,
+    multiGroupEnabled: false,
     shortcuts: {
-      taskPrefix: "Control+Alt",
+      taskPrefix: "Control",
     },
   },
   recordings: [],
@@ -49,6 +52,16 @@ export const api = {
   setCurrentGroup: (group: string) => invoke<Snapshot>("set_current_group", { group }),
   setGroupName: (group: string, name: string) => invoke<Snapshot>("set_group_name", { group, name }),
   moveTaskToTop: (taskId: string) => invoke<Snapshot>("move_task_to_top", { taskId }),
+  taskDocument: (taskId: string) => invoke<TaskDocument>("get_task_document", { taskId }),
+  createTextCard: (taskId: string) => invoke<TextCard>("create_text_card", { taskId }),
+  updateTextCard: (cardId: string, content: string) => invoke<void>("update_text_card", { cardId, content }),
+  deleteTextCard: (cardId: string) => invoke<void>("delete_text_card", { cardId }),
+  updateTaskTitle: (taskId: string, title: string) => invoke<Snapshot>("update_task_title", { taskId, title }),
+  updateTaskContact: (taskId: string, contactId: string | null) => invoke<Snapshot>("update_task_contact", { taskId, contactId }),
+  updateTaskLink: (taskId: string, url: string | null) => invoke<Snapshot>("update_task_link", { taskId, url }),
+  deleteCompletedTask: (taskId: string) => invoke<Snapshot>("delete_completed_task", { taskId }),
+  resolveTaskOverflow: (keepIds: string[]) => invoke<Snapshot>("resolve_task_overflow", { keepIds }),
+  clearAllData: () => invoke<Snapshot>("clear_all_data"),
   dispatch: (action: AppAction) => invoke<Snapshot>("dispatch_action", { action }),
   resolveTitle: (url: string) => invoke<TitleSuggestion>("resolve_link_title", { url }),
   addContact: (name: string) => invoke<Snapshot>("add_contact", { name }),
@@ -69,6 +82,13 @@ export const api = {
   recordingDetail: (recordingId: string) => invoke<RecordingDetail>("get_recording_detail", { recordingId }),
   processRecording: (recordingId: string) => invoke<Snapshot>("process_recording", { recordingId }),
   recordingAudioData: (recordingId: string) => invoke<number[]>("recording_audio_data", { recordingId }),
+  deepSeekSettings: () => invoke<DeepSeekSettings>("get_deepseek_settings"),
+  saveDeepSeekApiKey: (apiKey: string) => invoke<DeepSeekSettings>("save_deepseek_api_key", { apiKey }),
+  deleteDeepSeekApiKey: () => invoke<DeepSeekSettings>("delete_deepseek_api_key"),
+  testDeepSeekConnection: () => invoke<void>("test_deepseek_connection"),
+  summarizeRecording: (recordingId: string) => invoke<void>("summarize_recording", { recordingId }),
+  retryRecordingSummary: (recordingId: string) => invoke<void>("retry_recording_summary", { recordingId }),
+  updateRecordingSummary: (recordingId: string, summary: RecordingSummary) => invoke<void>("update_recording_summary", { recordingId, summary }),
   modelStatus: (modelId: string) => invoke<ModelStatus>("model_status", { modelId }),
   downloadModel: (modelId: string) => invoke<void>("download_model", { modelId }),
   cancelModelDownload: (modelId: string) => invoke<void>("cancel_model_download", { modelId }),
@@ -111,11 +131,6 @@ export async function onNewTask(callback: (url: string) => void): Promise<Unlist
 export async function onRecordingToggle(callback: () => void): Promise<UnlistenFn> {
   if (!inTauri()) return () => undefined;
   return listen("redkey://recording-toggle", () => callback());
-}
-
-export async function onProgressHud(callback: (payload: ProgressHudPayload) => void): Promise<UnlistenFn> {
-  if (!inTauri()) return () => undefined;
-  return listen<ProgressHudPayload>("redkey://progress-hud", ({ payload }) => callback(payload));
 }
 
 export async function onTaskHud(callback: (payload: TaskHudPayload) => void): Promise<UnlistenFn> {

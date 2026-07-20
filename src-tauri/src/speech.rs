@@ -1,7 +1,7 @@
 use crate::models::ModelStatus;
 use anyhow::{bail, Context, Result};
 use serde_json::json;
-use std::{collections::HashSet, fs, fs::OpenOptions, io::{BufRead, BufReader, Write}, path::{Path, PathBuf}, process::{Child, ChildStdin, ChildStdout, Command, Stdio}, sync::{Mutex, OnceLock}, thread, time::Duration};
+use std::{collections::HashSet, fs, fs::OpenOptions, io::{BufRead, BufReader, Write}, path::{Path, PathBuf}, process::{Child, ChildStdin, ChildStdout, Command, Stdio}, sync::{Arc, Mutex, OnceLock}, thread, time::Duration};
 use tauri::{AppHandle, Emitter, Manager};
 
 pub const ASR_ID: &str = "Qwen3-ASR-1.7B";
@@ -210,7 +210,7 @@ fn health_check(app: &AppHandle, python: &Path) -> Result<()> {
     Ok(())
 }
 
-pub struct SpeechWorker { child: Child, input: ChildStdin, output: BufReader<ChildStdout> }
+pub struct SpeechWorker { child: Arc<parking_lot::Mutex<Child>>, input: ChildStdin, output: BufReader<ChildStdout> }
 
 impl SpeechWorker {
 pub fn start(app: &AppHandle) -> Result<Self> {
@@ -219,12 +219,14 @@ pub fn start(app: &AppHandle) -> Result<Self> {
     let mut child = Command::new(python).arg(worker_path(app)?).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().context("无法启动语音 worker")?;
     let input = child.stdin.take().context("worker 输入不可用")?;
     let output = BufReader::new(child.stdout.take().context("worker 输出不可用")?);
-    let mut worker = Self { child, input, output };
+    let mut worker = Self { child: Arc::new(parking_lot::Mutex::new(child)), input, output };
     worker.send(json!({"action":"load","modelPath":models_dir(app)?.join(ASR_ID),"requestId":"startup"}))?;
     let loaded = worker.receive()?;
     if loaded["event"] != "loaded" { bail!("{}", loaded["message"].as_str().unwrap_or("模型加载失败")) }
     Ok(worker)
 }
+
+pub fn process_handle(&self) -> Arc<parking_lot::Mutex<Child>> { self.child.clone() }
 
 pub fn transcribe(&mut self, audio_path: &Path, request_id: &str, partial: bool) -> Result<String> {
     self.send(json!({"action": if partial { "partial" } else { "transcribe" },"audioPath":audio_path,"requestId":request_id}))?;
@@ -251,7 +253,7 @@ fn receive(&mut self) -> Result<serde_json::Value> { let mut line = String::new(
 #[serde(rename_all="camelCase")]
 pub struct SpeakerTurn { pub speaker_id: String, pub start_ms: i64, pub end_ms: i64, pub confidence: Option<f64>, pub overlap: bool }
 
-pub fn diarize(app: &AppHandle, audio_path: &Path) -> Result<Vec<SpeakerTurn>> {
+pub fn diarize(app: &AppHandle, audio_path: &Path, cancelled: impl Fn() -> bool) -> Result<Vec<SpeakerTurn>> {
     let python = diarization_runtime_dir(app)?.join(if cfg!(windows) { "Scripts/python.exe" } else { "bin/python" });
     if !status(app, DIARIZATION_ID)?.installed { bail!("请先在设置中安装 3D-Speaker-CAM++") }
     let bundled = app.path().resource_dir()?.join("workers/diarization_worker.py");
@@ -261,6 +263,15 @@ pub fn diarize(app: &AppHandle, audio_path: &Path) -> Result<Vec<SpeakerTurn>> {
     fs::create_dir_all(&runtime_cache)?;
     let mut child = Command::new(python).arg(worker).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
     writeln!(child.stdin.as_mut().context("分离 worker 输入不可用")?, "{}", json!({"audioPath":audio_path,"repoPath":repo,"cachePath":models_dir(app)?.join(DIARIZATION_ID).join("model-cache"),"runtimeCachePath":runtime_cache}))?;
+    loop {
+        if cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("录音处理已取消")
+        }
+        if child.try_wait()?.is_some() { break; }
+        thread::sleep(Duration::from_millis(100));
+    }
     let output = child.wait_with_output()?;
     let _ = fs::write(models_dir(app)?.join(format!(".{DIARIZATION_ID}.runtime.log")), &output.stderr);
     let line = String::from_utf8_lossy(&output.stdout).lines().last().unwrap_or_default().to_string();
@@ -270,7 +281,7 @@ pub fn diarize(app: &AppHandle, audio_path: &Path) -> Result<Vec<SpeakerTurn>> {
 }
 
 impl Drop for SpeechWorker {
-    fn drop(&mut self) { let _ = self.send(json!({"action":"shutdown","requestId":"shutdown"})); let _ = self.child.kill(); let _ = self.child.wait(); }
+    fn drop(&mut self) { let _ = self.send(json!({"action":"shutdown","requestId":"shutdown"})); let mut child = self.child.lock(); let _ = child.kill(); let _ = child.wait(); }
 }
 
 fn run_cancelable(app: &AppHandle, id: &str, command: &mut Command, context: &str, base_progress: u8, download_dir: Option<&Path>, total_path: Option<&Path>) -> Result<()> {

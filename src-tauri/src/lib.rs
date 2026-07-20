@@ -1,5 +1,6 @@
 mod db;
 mod hardware;
+mod llm;
 mod models;
 mod speech;
 
@@ -12,6 +13,7 @@ use std::io::{BufRead, BufReader, Write};
 #[cfg(target_os = "macos")]
 use std::sync::mpsc;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Duration;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
@@ -33,6 +35,8 @@ struct RuntimeState {
     keyboard_monitor: Mutex<Option<KeyboardMonitor>>,
     hover_regions: Mutex<HoverRegions>,
     speech_worker: Mutex<Option<speech::SpeechWorker>>,
+    speech_worker_process: Mutex<Option<Arc<Mutex<Child>>>>,
+    processing_cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
     partial_busy: std::sync::atomic::AtomicBool,
     native_recording: Mutex<Option<NativeRecording>>,
     hud_state: Mutex<HudState>,
@@ -58,7 +62,7 @@ struct PrefixConfig { required: core_graphics::event::CGEventFlags }
 enum KeyboardEvent { Prefix(bool), Action(AppAction) }
 
 #[derive(Default)]
-struct HudState { prefix_held: bool, progress_generation: u64, progress_visible: bool }
+struct HudState { prefix_held: bool }
 
 #[derive(Default)]
 struct HoverRegions {
@@ -85,14 +89,70 @@ fn emit_snapshot(app: &AppHandle) -> Result<Snapshot> {
 fn transcribe_with_worker(app: &AppHandle, path: &std::path::Path, request_id: &str, partial: bool) -> Result<String> {
     let state = app.state::<RuntimeState>();
     let mut guard = state.speech_worker.lock();
-    if guard.is_none() { *guard = Some(speech::SpeechWorker::start(app)?); }
+    if guard.is_none() {
+        let worker = speech::SpeechWorker::start(app)?;
+        *state.speech_worker_process.lock() = Some(worker.process_handle());
+        *guard = Some(worker);
+    }
+    if !partial && processing_cancelled(app, request_id) {
+        if let Some(worker) = state.speech_worker_process.lock().as_ref() { let _ = worker.lock().kill(); }
+        *guard = None;
+        *state.speech_worker_process.lock() = None;
+        return Err(anyhow::anyhow!("录音处理已取消"));
+    }
     match guard.as_mut().unwrap().transcribe(path, request_id, partial) {
         Ok(text) => Ok(text),
-        Err(error) => { *guard = None; Err(error) }
+        Err(error) => { *guard = None; *state.speech_worker_process.lock() = None; Err(error) }
     }
 }
 
+fn begin_processing(app: &AppHandle, recording_id: &str) -> Arc<AtomicBool> {
+    let token = Arc::new(AtomicBool::new(false));
+    app.state::<RuntimeState>().processing_cancellations.lock().insert(recording_id.into(), token.clone());
+    token
+}
+
+fn processing_cancelled(app: &AppHandle, recording_id: &str) -> bool {
+    app.state::<RuntimeState>().processing_cancellations.lock().get(recording_id).is_some_and(|token| token.load(Ordering::Acquire))
+}
+
+fn finish_processing(app: &AppHandle, recording_id: &str) {
+    app.state::<RuntimeState>().processing_cancellations.lock().remove(recording_id);
+}
+
+fn cancel_processing(app: &AppHandle, recording_id: &str) {
+    let active = if let Some(token) = app.state::<RuntimeState>().processing_cancellations.lock().get(recording_id) {
+        token.store(true, Ordering::Release);
+        true
+    } else { false };
+    if active {
+        if let Some(worker) = app.state::<RuntimeState>().speech_worker_process.lock().as_ref() { let _ = worker.lock().kill(); }
+    }
+}
+
+fn run_transcription_pipeline(app: AppHandle, path: std::path::PathBuf, recording_id: String) {
+    if processing_cancelled(&app, &recording_id) { finish_processing(&app, &recording_id); return; }
+    let result = transcribe_with_worker(&app, &path, &recording_id, false);
+    if processing_cancelled(&app, &recording_id) { finish_processing(&app, &recording_id); return; }
+    match result {
+        Ok(text) => {
+            if app.state::<RuntimeState>().db.lock().complete_transcription(&recording_id, &text).is_ok()
+                && !processing_cancelled(&app, &recording_id)
+                && app.state::<RuntimeState>().db.lock().prepare_recording_processing(&recording_id).is_ok()
+            {
+                let _ = process_recording_pipeline(&app, &recording_id);
+            }
+        }
+        Err(error) => {
+            if !processing_cancelled(&app, &recording_id) { let _ = app.state::<RuntimeState>().db.lock().fail_recording(&recording_id, &error.to_string()); }
+        }
+    }
+    finish_processing(&app, &recording_id);
+    let _ = emit_snapshot(&app);
+}
+
 fn process_recording_pipeline(app: &AppHandle, recording_id: &str) -> Result<()> {
+    if processing_cancelled(app, recording_id) { return Ok(()); }
     let detail = app.state::<RuntimeState>().db.lock().recording_detail(recording_id)?;
     let path = detail.recording.audio_path.as_ref().map(std::path::PathBuf::from).context("录音文件不存在")?;
     if !speech::status(app, speech::DIARIZATION_ID)?.installed {
@@ -102,7 +162,7 @@ fn process_recording_pipeline(app: &AppHandle, recording_id: &str) -> Result<()>
     }
     app.state::<RuntimeState>().db.lock().set_processing_stage(recording_id, "diarizing", None)?;
     let _ = emit_snapshot(app);
-    let turns = match speech::diarize(app, &path).map(smooth_speaker_turns) {
+    let turns = match speech::diarize(app, &path, || processing_cancelled(app, recording_id)).map(smooth_speaker_turns) {
         Ok(turns) if !turns.is_empty() => turns,
         Ok(_) => {
             app.state::<RuntimeState>().db.lock().set_processing_stage(recording_id, "diarization_error", Some("没有检测到可分离的讲话内容"))?;
@@ -110,11 +170,13 @@ fn process_recording_pipeline(app: &AppHandle, recording_id: &str) -> Result<()>
             return Ok(());
         }
         Err(error) => {
+            if processing_cancelled(app, recording_id) { return Ok(()); }
             app.state::<RuntimeState>().db.lock().set_processing_stage(recording_id, "diarization_error", Some("发言人分离失败，请在设置中检查本地模型"))?;
             let _ = emit_snapshot(app);
             return Err(error);
         }
     };
+    if processing_cancelled(app, recording_id) { return Ok(()); }
     let speaker_count = turns.iter().filter_map(|turn| turn.speaker_id.strip_prefix("speaker_")?.parse::<usize>().ok()).max().map(|value| value + 1).unwrap_or(0) as i64;
     if !speech::status(app, speech::ALIGNER_ID)?.installed {
         app.state::<RuntimeState>().db.lock().set_processing_stage(recording_id, "waiting_alignment", None)?;
@@ -136,15 +198,18 @@ fn process_recording_pipeline(app: &AppHandle, recording_id: &str) -> Result<()>
             return Ok(());
         }
         Err(error) => {
+            if processing_cancelled(app, recording_id) { return Ok(()); }
             app.state::<RuntimeState>().db.lock().set_processing_stage(recording_id, "alignment_error", Some("文字时间对齐失败，请重新处理"))?;
             let _ = emit_snapshot(app);
             return Err(error);
         }
     };
+    if processing_cancelled(app, recording_id) { return Ok(()); }
     app.state::<RuntimeState>().db.lock().save_words(recording_id, &words)?;
     app.state::<RuntimeState>().db.lock().set_processing_stage(recording_id, "merging", None)?;
     let _ = emit_snapshot(app);
     let segments = build_speaker_segments(&words, &turns);
+    if processing_cancelled(app, recording_id) { return Ok(()); }
     if segments.is_empty() {
         app.state::<RuntimeState>().db.lock().set_processing_stage(recording_id, "diarization_error", Some("没有生成可展示的发言人对话"))?;
         let _ = emit_snapshot(app);
@@ -158,7 +223,35 @@ fn process_recording_pipeline(app: &AppHandle, recording_id: &str) -> Result<()>
     db.set_processing_stage(recording_id, "completed", None)?;
     drop(db);
     let _ = emit_snapshot(app);
+    spawn_recording_summary(app, recording_id);
     Ok(())
+}
+
+fn spawn_recording_summary(app: &AppHandle, recording_id: &str) {
+    spawn_recording_summary_with_force(app, recording_id, false);
+}
+
+fn spawn_recording_summary_with_force(app: &AppHandle, recording_id: &str, force: bool) {
+    let app = app.clone();
+    let recording_id = recording_id.to_string();
+    tauri::async_runtime::spawn(async move {
+        if !llm::settings().map(|settings| settings.configured).unwrap_or(false) { return; }
+        let document = match app.state::<RuntimeState>().db.lock().task_document_for_recording(&recording_id) {
+            Ok(document) => document,
+            Err(error) => { let _ = app.state::<RuntimeState>().db.lock().set_recording_summary_status(&recording_id, "error", Some(&error.to_string())); let _ = emit_snapshot(&app); return; }
+        };
+        if !force && document.summaries.iter().any(|summary| summary.recording_id == recording_id && summary.user_edited) {
+            let _ = emit_snapshot(&app);
+            return;
+        }
+        let _ = app.state::<RuntimeState>().db.lock().set_recording_summary_status(&recording_id, "summarizing", None);
+        let _ = emit_snapshot(&app);
+        match llm::summarize(&document, &recording_id).await {
+            Ok(summary) => { let _ = app.state::<RuntimeState>().db.lock().save_recording_summary(&summary); }
+            Err(error) => { let _ = app.state::<RuntimeState>().db.lock().set_recording_summary_status(&recording_id, "error", Some(&error.to_string())); }
+        }
+        let _ = emit_snapshot(&app);
+    });
 }
 
 fn smooth_speaker_turns(mut turns: Vec<speech::SpeakerTurn>) -> Vec<speech::SpeakerTurn> {
@@ -375,48 +468,12 @@ fn set_task_hud_visible(app: &AppHandle, visible: bool) -> Result<()> {
         let runtime = app.state::<RuntimeState>();
         let mut state = runtime.hud_state.lock();
         state.prefix_held = visible;
-        visible && !state.progress_visible
+        visible
     };
     if show { emit_task_hud(app)?; }
     if !visible {
-        let progress_visible = app.state::<RuntimeState>().hud_state.lock().progress_visible;
-        if !progress_visible { if let Some(hud) = app.get_webview_window("hud") { hud.hide()?; } }
+        if let Some(hud) = app.get_webview_window("hud") { hud.hide()?; }
     }
-    Ok(())
-}
-
-fn emit_progress_hud(app: &AppHandle, before: &Snapshot, after: &Snapshot) -> Result<()> {
-    let Some(task_id) = after.current_task_id.as_ref() else { return Ok(()); };
-    let Some(task) = after.tasks.iter().find(|task| &task.id == task_id) else { return Ok(()); };
-    let previous = before.tasks.iter().find(|item| item.id == task.id).map(|item| item.progress).unwrap_or(task.progress);
-    let hud = position_hud(app)?;
-    hud.show()?;
-    hud.emit("redkey://progress-hud", serde_json::json!({
-        "title": &task.title,
-        "group": &task.group,
-        "progress": task.progress,
-        "delta": task.progress - previous,
-    }))?;
-    let generation = {
-        let runtime = app.state::<RuntimeState>();
-        let mut state = runtime.hud_state.lock();
-        state.progress_visible = true;
-        state.progress_generation = state.progress_generation.wrapping_add(1);
-        state.progress_generation
-    };
-    let app = app.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(1500));
-        let restore_task_hud = {
-            let runtime = app.state::<RuntimeState>();
-            let mut state = runtime.hud_state.lock();
-            if state.progress_generation != generation { false } else { state.progress_visible = false; state.prefix_held }
-        };
-        if restore_task_hud { let _ = emit_task_hud(&app); }
-        else if app.state::<RuntimeState>().hud_state.lock().progress_generation == generation {
-            if let Some(hud) = app.get_webview_window("hud") { let _ = hud.hide(); }
-        }
-    });
     Ok(())
 }
 
@@ -436,8 +493,8 @@ fn keyboard_action(key_code: i64) -> Option<AppAction> {
         18 => AppAction::ActivateSlot { slot: 0 }, 19 => AppAction::ActivateSlot { slot: 1 }, 20 => AppAction::ActivateSlot { slot: 2 },
         21 => AppAction::ActivateSlot { slot: 3 }, 23 => AppAction::ActivateSlot { slot: 4 }, 22 => AppAction::ActivateSlot { slot: 5 },
         26 => AppAction::ActivateSlot { slot: 6 }, 28 => AppAction::ActivateSlot { slot: 7 }, 25 => AppAction::ActivateSlot { slot: 8 },
-        29 => AppAction::ActivateSlot { slot: 9 }, 27 => AppAction::AdjustProgress { delta: -1 }, 24 => AppAction::AdjustProgress { delta: 1 },
-        17 => AppAction::ToggleRecording, 49 => AppAction::OpenConsole, _ => return None,
+        29 => AppAction::ActivateSlot { slot: 9 },
+        _ => return None,
     })
 }
 
@@ -465,8 +522,7 @@ fn install_keyboard_tap(app: &AppHandle, monitor: &KeyboardMonitor) {
                 if !matches!(event_type, CGEventType::KeyDown) || !has_required { return CallbackResult::Keep; }
                 let Some(action) = keyboard_action(event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE)) else { return CallbackResult::Keep; };
                 let extras = flags.intersection(modifier_flags).difference(required);
-                let allows_shifted_plus = matches!(action, AppAction::AdjustProgress { delta: 1 }) && extras == CGEventFlags::CGEventFlagShift;
-                if extras.is_empty() || allows_shifted_plus { let _ = sender.send(KeyboardEvent::Action(action)); return CallbackResult::Drop; }
+                if extras.is_empty() { let _ = sender.send(KeyboardEvent::Action(action)); return CallbackResult::Drop; }
                 CallbackResult::Keep
             }
         }, CFRunLoop::run_current);
@@ -486,7 +542,6 @@ fn start_keyboard_monitor(app: &AppHandle, settings: &ShortcutSettings) -> Keybo
         match event {
             KeyboardEvent::Prefix(active) => { let _ = set_task_hud_visible(&app_handle, active); }
             KeyboardEvent::Action(AppAction::ActivateSlot { slot }) => { let _ = dispatch_internal(&app_handle, AppAction::ActivateSlot { slot }); if app_handle.state::<RuntimeState>().hud_state.lock().prefix_held { let _ = emit_task_hud(&app_handle); } }
-            KeyboardEvent::Action(AppAction::AdjustProgress { delta }) => { let before = snapshot(&app_handle).ok(); let after = dispatch_internal(&app_handle, AppAction::AdjustProgress { delta }); if let (Some(before), Ok(after)) = (before.as_ref(), after.as_ref()) { let _ = emit_progress_hud(&app_handle, before, after); } }
             KeyboardEvent::Action(action) => { let _ = dispatch_internal(&app_handle, action); }
         }
     });
@@ -718,6 +773,116 @@ fn get_snapshot(app: AppHandle) -> Result<Snapshot, String> {
 }
 
 #[tauri::command]
+fn get_task_document(app: AppHandle, task_id: String) -> Result<TaskDocument, String> {
+    app.state::<RuntimeState>().db.lock().task_document(&task_id).map_err(err)
+}
+
+#[tauri::command]
+fn create_text_card(app: AppHandle, task_id: String) -> Result<TextCard, String> {
+    let card = app.state::<RuntimeState>().db.lock().create_text_card(&task_id).map_err(err)?;
+    let _ = emit_snapshot(&app);
+    Ok(card)
+}
+
+#[tauri::command]
+fn update_text_card(app: AppHandle, card_id: String, content: String) -> Result<(), String> {
+    app.state::<RuntimeState>().db.lock().update_text_card(&card_id, &content).map_err(err)
+}
+
+#[tauri::command]
+fn delete_text_card(app: AppHandle, card_id: String) -> Result<(), String> {
+    app.state::<RuntimeState>().db.lock().delete_text_card(&card_id).map_err(err)?;
+    let _ = emit_snapshot(&app);
+    Ok(())
+}
+
+#[tauri::command]
+fn update_task_title(app: AppHandle, task_id: String, title: String) -> Result<Snapshot, String> {
+    app.state::<RuntimeState>().db.lock().update_task_title(&task_id, &title).map_err(err)?;
+    emit_snapshot(&app).map_err(err)
+}
+
+#[tauri::command]
+fn update_task_contact(app: AppHandle, task_id: String, contact_id: Option<String>) -> Result<Snapshot, String> {
+    app.state::<RuntimeState>().db.lock().update_task_contact(&task_id, contact_id.as_deref()).map_err(err)?;
+    emit_snapshot(&app).map_err(err)
+}
+
+#[tauri::command]
+fn update_task_link(app: AppHandle, task_id: String, url: Option<String>) -> Result<Snapshot, String> {
+    app.state::<RuntimeState>().db.lock().update_task_link(&task_id, url.as_deref()).map_err(err)?;
+    emit_snapshot(&app).map_err(err)
+}
+
+#[tauri::command]
+fn delete_completed_task(app: AppHandle, task_id: String) -> Result<Snapshot, String> {
+    let paths = app.state::<RuntimeState>().db.lock().task_document(&task_id).map_err(err)?.recordings.into_iter().filter_map(|recording| recording.audio_path).collect::<Vec<_>>();
+    app.state::<RuntimeState>().db.lock().delete_completed_task(&task_id).map_err(err)?;
+    for path in paths { let _ = std::fs::remove_file(path); }
+    emit_snapshot(&app).map_err(err)
+}
+
+#[tauri::command]
+fn clear_all_data(app: AppHandle) -> Result<Snapshot, String> {
+    if app.state::<RuntimeState>().native_recording.lock().is_some() || app.state::<RuntimeState>().db.lock().snapshot().map_err(err)?.recordings.iter().any(|recording| recording.status == "recording") {
+        return Err("录音进行中，无法清除数据".into());
+    }
+    app.state::<RuntimeState>().db.lock().clear_all_data().map_err(err)?;
+    llm::delete_key().map_err(err)?;
+    let settings = app.state::<RuntimeState>().db.lock().settings().map_err(err)?;
+    if settings.autostart { app.autolaunch().enable().map_err(|error| format!("无法恢复开机启动：{error}"))?; }
+    emit_snapshot(&app).map_err(err)
+}
+
+#[tauri::command]
+fn resolve_task_overflow(app: AppHandle, keep_ids: Vec<String>) -> Result<Snapshot, String> {
+    app.state::<RuntimeState>().db.lock().resolve_task_overflow(&keep_ids).map_err(err)?;
+    emit_snapshot(&app).map_err(err)
+}
+
+#[tauri::command]
+fn get_deepseek_settings() -> Result<DeepSeekSettings, String> { llm::settings().map_err(err) }
+
+#[tauri::command]
+fn save_deepseek_api_key(api_key: String) -> Result<DeepSeekSettings, String> {
+    llm::save_key(&api_key).map_err(err)?;
+    llm::settings().map_err(err)
+}
+
+#[tauri::command]
+fn delete_deepseek_api_key() -> Result<DeepSeekSettings, String> {
+    llm::delete_key().map_err(err)?;
+    llm::settings().map_err(err)
+}
+
+#[tauri::command]
+async fn test_deepseek_connection() -> Result<(), String> { llm::test_connection().await.map_err(err) }
+
+#[tauri::command]
+fn summarize_recording(app: AppHandle, recording_id: String) -> Result<(), String> {
+    let document = app.state::<RuntimeState>().db.lock().task_document_for_recording(&recording_id).map_err(err)?;
+    let recording = document.recordings.iter().find(|recording| recording.id == recording_id).ok_or("录音记录不存在")?;
+    if recording.transcript.trim().is_empty() && recording.raw_transcript.trim().is_empty() { return Err("录音尚未完成转写".into()); }
+    spawn_recording_summary_with_force(&app, &recording_id, true);
+    Ok(())
+}
+
+#[tauri::command]
+fn retry_recording_summary(app: AppHandle, recording_id: String) -> Result<(), String> { summarize_recording(app, recording_id) }
+
+#[tauri::command]
+fn update_recording_summary(app: AppHandle, recording_id: String, mut summary: RecordingSummary) -> Result<(), String> {
+    if summary.recording_id != recording_id { return Err("录音总结归属不匹配".into()); }
+    summary.status = "completed".into();
+    summary.error_message = None;
+    summary.user_edited = true;
+    summary.updated_at = chrono::Utc::now().to_rfc3339();
+    app.state::<RuntimeState>().db.lock().save_recording_summary(&summary).map_err(err)?;
+    let _ = emit_snapshot(&app);
+    Ok(())
+}
+
+#[tauri::command]
 fn keyboard_listener_status(app: AppHandle) -> Option<String> {
     app.state::<RuntimeState>().keyboard_monitor.lock().as_ref().and_then(|monitor| {
         #[cfg(target_os = "macos")]
@@ -765,7 +930,7 @@ fn set_current_task(app: AppHandle, task_id: String, open: bool) -> Result<Snaps
         .lock()
         .set_current_task(&task_id)
         .map_err(err)?;
-    if open {
+    if open && !url.trim().is_empty() {
         open_link(&url).map_err(err)?;
     }
     emit_snapshot(&app).map_err(err)
@@ -994,15 +1159,9 @@ fn stop_native_recording(app: AppHandle) -> Result<Snapshot, String> {
     let duration = recording.started.elapsed().as_secs_f64();
     app.state::<RuntimeState>().db.lock().finish_recording(&recording.id, duration, &recording.path.to_string_lossy()).map_err(err)?;
     emit_snapshot(&app).map_err(err)?;
+    begin_processing(&app, &recording.id);
     let background_app = app.clone();
-    std::thread::spawn(move || {
-        let result = transcribe_with_worker(&background_app, &recording.path, &recording.id, false);
-        match result {
-            Ok(text) => { if background_app.state::<RuntimeState>().db.lock().complete_transcription(&recording.id, &text).is_ok() { let _ = background_app.state::<RuntimeState>().db.lock().prepare_recording_processing(&recording.id); let _ = process_recording_pipeline(&background_app, &recording.id); } }
-            Err(error) => { let _ = background_app.state::<RuntimeState>().db.lock().fail_recording(&recording.id, &error.to_string()); }
-        }
-        let _ = emit_snapshot(&background_app);
-    });
+    std::thread::spawn(move || run_transcription_pipeline(background_app, recording.path, recording.id));
     snapshot(&app).map_err(err)
 }
 
@@ -1014,15 +1173,9 @@ fn finish_recording(app: AppHandle, recording_id: String, audio: Vec<u8>, durati
     std::fs::write(&path, audio).map_err(err)?;
     app.state::<RuntimeState>().db.lock().finish_recording(&recording_id, duration, &path.to_string_lossy()).map_err(err)?;
     emit_snapshot(&app).map_err(err)?;
+    begin_processing(&app, &recording_id);
     let background_app = app.clone();
-    std::thread::spawn(move || {
-        let result = transcribe_with_worker(&background_app, &path, &recording_id, false);
-        match result {
-            Ok(text) => { if background_app.state::<RuntimeState>().db.lock().complete_transcription(&recording_id, &text).is_ok() { let _ = background_app.state::<RuntimeState>().db.lock().prepare_recording_processing(&recording_id); let _ = process_recording_pipeline(&background_app, &recording_id); } }
-            Err(error) => { let _ = background_app.state::<RuntimeState>().db.lock().fail_recording(&recording_id, &error.to_string()); }
-        }
-        let _ = emit_snapshot(&background_app);
-    });
+    std::thread::spawn(move || run_transcription_pipeline(background_app, path, recording_id));
     snapshot(&app).map_err(err)
 }
 
@@ -1034,6 +1187,7 @@ fn fail_recording(app: AppHandle, recording_id: String, message: String) -> Resu
 
 #[tauri::command]
 fn delete_recording(app: AppHandle, recording_id: String) -> Result<Snapshot, String> {
+    cancel_processing(&app, &recording_id);
     let path = app.path().app_data_dir().map_err(err)?.join("recordings").join(format!("{recording_id}.wav"));
     let _ = std::fs::remove_file(path);
     app.state::<RuntimeState>().db.lock().delete_recording(&recording_id).map_err(err)?;
@@ -1045,15 +1199,9 @@ fn retry_transcription(app: AppHandle, recording_id: String) -> Result<Snapshot,
     let recording = snapshot(&app).map_err(err)?.recordings.into_iter().find(|item| item.id == recording_id).ok_or("录音记录不存在")?;
     let path = recording.audio_path.map(std::path::PathBuf::from).ok_or("录音文件不存在")?;
     app.state::<RuntimeState>().db.lock().finish_recording(&recording_id, recording.duration, &path.to_string_lossy()).map_err(err)?;
+    begin_processing(&app, &recording_id);
     let background_app = app.clone();
-    std::thread::spawn(move || {
-        let result = transcribe_with_worker(&background_app, &path, &recording_id, false);
-        match result {
-            Ok(text) => { if background_app.state::<RuntimeState>().db.lock().complete_transcription(&recording_id, &text).is_ok() { let _ = background_app.state::<RuntimeState>().db.lock().prepare_recording_processing(&recording_id); let _ = process_recording_pipeline(&background_app, &recording_id); } }
-            Err(error) => { let _ = background_app.state::<RuntimeState>().db.lock().fail_recording(&recording_id, &error.to_string()); }
-        }
-        let _ = emit_snapshot(&background_app);
-    });
+    std::thread::spawn(move || run_transcription_pipeline(background_app, path, recording_id));
     emit_snapshot(&app).map_err(err)
 }
 
@@ -1088,8 +1236,13 @@ fn get_recording_detail(app: AppHandle, recording_id: String) -> Result<Recordin
 #[tauri::command]
 fn process_recording(app: AppHandle, recording_id: String) -> Result<Snapshot, String> {
     app.state::<RuntimeState>().db.lock().prepare_recording_processing(&recording_id).map_err(err)?;
+    begin_processing(&app, &recording_id);
     let background = app.clone();
-    std::thread::spawn(move || { let _ = process_recording_pipeline(&background, &recording_id); let _ = emit_snapshot(&background); });
+    std::thread::spawn(move || {
+        let _ = process_recording_pipeline(&background, &recording_id);
+        finish_processing(&background, &recording_id);
+        let _ = emit_snapshot(&background);
+    });
     emit_snapshot(&app).map_err(err)
 }
 
@@ -1275,12 +1428,15 @@ pub fn run() {
             let data_dir = app.path().app_data_dir()?;
             let database = Database::open(&data_dir.join("redkey.sqlite3"))?;
             let settings = database.settings()?;
+            if settings.autostart { app.autolaunch().enable()?; }
             app.manage(RuntimeState {
                 db: Mutex::new(database),
                 tray_icon: Mutex::new(None),
                 keyboard_monitor: Mutex::new(None),
                 hover_regions: Mutex::new(HoverRegions::default()),
                 speech_worker: Mutex::new(None),
+                speech_worker_process: Mutex::new(None),
+                processing_cancellations: Mutex::new(HashMap::new()),
                 partial_busy: std::sync::atomic::AtomicBool::new(false),
                 native_recording: Mutex::new(None),
                 hud_state: Mutex::new(HudState::default()),
@@ -1308,6 +1464,23 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
+            get_task_document,
+            create_text_card,
+            update_text_card,
+            delete_text_card,
+            update_task_title,
+            update_task_contact,
+            update_task_link,
+            delete_completed_task,
+            clear_all_data,
+            resolve_task_overflow,
+            get_deepseek_settings,
+            save_deepseek_api_key,
+            delete_deepseek_api_key,
+            test_deepseek_connection,
+            summarize_recording,
+            retry_recording_summary,
+            update_recording_summary,
             keyboard_listener_status,
             create_task,
             update_task,

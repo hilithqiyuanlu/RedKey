@@ -6,7 +6,7 @@ const base: Task = {
   id: "1", title: "任务", titleMode: "title", sourceTitle: null, url: "https://figma.com/design/key/task",
   group: "blue",
   contactId: null, contactName: null, priority: 2, pinned: false, manualOrder: 0,
-  lastOpenedAt: null, status: "active", progress: 0, startedAt: "2026-01-01",
+  lastOpenedAt: null, status: "active", startedAt: "2026-01-01",
   completedAt: null, slot: 0,
 };
 

@@ -14,7 +14,6 @@ export interface Task {
   manualOrder: number;
   lastOpenedAt: string | null;
   status: TaskStatus;
-  progress: number;
   startedAt: string;
   completedAt: string | null;
   slot: number | null;
@@ -75,6 +74,28 @@ export interface TranscriptSegment { id: string; seq: number; speakerId: string 
 export interface RecordingSpeaker { speakerId: string; displayName: string; sortOrder: number; }
 export interface RecordingDetail { recording: Recording; words: TranscriptWord[]; segments: TranscriptSegment[]; speakers: RecordingSpeaker[]; }
 
+export interface TextCard { id: string; taskId: string; content: string; createdAt: string; updatedAt: string; }
+export interface ActionItem { text: string; owner: string | null; due: string | null; }
+export type RecordingSummaryStatus = "pending" | "summarizing" | "completed" | "error" | "stale";
+export interface RecordingSummary {
+  recordingId: string;
+  overview: string;
+  pendingItems: string[];
+  confirmedDecisions: string[];
+  requestedChanges: string[];
+  actionItems: ActionItem[];
+  openQuestions: string[];
+  sourceTranscriptHash: string | null;
+  model: string | null;
+  promptVersion: string;
+  status: RecordingSummaryStatus | string;
+  errorMessage: string | null;
+  userEdited: boolean;
+  updatedAt: string;
+}
+export interface TaskDocument { task: Task; textCards: TextCard[]; recordings: Recording[]; summaries: RecordingSummary[]; }
+export interface DeepSeekSettings { configured: boolean; model: string; }
+
 export interface ModelStatus {
   id: string;
   installed: boolean;
@@ -90,24 +111,14 @@ export interface ModelStatus {
   verified: boolean;
 }
 
-export interface ProgressHudPayload {
-  title: string;
-  group: TaskGroup;
-  progress: number;
-  delta: number;
-}
-
 export interface TaskHudPayload {
   slots: { slot: number; name: string | null; title: string | null }[];
 }
 
 export type AppAction =
   | { type: "activate_slot"; slot: number }
-  | { type: "adjust_progress"; delta: number }
   | { type: "complete_current" }
   | { type: "start_rework" }
-  | { type: "previous_group" }
-  | { type: "next_group" }
   | { type: "open_console" }
   | { type: "toggle_recording" };
 

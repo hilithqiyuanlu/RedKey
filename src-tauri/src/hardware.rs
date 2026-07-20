@@ -25,12 +25,7 @@ impl HardwareInputAdapter for JsonLinesHardwareAdapter {
                     .and_then(|slot| slot.as_i64())
                     .ok_or_else(|| anyhow::anyhow!("slot 事件缺少 slot"))?,
             }),
-            Some("progress") => Some(AppAction::AdjustProgress {
-                delta: value
-                    .get("delta")
-                    .and_then(|delta| delta.as_i64())
-                    .unwrap_or(0),
-            }),
+            Some("progress") => None,
             Some("complete") => Some(AppAction::CompleteCurrent),
             Some("rework") => Some(AppAction::StartRework),
             Some(_) | None => None,
@@ -50,11 +45,6 @@ mod tests {
             adapter.decode_line(r#"{"event":"slot","slot":2}"#).unwrap(),
             Some(AppAction::ActivateSlot { slot: 2 })
         );
-        assert_eq!(
-            adapter
-                .decode_line(r#"{"event":"progress","delta":5}"#)
-                .unwrap(),
-            Some(AppAction::AdjustProgress { delta: 5 })
-        );
+        assert_eq!(adapter.decode_line(r#"{"event":"progress","delta":5}"#).unwrap(), None);
     }
 }

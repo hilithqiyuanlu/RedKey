@@ -6,11 +6,8 @@
 
 ```json
 {"event":"slot","slot":0}
-{"event":"progress","delta":5}
-{"event":"priority","delta":1}
 {"event":"complete"}
 {"event":"rework"}
-{"event":"cancel_rework"}
 ```
 
 `slot` 使用内部编号 `0–9`，对应可见按键 `1–9、0`。未知事件应被忽略，格式错误的行应记录但不能中断后续读取。
@@ -20,7 +17,7 @@
 首版实体硬件接入时增加以下消息：
 
 ```json
-{"command":"state","connected":true,"slot":0,"title":"阿伟 · 登录页改版","progress":65,"priority":3,"status":"active","revision":1}
+{"command":"state","connected":true,"slot":0,"title":"登录页改版","contact":"阿伟","status":"active"}
 {"command":"notice","level":"attention","text":"槽位未绑定"}
 ```
 
@@ -29,4 +26,3 @@
 ## 接入边界
 
 Rust 中的 `HardwareInputAdapter` 负责把一行设备消息转换成 `AppAction`。串口连接层只负责发现设备、重连、逐行读取和发送状态，不得直接读写 SQLite。
-

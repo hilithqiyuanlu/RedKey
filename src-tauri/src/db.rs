@@ -8,7 +8,6 @@ use url::Url;
 use uuid::Uuid;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-pub const PROGRESS_STEP: i64 = 20;
 pub const GROUPS: [&str; 5] = ["red", "amber", "purple", "green", "blue"];
 
 const MIGRATION_1: &str = r#"
@@ -141,8 +140,32 @@ CREATE TABLE IF NOT EXISTS recording_speakers (
   sort_order INTEGER NOT NULL,
   PRIMARY KEY(recording_id, speaker_id)
 );
+CREATE TABLE IF NOT EXISTS task_text_cards (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  content TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS recording_summaries (
+  recording_id TEXT PRIMARY KEY REFERENCES recordings(id) ON DELETE CASCADE,
+  overview TEXT NOT NULL DEFAULT '',
+  pending_items TEXT NOT NULL DEFAULT '[]',
+  confirmed_decisions TEXT NOT NULL DEFAULT '[]',
+  requested_changes TEXT NOT NULL DEFAULT '[]',
+  action_items TEXT NOT NULL DEFAULT '[]',
+  open_questions TEXT NOT NULL DEFAULT '[]',
+  source_transcript_hash TEXT,
+  model TEXT,
+  prompt_version TEXT NOT NULL DEFAULT 'recording-summary-v1',
+  status TEXT NOT NULL DEFAULT 'pending',
+  error_message TEXT,
+  user_edited INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_recordings_task ON recordings(task_id);
 CREATE INDEX IF NOT EXISTS idx_recordings_created ON recordings(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_text_cards_task ON task_text_cards(task_id, created_at DESC);
 "#;
 
 pub struct Database {
@@ -188,6 +211,32 @@ impl Database {
     }
 
     fn ensure_schema_compatibility(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS task_text_cards (
+               id TEXT PRIMARY KEY,
+               task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+               content TEXT NOT NULL DEFAULT '',
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS recording_summaries (
+               recording_id TEXT PRIMARY KEY REFERENCES recordings(id) ON DELETE CASCADE,
+               overview TEXT NOT NULL DEFAULT '',
+               pending_items TEXT NOT NULL DEFAULT '[]',
+               confirmed_decisions TEXT NOT NULL DEFAULT '[]',
+               requested_changes TEXT NOT NULL DEFAULT '[]',
+               action_items TEXT NOT NULL DEFAULT '[]',
+               open_questions TEXT NOT NULL DEFAULT '[]',
+               source_transcript_hash TEXT,
+               model TEXT,
+               prompt_version TEXT NOT NULL DEFAULT 'recording-summary-v1',
+               status TEXT NOT NULL DEFAULT 'pending',
+               error_message TEXT,
+               user_edited INTEGER NOT NULL DEFAULT 0,
+               updated_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_text_cards_task ON task_text_cards(task_id, created_at DESC);",
+        )?;
         let has_color: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name='color')",
             [],
@@ -301,10 +350,11 @@ impl Database {
                     let prefix = raw.pointer("/shortcuts/slots/0").and_then(|value| value.as_str())
                         .and_then(|value| value.rsplit_once('+').map(|(prefix, _)| prefix))
                         .filter(|value| !value.is_empty())
-                        .unwrap_or("Control+Alt");
+                        .unwrap_or("Control");
                     current.shortcuts.task_prefix = prefix.replace("Option", "Alt");
                 }
             }
+            if current.shortcuts.task_prefix == "Control+Alt" { current.shortcuts.task_prefix = "Control".into(); }
             self.conn.execute(
                 "UPDATE settings SET value=?1 WHERE key='app_settings'",
                 [serde_json::to_string(&current)?],
@@ -347,6 +397,7 @@ impl Database {
             params![id, duration.max(0.0), audio_path, now()],
         )?;
         anyhow::ensure!(changed == 1, "录音记录不存在");
+        self.mark_summary_stale(id)?;
         Ok(())
     }
 
@@ -458,6 +509,122 @@ impl Database {
         query_all(&self.conn, "SELECT r.id,r.task_id,t.title,r.filename,r.duration,r.status,r.created_at,COALESCE(NULLIF(r.final_transcript,''),r.transcript),r.raw_transcript,r.error_message,r.processing_status,r.audio_path,r.updated_at,r.alignment_status,r.diarization_status,r.speaker_count,r.processing_error FROM recordings r LEFT JOIN tasks t ON t.id=r.task_id ORDER BY r.created_at DESC", |row| Ok(Recording {
             id: row.get(0)?, task_id: row.get(1)?, task_title: row.get(2)?, filename: row.get(3)?, duration: row.get(4)?, status: row.get(5)?, created_at: row.get(6)?, transcript: row.get(7)?, raw_transcript: row.get(8)?, error_message: row.get(9)?, processing_status: row.get(10)?, audio_path: row.get(11)?, updated_at: row.get(12)?, alignment_status: row.get(13)?, diarization_status: row.get(14)?, speaker_count: row.get(15)?, processing_error: row.get(16)?,
         }))
+    }
+
+    pub fn task_document(&self, task_id: &str) -> Result<TaskDocument> {
+        let task = self.list_tasks()?.into_iter().find(|task| task.id == task_id).context("任务不存在")?;
+        let text_cards = {
+            let mut statement = self.conn.prepare("SELECT id,task_id,content,created_at,updated_at FROM task_text_cards WHERE task_id=?1 ORDER BY created_at DESC")?;
+            let cards = statement.query_map([task_id], |row| Ok(TextCard { id: row.get(0)?, task_id: row.get(1)?, content: row.get(2)?, created_at: row.get(3)?, updated_at: row.get(4)? }))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            cards
+        };
+        let recordings = self.list_recordings()?.into_iter().filter(|recording| recording.task_id.as_deref() == Some(task_id)).collect::<Vec<_>>();
+        let recording_ids = recordings.iter().map(|recording| recording.id.as_str()).collect::<HashSet<_>>();
+        let summaries = self.list_recording_summaries()?.into_iter().filter(|summary| recording_ids.contains(summary.recording_id.as_str())).collect();
+        Ok(TaskDocument { task, text_cards, recordings, summaries })
+    }
+
+    pub fn task_document_for_recording(&self, recording_id: &str) -> Result<TaskDocument> {
+        let task_id: String = self.conn.query_row("SELECT task_id FROM recordings WHERE id=?1", [recording_id], |row| row.get(0)).context("录音尚未绑定需求")?;
+        self.task_document(&task_id)
+    }
+
+    fn ensure_active_task(&self, task_id: &str) -> Result<()> {
+        let active: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks t JOIN task_revisions r ON r.id=(SELECT rr.id FROM task_revisions rr WHERE rr.task_id=t.id AND rr.status!='cancelled' ORDER BY rr.revision_no DESC LIMIT 1) WHERE t.id=?1 AND r.status='active')",
+            [task_id], |row| row.get(0),
+        )?;
+        anyhow::ensure!(active, "已完成需求为只读，请先返工");
+        Ok(())
+    }
+
+    pub fn create_text_card(&self, task_id: &str) -> Result<TextCard> {
+        self.ensure_active_task(task_id)?;
+        let id = Uuid::new_v4().to_string();
+        let timestamp = now();
+        self.conn.execute("INSERT INTO task_text_cards(id,task_id,content,created_at,updated_at) VALUES(?1,?2,'',?3,?3)", params![id, task_id, timestamp])?;
+        Ok(TextCard { id, task_id: task_id.into(), content: String::new(), created_at: timestamp.clone(), updated_at: timestamp })
+    }
+
+    pub fn update_text_card(&self, card_id: &str, content: &str) -> Result<()> {
+        let task_id: String = self.conn.query_row("SELECT task_id FROM task_text_cards WHERE id=?1", [card_id], |row| row.get(0)).context("文本卡不存在")?;
+        self.ensure_active_task(&task_id)?;
+        let content = content.trim_end();
+        anyhow::ensure!(content.chars().count() <= 50_000, "文本内容过长");
+        self.conn.execute("UPDATE task_text_cards SET content=?2,updated_at=?3 WHERE id=?1", params![card_id, content, now()])?;
+        Ok(())
+    }
+
+    pub fn delete_text_card(&self, card_id: &str) -> Result<()> {
+        let task_id: String = self.conn.query_row("SELECT task_id FROM task_text_cards WHERE id=?1", [card_id], |row| row.get(0)).context("文本卡不存在")?;
+        self.ensure_active_task(&task_id)?;
+        self.conn.execute("DELETE FROM task_text_cards WHERE id=?1", [card_id])?;
+        Ok(())
+    }
+
+    pub fn update_task_title(&self, task_id: &str, title: &str) -> Result<()> {
+        self.ensure_active_task(task_id)?;
+        let title = title.trim();
+        anyhow::ensure!(!title.is_empty() && title.chars().count() <= 80, "标题必须为 1 到 80 个字符");
+        self.conn.execute("UPDATE tasks SET title=?2,source_title=?2,title_mode='title',updated_at=?3 WHERE id=?1", params![task_id, title, now()])?;
+        Ok(())
+    }
+
+    pub fn update_task_contact(&self, task_id: &str, contact_id: Option<&str>) -> Result<()> {
+        self.ensure_active_task(task_id)?;
+        if let Some(contact_id) = contact_id {
+            let exists: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM contacts WHERE id=?1)", [contact_id], |row| row.get(0))?;
+            anyhow::ensure!(exists, "联系人不存在");
+        }
+        self.conn.execute("UPDATE tasks SET contact_id=?2,updated_at=?3 WHERE id=?1", params![task_id, contact_id, now()])?;
+        Ok(())
+    }
+
+    pub fn update_task_link(&self, task_id: &str, url: Option<&str>) -> Result<()> {
+        self.ensure_active_task(task_id)?;
+        let url = url.unwrap_or("").trim();
+        if !url.is_empty() {
+            let parsed = Url::parse(url).context("链接格式无效")?;
+            anyhow::ensure!(["http", "https"].contains(&parsed.scheme()), "只支持 HTTP 或 HTTPS 链接");
+        }
+        self.conn.execute("UPDATE tasks SET url=?2,updated_at=?3 WHERE id=?1", params![task_id, url, now()])?;
+        Ok(())
+    }
+
+    pub fn list_recording_summaries(&self) -> Result<Vec<RecordingSummary>> {
+        query_all(&self.conn, "SELECT recording_id,overview,pending_items,confirmed_decisions,requested_changes,action_items,open_questions,source_transcript_hash,model,prompt_version,status,error_message,user_edited,updated_at FROM recording_summaries ORDER BY updated_at DESC", |row| {
+            let pending: String = row.get(2)?; let decisions: String = row.get(3)?; let changes: String = row.get(4)?; let actions: String = row.get(5)?; let questions: String = row.get(6)?;
+            Ok(RecordingSummary {
+                recording_id: row.get(0)?, overview: row.get(1)?,
+                pending_items: serde_json::from_str(&pending).unwrap_or_default(),
+                confirmed_decisions: serde_json::from_str(&decisions).unwrap_or_default(),
+                requested_changes: serde_json::from_str(&changes).unwrap_or_default(),
+                action_items: serde_json::from_str(&actions).unwrap_or_default(),
+                open_questions: serde_json::from_str(&questions).unwrap_or_default(),
+                source_transcript_hash: row.get(7)?, model: row.get(8)?, prompt_version: row.get(9)?, status: row.get(10)?, error_message: row.get(11)?, user_edited: row.get::<_, i64>(12)? != 0, updated_at: row.get(13)?,
+            })
+        })
+    }
+
+    pub fn set_recording_summary_status(&self, recording_id: &str, status: &str, error: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO recording_summaries(recording_id,status,error_message,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(recording_id) DO UPDATE SET status=excluded.status,error_message=excluded.error_message,updated_at=excluded.updated_at",
+            params![recording_id, status, error, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn save_recording_summary(&self, summary: &RecordingSummary) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO recording_summaries(recording_id,overview,pending_items,confirmed_decisions,requested_changes,action_items,open_questions,source_transcript_hash,model,prompt_version,status,error_message,user_edited,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14) ON CONFLICT(recording_id) DO UPDATE SET overview=excluded.overview,pending_items=excluded.pending_items,confirmed_decisions=excluded.confirmed_decisions,requested_changes=excluded.requested_changes,action_items=excluded.action_items,open_questions=excluded.open_questions,source_transcript_hash=excluded.source_transcript_hash,model=excluded.model,prompt_version=excluded.prompt_version,status=excluded.status,error_message=excluded.error_message,user_edited=excluded.user_edited,updated_at=excluded.updated_at",
+            params![summary.recording_id, summary.overview, serde_json::to_string(&summary.pending_items)?, serde_json::to_string(&summary.confirmed_decisions)?, serde_json::to_string(&summary.requested_changes)?, serde_json::to_string(&summary.action_items)?, serde_json::to_string(&summary.open_questions)?, summary.source_transcript_hash, summary.model, summary.prompt_version, summary.status, summary.error_message, summary.user_edited as i64, summary.updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_summary_stale(&self, recording_id: &str) -> Result<()> {
+        self.conn.execute("UPDATE recording_summaries SET status='stale',updated_at=?2 WHERE recording_id=?1", params![recording_id, now()])?;
+        Ok(())
     }
 
     pub fn settings(&self) -> Result<Settings> {
@@ -610,11 +777,62 @@ impl Database {
             [],
             |row| row.get(0),
         )?;
+        tx.execute("DELETE FROM recordings WHERE task_id=?1", [task_id])?;
         let changed = tx.execute("DELETE FROM tasks WHERE id=?1", [task_id])?;
         anyhow::ensure!(changed == 1, "任务不存在");
         if current.as_deref() == Some(task_id) {
             Self::set_current_task_id_tx(&tx, None)?;
         }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_completed_task(&mut self, task_id: &str) -> Result<()> {
+        let task = self.list_tasks()?.into_iter().find(|task| task.id == task_id).context("任务不存在")?;
+        anyhow::ensure!(task.status == "completed", "进行中的需求不能删除，请先完成");
+        self.delete_task(task_id)
+    }
+
+    pub fn clear_all_data(&mut self) -> Result<()> {
+        self.conn.execute_batch(
+            "DELETE FROM progress_events;
+             DELETE FROM recording_summaries;
+             DELETE FROM task_text_cards;
+             DELETE FROM recordings;
+             DELETE FROM group_slot_bindings;
+             DELETE FROM completed_group_slot_bindings;
+             DELETE FROM task_revisions;
+             DELETE FROM tasks;
+             DELETE FROM contacts;
+             DELETE FROM app_state;
+             DELETE FROM task_groups;
+             DELETE FROM settings;",
+        )?;
+        for group in GROUPS { self.conn.execute("INSERT INTO task_groups(id,name) VALUES(?1,'')", [group])?; }
+        self.conn.execute("INSERT INTO app_state(key,value) VALUES('current_group','red')", [])?;
+        self.conn.execute("INSERT INTO app_state(key,value) VALUES('current_task_id',NULL)", [])?;
+        self.conn.execute("INSERT INTO settings(key,value) VALUES('app_settings',?1)", [serde_json::to_string(&Settings::default())?])?;
+        Ok(())
+    }
+
+    pub fn resolve_task_overflow(&mut self, keep_ids: &[String]) -> Result<()> {
+        anyhow::ensure!(keep_ids.len() == 10, "请选择 10 个保留在进行中的需求");
+        let unique = keep_ids.iter().collect::<HashSet<_>>();
+        anyhow::ensure!(unique.len() == keep_ids.len(), "保留列表包含重复需求");
+        let active_ids = self.list_tasks()?.into_iter().filter(|task| task.status == "active").map(|task| task.id).collect::<HashSet<_>>();
+        anyhow::ensure!(active_ids.len() > 10, "当前不需要整理进行中需求");
+        anyhow::ensure!(keep_ids.iter().all(|id| active_ids.contains(id)), "保留列表包含非进行中需求");
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM group_slot_bindings WHERE task_id IN (SELECT task_id FROM task_revisions WHERE status='active')", [])?;
+        for task_id in active_ids.iter().filter(|id| !unique.contains(id)) {
+            tx.execute("UPDATE task_revisions SET status='completed',completed_at=?2 WHERE id=(SELECT id FROM task_revisions WHERE task_id=?1 AND status!='cancelled' ORDER BY revision_no DESC LIMIT 1)", params![task_id, now()])?;
+        }
+        for (slot, task_id) in keep_ids.iter().enumerate() {
+            tx.execute("UPDATE tasks SET color='red',updated_at=?2 WHERE id=?1", params![task_id, now()])?;
+            tx.execute("INSERT INTO group_slot_bindings(group_name,slot,task_id,created_at) VALUES('red',?1,?2,?3)", params![slot as i64, task_id, now()])?;
+        }
+        Self::set_current_group_tx(&tx, "red")?;
+        Self::set_current_task_id_tx(&tx, keep_ids.first().map(String::as_str))?;
         tx.commit()?;
         Ok(())
     }
@@ -752,15 +970,6 @@ impl Database {
                 let task_id = task_id.ok_or_else(|| anyhow!("该数字槽位尚未绑定任务"))?;
                 Ok(Some(self.set_current_task(&task_id)?))
             }
-            AppAction::AdjustProgress { delta } => {
-                let requested = if *delta < 0 {
-                    -PROGRESS_STEP
-                } else {
-                    PROGRESS_STEP
-                };
-                self.adjust_progress(requested)?;
-                Ok(None)
-            }
             AppAction::CompleteCurrent => {
                 self.complete_current()?;
                 Ok(None)
@@ -769,14 +978,8 @@ impl Database {
                 self.start_rework()?;
                 Ok(None)
             }
-            AppAction::PreviousGroup => {
-                self.cycle_group(-1)?;
-                Ok(None)
-            }
-            AppAction::NextGroup => {
-                self.cycle_group(1)?;
-                Ok(None)
-            }
+            AppAction::PreviousGroup => { self.cycle_group(-1)?; Ok(None) }
+            AppAction::NextGroup => { self.cycle_group(1)?; Ok(None) }
             AppAction::OpenConsole => Ok(None),
             AppAction::ToggleRecording => Ok(None),
         }
@@ -801,7 +1004,7 @@ impl Database {
         Ok(())
     }
 
-    fn current_revision_tx(tx: &Transaction<'_>) -> Result<(String, String, i64, String)> {
+    fn current_revision_tx(tx: &Transaction<'_>) -> Result<(String, String, String)> {
         let task_id: Option<String> = tx.query_row(
             "SELECT value FROM app_state WHERE key='current_task_id'",
             [],
@@ -809,48 +1012,20 @@ impl Database {
         )?;
         let task_id = task_id.ok_or_else(|| anyhow!("尚未选择当前任务"))?;
         tx.query_row(
-            "SELECT id,task_id,progress,status FROM task_revisions WHERE task_id=?1 AND status!='cancelled' ORDER BY revision_no DESC LIMIT 1",
+            "SELECT id,task_id,status FROM task_revisions WHERE task_id=?1 AND status!='cancelled' ORDER BY revision_no DESC LIMIT 1",
             [task_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).context("当前任务没有有效轮次")
-    }
-
-    fn adjust_progress(&mut self, delta: i64) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        let (revision_id, _, old, status) = Self::current_revision_tx(&tx)?;
-        anyhow::ensure!(
-            status == "active",
-            "已完成任务不能直接修改进度，请先恢复任务"
-        );
-        let new_value = (old + delta).clamp(0, 100);
-        if new_value != old {
-            tx.execute(
-                "UPDATE task_revisions SET progress=?2 WHERE id=?1",
-                params![revision_id, new_value],
-            )?;
-            tx.execute(
-                "INSERT INTO progress_events(id,revision_id,old_value,new_value,source,created_at) VALUES(?1,?2,?3,?4,'command',?5)",
-                params![Uuid::new_v4().to_string(), revision_id, old, new_value, now()],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
     }
 
     fn complete_current(&mut self) -> Result<()> {
         let tx = self.conn.transaction()?;
-        let (revision_id, task_id, old, status) = Self::current_revision_tx(&tx)?;
+        let (revision_id, task_id, status) = Self::current_revision_tx(&tx)?;
         anyhow::ensure!(status == "active", "任务已经完成");
         tx.execute(
-            "UPDATE task_revisions SET progress=100,status='completed',completed_at=?2 WHERE id=?1",
+            "UPDATE task_revisions SET status='completed',completed_at=?2 WHERE id=?1",
             params![revision_id, now()],
         )?;
-        if old != 100 {
-            tx.execute(
-                "INSERT INTO progress_events(id,revision_id,old_value,new_value,source,created_at) VALUES(?1,?2,?3,100,'complete',?4)",
-                params![Uuid::new_v4().to_string(), revision_id, old, now()],
-            )?;
-        }
         if let Some(slot) = tx
             .query_row(
                 "SELECT group_name,slot FROM group_slot_bindings WHERE task_id=?1",
@@ -871,42 +1046,33 @@ impl Database {
 
     fn start_rework(&mut self) -> Result<()> {
         let tx = self.conn.transaction()?;
-        let (revision_id, task_id, old, status) = Self::current_revision_tx(&tx)?;
+        let (revision_id, task_id, status) = Self::current_revision_tx(&tx)?;
         anyhow::ensure!(status == "completed", "只有已完成任务可以恢复");
         tx.execute(
-            "UPDATE task_revisions SET status='active',progress=50,completed_at=NULL WHERE id=?1",
+            "UPDATE task_revisions SET status='active',completed_at=NULL WHERE id=?1",
             [&revision_id],
         )?;
-        tx.execute(
-            "INSERT INTO progress_events(id,revision_id,old_value,new_value,source,created_at) VALUES(?1,?2,?3,50,'rework',?4)",
-            params![Uuid::new_v4().to_string(), revision_id, old, now()],
-        )?;
-        if let Some(slot) = tx
+        let original_slot = tx
             .query_row(
                 "SELECT group_name,slot FROM completed_group_slot_bindings WHERE task_id=?1",
                 [&task_id],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
             )
-            .optional()?
-        {
-            let occupied: Option<String> = tx
-                .query_row(
-                    "SELECT task_id FROM group_slot_bindings WHERE group_name=?1 AND slot=?2",
-                    params![slot.0, slot.1],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if occupied.is_none() {
-                tx.execute(
-                    "INSERT INTO group_slot_bindings(group_name,slot,task_id,created_at) VALUES(?1,?2,?3,?4)",
-                    params![slot.0, slot.1, task_id, now()],
-                )?;
+            .optional()?;
+        let requested_slot = original_slot.as_ref().map(|(_, slot)| *slot);
+        let mut selected_slot = requested_slot.filter(|slot| {
+            tx.query_row("SELECT EXISTS(SELECT 1 FROM group_slot_bindings WHERE group_name='red' AND slot=?1)", [slot], |row| row.get::<_, bool>(0)).unwrap_or(true) == false
+        });
+        if selected_slot.is_none() {
+            for slot in 0..10 {
+                let occupied: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM group_slot_bindings WHERE group_name='red' AND slot=?1)", [slot], |row| row.get(0))?;
+                if !occupied { selected_slot = Some(slot); break; }
             }
-            tx.execute(
-                "DELETE FROM completed_group_slot_bindings WHERE task_id=?1",
-                [&task_id],
-            )?;
         }
+        let selected_slot = selected_slot.context("没有可用数字键，请先完成其他需求")?;
+        tx.execute("INSERT INTO group_slot_bindings(group_name,slot,task_id,created_at) VALUES('red',?1,?2,?3)", params![selected_slot, task_id, now()])?;
+        tx.execute("UPDATE tasks SET color='red' WHERE id=?1", [&task_id])?;
+        tx.execute("DELETE FROM completed_group_slot_bindings WHERE task_id=?1", [&task_id])?;
         tx.commit()?;
         Ok(())
     }
@@ -988,11 +1154,12 @@ impl Database {
     fn list_tasks(&self) -> Result<Vec<Task>> {
         let mut statement = self.conn.prepare(
             r#"SELECT t.id,t.title,t.title_mode,t.source_title,t.url,t.color,t.contact_id,c.name,t.priority,t.pinned,t.manual_order,t.last_opened_at,
-                      r.status,r.progress,r.started_at,r.completed_at,s.slot
+                      r.status,r.started_at,r.completed_at,COALESCE(s.slot,cs.slot)
                FROM tasks t
                JOIN task_revisions r ON r.id=(SELECT rr.id FROM task_revisions rr WHERE rr.task_id=t.id AND rr.status!='cancelled' ORDER BY rr.revision_no DESC LIMIT 1)
                LEFT JOIN contacts c ON c.id=t.contact_id
                LEFT JOIN group_slot_bindings s ON s.task_id=t.id
+               LEFT JOIN completed_group_slot_bindings cs ON cs.task_id=t.id
                ORDER BY t.manual_order ASC"#,
         )?;
         let rows = statement.query_map([], |row| {
@@ -1010,10 +1177,9 @@ impl Database {
                 manual_order: row.get(10)?,
                 last_opened_at: row.get(11)?,
                 status: row.get(12)?,
-                progress: row.get(13)?,
-                started_at: row.get(14)?,
-                completed_at: row.get(15)?,
-                slot: row.get(16)?,
+                started_at: row.get(13)?,
+                completed_at: row.get(14)?,
+                slot: row.get(15)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1094,11 +1260,13 @@ fn clean_title_mode(value: &str) -> Result<String> {
 fn validate_title_and_url(title: &str, url: &str) -> Result<()> {
     anyhow::ensure!(!title.trim().is_empty(), "任务标题不能为空");
     anyhow::ensure!(title.chars().count() <= 80, "任务标题不能超过 80 个字符");
-    let parsed = Url::parse(url.trim()).context("链接格式无效")?;
-    anyhow::ensure!(
-        ["http", "https"].contains(&parsed.scheme()),
-        "只支持 HTTP 或 HTTPS 链接"
-    );
+    if !url.trim().is_empty() {
+        let parsed = Url::parse(url.trim()).context("链接格式无效")?;
+        anyhow::ensure!(
+            ["http", "https"].contains(&parsed.scheme()),
+            "只支持 HTTP 或 HTTPS 链接"
+        );
+    }
     Ok(())
 }
 
@@ -1142,25 +1310,6 @@ mod tests {
     }
 
     #[test]
-    fn completed_task_resumes_at_fifty_percent() {
-        let mut db = Database::memory().unwrap();
-        db.create_task(sample_task(0)).unwrap();
-        db.dispatch(&AppAction::AdjustProgress { delta: 65 })
-            .unwrap();
-        db.dispatch(&AppAction::CompleteCurrent).unwrap();
-        let completed = db.snapshot().unwrap().tasks.remove(0);
-        assert_eq!(completed.progress, 100);
-        assert_eq!(completed.status, "completed");
-        assert_eq!(completed.slot, None);
-
-        db.dispatch(&AppAction::StartRework).unwrap();
-        let resumed = db.snapshot().unwrap().tasks.remove(0);
-        assert_eq!(resumed.progress, 50);
-        assert_eq!(resumed.status, "active");
-        assert_eq!(resumed.slot, Some(0));
-    }
-
-    #[test]
     fn updating_task_preserves_the_independent_source_title() {
         let mut db = Database::memory().unwrap();
         db.create_task(sample_task(0)).unwrap();
@@ -1176,35 +1325,6 @@ mod tests {
             slot: Some(0),
         }).unwrap();
         assert_eq!(db.snapshot().unwrap().tasks[0].source_title.as_deref(), Some("搜索页"));
-    }
-
-    #[test]
-    fn progress_is_clamped() {
-        let mut db = Database::memory().unwrap();
-        db.create_task(sample_task(0)).unwrap();
-        for _ in 0..6 {
-            db.dispatch(&AppAction::AdjustProgress { delta: 1 })
-                .unwrap();
-        }
-        let task = db.snapshot().unwrap().tasks.remove(0);
-        assert_eq!(task.progress, 100);
-    }
-
-    #[test]
-    fn completing_and_resuming_does_not_create_a_new_revision() {
-        let mut db = Database::memory().unwrap();
-        db.create_task(sample_task(0)).unwrap();
-        db.dispatch(&AppAction::CompleteCurrent).unwrap();
-        for _ in 0..7 {
-            db.dispatch(&AppAction::StartRework).unwrap();
-            assert_eq!(db.snapshot().unwrap().tasks[0].progress, 50);
-            db.dispatch(&AppAction::CompleteCurrent).unwrap();
-        }
-        let revisions: i64 = db
-            .conn
-            .query_row("SELECT COUNT(*) FROM task_revisions", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(revisions, 1);
     }
 
     #[test]
@@ -1235,12 +1355,14 @@ mod tests {
     }
 
     #[test]
-    fn resumed_task_stays_unbound_when_completed_slot_is_taken() {
+    fn resumed_task_uses_first_free_slot_when_original_is_taken() {
         let mut db = Database::memory().unwrap();
         db.create_task(sample_task(0)).unwrap();
         let first = db.snapshot().unwrap().tasks[0].id.clone();
         db.dispatch(&AppAction::CompleteCurrent).unwrap();
-        db.create_task(sample_task(0)).unwrap();
+        let mut occupying = sample_task(0);
+        occupying.group = "red".into();
+        db.create_task(occupying).unwrap();
         db.set_current_task(&first).unwrap();
         db.dispatch(&AppAction::StartRework).unwrap();
         let task = db
@@ -1250,7 +1372,7 @@ mod tests {
             .into_iter()
             .find(|task| task.id == first)
             .unwrap();
-        assert_eq!(task.slot, None);
+        assert_eq!(task.slot, Some(1));
     }
 
     #[test]
@@ -1552,5 +1674,49 @@ mod tests {
         let recording = db.snapshot().unwrap().recordings.into_iter().find(|item| item.id == id).unwrap();
         assert_eq!(recording.status, "error");
         assert!(recording.error_message.unwrap().contains("未正常结束"));
+    }
+
+    #[test]
+    fn task_document_persists_text_cards_and_summary() {
+        let mut db = Database::memory().unwrap();
+        db.create_task(sample_task(0)).unwrap();
+        let task_id = db.snapshot().unwrap().tasks[0].id.clone();
+        let card = db.create_text_card(&task_id).unwrap();
+        db.update_text_card(&card.id, "补充异常状态").unwrap();
+        let recording_id = db.start_recording(Some(&task_id)).unwrap();
+        db.finish_recording(&recording_id, 2.0, "/tmp/test.wav").unwrap();
+        db.complete_transcription(&recording_id, "确认保留两步流程").unwrap();
+        db.save_recording_summary(&RecordingSummary {
+            recording_id: recording_id.clone(), overview: "保留两步流程".into(), pending_items: vec!["补充异常状态".into()], confirmed_decisions: vec!["保留两步流程".into()], requested_changes: vec![], action_items: vec![ActionItem { text: "补充方案".into(), owner: None, due: None }], open_questions: vec![], source_transcript_hash: Some("hash".into()), model: Some("deepseek-v4-flash".into()), prompt_version: "recording-summary-v1".into(), status: "completed".into(), error_message: None, user_edited: false, updated_at: now(),
+        }).unwrap();
+        let document = db.task_document(&task_id).unwrap();
+        assert_eq!(document.text_cards[0].content, "补充异常状态");
+        assert_eq!(document.summaries[0].overview, "保留两步流程");
+    }
+
+    #[test]
+    fn completed_document_rejects_new_text_cards() {
+        let mut db = Database::memory().unwrap();
+        db.create_task(sample_task(0)).unwrap();
+        let task_id = db.snapshot().unwrap().tasks[0].id.clone();
+        db.dispatch(&AppAction::CompleteCurrent).unwrap();
+        assert!(db.create_text_card(&task_id).is_err());
+    }
+
+    #[test]
+    fn overflow_resolution_keeps_selected_workset() {
+        let mut db = Database::memory().unwrap();
+        let mut ids = Vec::new();
+        for slot in 0..11 {
+            let mut task = sample_task(slot % 10);
+            task.group = if slot < 10 { "red" } else { "blue" }.into();
+            db.create_task(task).unwrap();
+            ids.push(db.snapshot().unwrap().tasks.last().unwrap().id.clone());
+        }
+        let keep = ids[1..11].to_vec();
+        db.resolve_task_overflow(&keep).unwrap();
+        let tasks = db.snapshot().unwrap().tasks;
+        assert_eq!(tasks.iter().filter(|task| task.status == "active").count(), 10);
+        assert_eq!(tasks.iter().filter(|task| task.status == "active" && task.slot.is_some()).count(), 10);
     }
 }

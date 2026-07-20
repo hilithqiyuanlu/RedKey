@@ -1,1142 +1,670 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import {
-  Check,
-  CircleGauge,
-  Clipboard,
-  ExternalLink,
-  Folder,
-  Keyboard,
-  Mic,
-  MicOff,
-  Link2,
-  ListTodo,
-  Minus,
-  Pencil,
-  Plus,
-  Redo2,
-  Settings as SettingsIcon,
-  Trash2,
-  UserPlus,
-} from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { api, onLinkDrop, onModelStatus, onNewTask, onPartialTranscript, onProgressHud, onQuickPanelShown, onRecordingToggle, onTaskHud } from "./api";
-import { extractHttpUrl, petState, slotLabel, slotTaskText, tasksForGroup, tasksForView } from "./domain";
-import { TaskEditor } from "./TaskEditor";
-import type { AppAction, ModelStatus, ProgressHudPayload, RecordingDetail, ShortcutSettings, Snapshot, Task, TaskGroup, TaskGroupInfo, TaskHudPayload } from "./types";
+import {
+  Check, ChevronDown, ChevronRight, CircleAlert, CircleCheck, Clipboard, ClipboardPaste, Download, ExternalLink,
+  FileImage, FileText, KeyRound, Link2, ListTodo, LoaderCircle, Mic, MicOff, Pencil,
+  Plus, RefreshCw, RotateCcw, Settings as SettingsIcon, Trash2, UserRound, X,
+} from "lucide-react";
+import { api, onLinkDrop, onModelStatus, onNewTask, onPartialTranscript, onQuickPanelShown, onRecordingToggle, onTaskHud } from "./api";
+import { extractHttpUrl, petState, slotLabel } from "./domain";
+import type {
+  DeepSeekSettings, ModelStatus, Recording, RecordingDetail, RecordingSummary, Settings,
+  Snapshot, Task, TaskDocument, TaskHudPayload, TextCard,
+} from "./types";
 import { useSnapshot } from "./useSnapshot";
 
-type View = "tasks" | "meetings" | "settings";
+type View = "active" | "completed" | "settings";
+type RecorderHandle = { stop: () => Promise<Uint8Array>; snapshot: () => Uint8Array };
 
-function windowView() {
-  return new URLSearchParams(window.location.search).get("view") ?? "console";
-}
-
-function initialConsoleView(): View {
-  const view = windowView();
-  return view === "meetings" || view === "settings" ? view : "tasks";
-}
-
-async function clipboardText() {
-  try {
-    return await readText();
-  } catch {
-    return navigator.clipboard?.readText?.() ?? "";
-  }
-}
-
-function nextPaint(): Promise<void> {
-  return new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
-}
-
-function recordingErrorMessage(reason: unknown): string {
-  if (reason instanceof DOMException && reason.name === "NotAllowedError") {
-    return "无法访问麦克风。请在系统设置的“隐私与安全性 → 麦克风”中允许 RedKey，然后重新尝试。";
-  }
-  return `无法开始录音：${String(reason)}`;
-}
+function windowView() { return new URLSearchParams(window.location.search).get("view") ?? "console"; }
+function initialView(): View { return windowView() === "settings" ? "settings" : "active"; }
 
 export function App() {
   const view = windowView();
   if (view === "pet") return <Pet />;
   if (view === "quick") return <QuickPanel />;
-  if (view === "hud") return <ProgressHudWindow />;
+  if (view === "hud") return <TaskHudWindow />;
   return <ConsoleApp />;
 }
 
 function ConsoleApp() {
-  const { snapshot, setSnapshot, currentTask, error } = useSnapshot();
-  const [view, setView] = useState<View>(initialConsoleView);
-  const [editing, setEditing] = useState<Task | "new" | null>(null);
-  const [editorUrl, setEditorUrl] = useState<string | null>(null);
-  const [newSlot, setNewSlot] = useState<number | null>(null);
+  const { snapshot, setSnapshot, error } = useSnapshot();
+  const [view, setView] = useState<View>(initialView);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [prefillUrl, setPrefillUrl] = useState("");
+  const [prefillSlot, setPrefillSlot] = useState<number | null>(null);
   const [notice, setNotice] = useState("");
+  const [documentVersion, setDocumentVersion] = useState(0);
   const noticeTimer = useRef<number | null>(null);
-  const recorderRef = useRef<{ stop: () => Promise<Uint8Array>; snapshot: () => Uint8Array } | null>(null);
+  const recorderRef = useRef<RecorderHandle | null>(null);
   const recordingIdRef = useRef<string | null>(null);
   const recordingStartedRef = useRef(0);
   const nativeRecordingRef = useRef(false);
-  const recordingCooldownRef = useRef(false);
-  const recordingCooldownTimer = useRef<number | null>(null);
-  const [recordingCoolingDown, setRecordingCoolingDown] = useState(false);
   const [recordingElapsed, setRecordingElapsed] = useState(0);
   const [recordingLevel, setRecordingLevel] = useState(0);
-  const recordingClockRef = useRef<number | null>(null);
-  const autoRecordingStarted = useRef(false);
-  const snapshotRef = useRef<Snapshot | null>(null);
-  snapshotRef.current = snapshot;
+  const clockRef = useRef<number | null>(null);
+
+  const activeTasks = useMemo(() => sortRecent(snapshot?.tasks.filter((task) => task.status === "active" && task.group === "red") ?? []), [snapshot]);
+  const overflowTasks = useMemo(() => sortRecent(snapshot?.tasks.filter((task) => task.status === "active") ?? []), [snapshot]);
+  const completedTasks = useMemo(() => [...(snapshot?.tasks.filter((task) => task.status === "completed") ?? [])].sort((a, b) => (b.completedAt ?? "").localeCompare(a.completedAt ?? "")), [snapshot]);
+  const selectedTask = snapshot?.tasks.find((task) => task.id === selectedId) ?? null;
+  const document = useTaskDocument(selectedTask?.id ?? null, snapshot, documentVersion);
 
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    void onNewTask((url) => {
-      setView("tasks");
-      setNewSlot(null);
-      setEditorUrl(url);
-      setEditing("new");
-    }).then((cleanup) => { unlisten = cleanup; });
-    return () => unlisten?.();
-  }, []);
-
-  async function toggleRecording() {
-    if (recordingCooldownRef.current) return;
-    if (nativeRecordingRef.current) {
-      beginRecordingCooldown();
-      stopRecordingClock();
-      await nextPaint();
-      try { setSnapshot(await api.stopNativeRecording()); nativeRecordingRef.current = false; recordingIdRef.current = null; }
-      catch (reason) { notify(String(reason)); }
-      return;
-    }
-    if (recorderRef.current) {
-      beginRecordingCooldown();
-      const recorder = recorderRef.current;
-      recorderRef.current = null;
-      stopRecordingClock();
-      await nextPaint();
-      try {
-        const bytes = await recorder.stop();
-        const recordingId = recordingIdRef.current;
-        if (recordingId) await api.finishRecording(recordingId, bytes, (Date.now() - recordingStartedRef.current) / 1000);
-        recordingIdRef.current = null;
-      } catch (reason) { notify(String(reason)); }
-      return;
-    }
-    try {
-      if (!(await api.requestMicrophonePermission())) {
-        throw new DOMException("麦克风权限未授予", "NotAllowedError");
-      }
-      if (!navigator.mediaDevices?.getUserMedia) {
-        const recordingId = await api.startNativeRecording();
-        nativeRecordingRef.current = true;
-        recordingIdRef.current = recordingId;
-        recordingStartedRef.current = Date.now();
-        startRecordingClock();
-        notify("已开始录音");
-        return;
-      }
-      const recordingId = await api.startRecording();
-      recordingIdRef.current = recordingId;
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = await startPcmRecorder(stream, setRecordingLevel);
-      recordingStartedRef.current = Date.now();
-      recorderRef.current = recorder;
-      startRecordingClock();
-      const partialTimer = window.setInterval(() => {
-        if (recorderRef.current === recorder && recordingIdRef.current) void api.transcribePartial(recordingIdRef.current, recorder.snapshot()).catch(() => undefined);
-        else window.clearInterval(partialTimer);
-      }, 5000);
-      notify("已开始录音");
-    } catch (reason) {
-      if (recordingIdRef.current) void api.failRecording(recordingIdRef.current, String(reason));
-      recordingIdRef.current = null;
-      notify(recordingErrorMessage(reason));
-    }
-  }
-
-  function startRecordingClock() {
-    stopRecordingClock();
-    setRecordingElapsed(0);
-    recordingClockRef.current = window.setInterval(() => setRecordingElapsed(Math.floor((Date.now() - recordingStartedRef.current) / 1000)), 250);
-  }
-
-  function stopRecordingClock() {
-    if (recordingClockRef.current != null) window.clearInterval(recordingClockRef.current);
-    recordingClockRef.current = null;
-    setRecordingLevel(0);
-  }
-
-  function beginRecordingCooldown() {
-    recordingCooldownRef.current = true;
-    setRecordingCoolingDown(true);
-    if (recordingCooldownTimer.current != null) window.clearTimeout(recordingCooldownTimer.current);
-    recordingCooldownTimer.current = window.setTimeout(() => {
-      recordingCooldownRef.current = false;
-      setRecordingCoolingDown(false);
-    }, 1000);
-  }
+    if (!snapshot || view === "settings") return;
+    const candidates = view === "completed" ? completedTasks : activeTasks;
+    if (!candidates.length) { setSelectedId(null); return; }
+    const currentValid = candidates.some((task) => task.id === selectedId);
+    if (!currentValid) setSelectedId(view === "active" ? (snapshot.currentTaskId && candidates.some((task) => task.id === snapshot.currentTaskId) ? snapshot.currentTaskId : candidates[0].id) : candidates[0].id);
+  }, [snapshot, view, selectedId, activeTasks, completedTasks]);
 
   useEffect(() => {
-    if (new URLSearchParams(window.location.search).get("startRecording") !== "1" || autoRecordingStarted.current) return;
-    autoRecordingStarted.current = true;
-    void toggleRecording();
+    let cleanup: (() => void) | undefined;
+    void onNewTask((url) => { setView("active"); setPrefillUrl(url); setPrefillSlot(null); setCreating(true); }).then((stop) => { cleanup = stop; });
+    return () => cleanup?.();
   }, []);
 
   useEffect(() => {
     let cleanup: (() => void) | undefined;
-    void onRecordingToggle(() => { void toggleRecording(); }).then((unlisten) => { cleanup = unlisten; });
+    void onRecordingToggle(() => { if (selectedTask?.status === "active") void toggleRecording(selectedTask.id); }).then((stop) => { cleanup = stop; });
     return () => cleanup?.();
-  }, []);
+  }, [selectedTask?.id, selectedTask?.status]);
 
-  useEffect(() => () => {
-    void recorderRef.current?.stop();
-    stopRecordingClock();
-    if (recordingCooldownTimer.current != null) window.clearTimeout(recordingCooldownTimer.current);
-  }, []);
-
-  const completedTasks = useMemo(() => {
-    if (!snapshot) return [];
-    const group = snapshot.settings.multiGroupEnabled ? snapshot.currentGroup : "red";
-    const visibleTasks = snapshot.settings.multiGroupEnabled ? snapshot.tasks : tasksForGroup(snapshot.tasks, "red");
-    return tasksForView(snapshot.settings.multiGroupEnabled ? visibleTasks : tasksForGroup(visibleTasks, group), "completed");
-  }, [snapshot]);
+  useEffect(() => () => { void recorderRef.current?.stop(); stopClock(); }, []);
 
   function notify(message: string) {
     setNotice(message);
     if (noticeTimer.current != null) window.clearTimeout(noticeTimer.current);
-    noticeTimer.current = window.setTimeout(() => setNotice(""), 3000);
+    noticeTimer.current = window.setTimeout(() => setNotice(""), 3200);
   }
 
-  async function run(operation: () => Promise<Snapshot>, message?: string) {
+  function stopClock() {
+    if (clockRef.current != null) window.clearInterval(clockRef.current);
+    clockRef.current = null;
+    setRecordingLevel(0);
+  }
+
+  function startClock() {
+    stopClock();
+    setRecordingElapsed(0);
+    clockRef.current = window.setInterval(() => setRecordingElapsed(Math.floor((Date.now() - recordingStartedRef.current) / 1000)), 250);
+  }
+
+  async function toggleRecording(taskId: string) {
+    if (nativeRecordingRef.current) {
+      stopClock();
+      try { setSnapshot(await api.stopNativeRecording()); notify("录音已保存，正在处理"); }
+      catch (reason) { notify(String(reason)); }
+      nativeRecordingRef.current = false; recordingIdRef.current = null; setDocumentVersion((value) => value + 1); return;
+    }
+    if (recorderRef.current) {
+      const recorder = recorderRef.current; recorderRef.current = null; stopClock();
+      try {
+        const bytes = await recorder.stop();
+        if (recordingIdRef.current) setSnapshot(await api.finishRecording(recordingIdRef.current, bytes, (Date.now() - recordingStartedRef.current) / 1000));
+        notify("录音已保存，正在处理");
+      } catch (reason) { notify(String(reason)); }
+      recordingIdRef.current = null; setDocumentVersion((value) => value + 1); return;
+    }
     try {
-      setSnapshot(await operation());
-      if (message) {
-        notify(message);
+      setSnapshot(await api.setCurrentTask(taskId, false));
+      if (!navigator.mediaDevices?.getUserMedia) {
+        recordingIdRef.current = await api.startNativeRecording(); nativeRecordingRef.current = true;
+      } else {
+        recordingIdRef.current = await api.startRecording();
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const recorder = await startPcmRecorder(stream, setRecordingLevel); recorderRef.current = recorder;
+        const partialTimer = window.setInterval(() => {
+          if (recorderRef.current === recorder && recordingIdRef.current) void api.transcribePartial(recordingIdRef.current, recorder.snapshot()).catch(() => undefined);
+          else window.clearInterval(partialTimer);
+        }, 5000);
       }
+      recordingStartedRef.current = Date.now(); startClock(); notify("已开始录音"); setDocumentVersion((value) => value + 1);
     } catch (reason) {
-      notify(String(reason));
+      if (recordingIdRef.current) void api.failRecording(recordingIdRef.current, String(reason));
+      recordingIdRef.current = null; notify(`无法开始录音：${String(reason)}`);
     }
   }
 
   if (!snapshot) return <LoadingState error={error} />;
 
-  return (
-    <div className="app-shell">
-      <aside className="sidebar">
-        <div className="brand-mark"><span>R</span><div><strong>RedKey</strong><small>任务指令台</small></div></div>
-        <nav>
-          <NavButton active={view === "tasks"} icon={<ListTodo />} label="进行中" onClick={() => setView("tasks")} />
-          <NavButton active={view === "meetings"} icon={<Mic />} label="对接" onClick={() => setView("meetings")} />
-          <NavButton active={view === "settings"} icon={<SettingsIcon />} label="设置" onClick={() => setView("settings")} />
-        </nav>
-      </aside>
-
-      <main className="main-view">
-        <header className="topbar">
-          <div>
-            <span className="eyebrow">{view === "settings" ? "应用设置" : view === "meetings" ? "对接记录" : "当前任务"}</span>
-            <h1>{view === "settings" ? "设置" : view === "meetings" ? "对接" : currentTask?.title ?? "尚未选择任务"}</h1>
-          </div>
-          {view !== "settings" && view !== "meetings" && (
-            <button className="primary-button" onClick={() => { setNewSlot(null); setEditorUrl(null); setEditing("new"); }}><Plus size={17} />新建任务</button>
-          )}
-        </header>
-
-        {view !== "settings" && view !== "meetings" && (
-          <>
-            <CurrentTaskBar task={currentTask} run={run} />
-            <section className="task-section">
-              {view === "tasks" && snapshot.settings.multiGroupEnabled && <GroupTabs groups={snapshot.groups} currentGroup={snapshot.currentGroup} onSelect={(group) => void run(() => api.setCurrentGroup(group))} />}
-              {view === "tasks" && <SlotStrip snapshot={snapshot} onSlotClick={(slot, task) => {
-                if (task) {
-                  void run(() => api.setCurrentTask(task.id, false));
-                } else {
-                  setNewSlot(slot);
-                  setEditing("new");
-                }
-              }} onSlotEdit={(slot, task) => {
-                if (task) {
-                  setEditing(task);
-                } else {
-                  setNewSlot(slot);
-                  setEditing("new");
-                }
-              }} />}
-              {view === "tasks" && <CompletedTaskList tasks={completedTasks} run={run} onEdit={setEditing} />}
-            </section>
-          </>
-        )}
-
-        {view === "meetings" && <MeetingsView snapshot={snapshot} setSnapshot={setSnapshot} coolingDown={recordingCoolingDown} recordingElapsed={recordingElapsed} recordingLevel={recordingLevel} onToggle={() => void toggleRecording()} notify={notify} />}
-
-        {view === "settings" && <SettingsView snapshot={snapshot} setSnapshot={setSnapshot} notify={notify} />}
-      </main>
-
-      {editing && (
-        <TaskEditor
-          contacts={snapshot.contacts}
-          task={editing === "new" ? null : editing}
-          initialUrl={editing === "new" ? editorUrl ?? "" : ""}
-          initialSlot={editing === "new" ? newSlot : null}
-          initialGroup={snapshot.settings.multiGroupEnabled ? snapshot.currentGroup : "red"}
-          groups={snapshot.groups}
-          multiGroupEnabled={snapshot.settings.multiGroupEnabled}
-          tasks={snapshot.tasks}
-          onClose={() => { setEditing(null); setEditorUrl(null); }}
-          onSaved={(next) => { setSnapshot(next); setEditorUrl(null); }}
-        />
-      )}
-      {notice && <div className="toast">{notice}</div>}
-    </div>
-  );
-}
-
-function ProgressHudWindow() {
-  const [payload, setPayload] = useState<ProgressHudPayload | null>(null);
-  const [taskPayload, setTaskPayload] = useState<TaskHudPayload | null>(null);
-  const { snapshot } = useSnapshot();
-  useEffect(() => {
-    document.documentElement.classList.add("hud-document");
-    return () => document.documentElement.classList.remove("hud-document");
-  }, []);
-  useEffect(() => {
-    let cleanup: (() => void) | undefined;
-    let stopTask: (() => void) | undefined;
-    void onProgressHud((next) => { setPayload(next); setTaskPayload(null); }).then((unlisten) => { cleanup = unlisten; });
-    void onTaskHud((next) => { setTaskPayload(next); setPayload(null); }).then((unlisten) => { stopTask = unlisten; });
-    return () => { cleanup?.(); stopTask?.(); };
-  }, []);
-  return <div className="progress-hud-window">{payload && <ProgressHud payload={payload} />}{taskPayload && <TaskHud payload={taskPayload} snapshot={snapshot} />}</div>;
-}
-
-function ProgressHud({ payload }: { payload: ProgressHudPayload }) {
-  return <section className="progress-hud" aria-live="polite" style={{ "--task-color": taskGroupColor(payload.group) } as React.CSSProperties}><strong>{payload.progress}%</strong><p>{payload.title}</p><div><i style={{ width: `${payload.progress}%` }} /></div></section>;
-}
-
-function TaskHud({ payload, snapshot }: { payload: TaskHudPayload; snapshot: Snapshot | null }) {
-  const slots = Array.from({ length: 10 }, (_, slot) => {
-    const emitted = payload.slots?.find((item) => item.slot === slot);
-    const task = snapshot?.tasks.find((item) => item.group === snapshot.currentGroup && item.slot === slot && item.status === "active") ?? null;
-    const fallback = slotTaskText(task);
-    return { slot, name: emitted?.name ?? fallback.name, title: emitted?.title ?? (task ? fallback.title : null) };
-  });
-  return <section className="task-hud" aria-label="任务快捷键">{slots.map(({ slot, name, title }) => <div className={`task-hud-key ${title ? "bound" : "empty"}`} key={slot}><kbd>{slot === 9 ? 0 : slot + 1}</kbd>{title ? <span className="task-hud-labels"><strong className="task-hud-contact">{name ?? ""}</strong><span className="task-hud-title" title={title}>{title}</span></span> : <span className="task-hud-empty">空</span>}</div>)}</section>;
-}
-
-function CurrentTaskBar({ task, run }: { task: Task | null; run: (op: () => Promise<Snapshot>, message?: string) => Promise<void> }) {
-  if (!task) return <div className="current-bar muted"><CircleGauge size={20} /><span>通过数字快捷键选择当前任务</span></div>;
-  const dispatch = (action: AppAction, message?: string) => run(() => api.dispatch(action), message);
-  return (
-    <div className="current-bar" style={{ "--task-color": taskGroupColor(task.group) } as React.CSSProperties}>
-      <div className="current-progress-wrap">
-        <div className="current-progress"><span style={{ width: `${task.progress}%` }} /></div>
-      </div>
-      <strong>{task.progress}%</strong>
-      <div className="current-actions">
-        <button className={`icon-button ${task.status === "completed" ? "ghost-slot" : ""}`} title="进度 -20%" onClick={() => void dispatch({ type: "adjust_progress", delta: -20 })}><Minus size={17} /></button>
-        <button className={`icon-button ${task.status === "completed" ? "ghost-slot" : ""}`} title="进度 +20%" onClick={() => void dispatch({ type: "adjust_progress", delta: 20 })}><Plus size={17} /></button>
-        {task.status === "completed" ? <button className="secondary-button compact" onClick={() => void dispatch({ type: "start_rework" }, "任务已恢复为进行中")}><Redo2 size={16} />返工</button> : <button className="primary-button compact" onClick={() => void dispatch({ type: "complete_current" }, "任务已完成")}><Check size={16} />完成</button>}
-      </div>
-    </div>
-  );
-}
-
-function GroupTabs({ groups, currentGroup, onSelect }: { groups: TaskGroupInfo[]; currentGroup: TaskGroup; onSelect: (group: TaskGroup) => void }) {
-  const [editing, setEditing] = useState<TaskGroup | null>(null);
-  const [draft, setDraft] = useState("");
-  const inputRef = useRef<HTMLInputElement>(null);
-
-  useEffect(() => { if (editing) inputRef.current?.focus(); }, [editing]);
-
-  return <div className="group-tabs" aria-label="任务分组">
-    {groups.map((group) => editing === group.id ? (
-      <input
-        key={group.id}
-        ref={inputRef}
-        className="group-name-input"
-        aria-label="输入分组名称"
-        value={draft}
-        maxLength={20}
-        onChange={(event) => { const value = event.target.value; setDraft(value); void api.setGroupName(group.id, value); }}
-        onBlur={() => setEditing(null)}
-        onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }}
-      />
-    ) : (
-      <button
-        key={group.id}
-        className={`group-tab ${currentGroup === group.id ? "selected" : ""} ${group.name ? "named" : ""}`}
-        style={{ "--group-color": `var(--task-${group.id})` } as React.CSSProperties}
-        title={group.name || groupLabel(group.id)}
-        onClick={() => onSelect(group.id)}
-        onContextMenu={(event) => { event.preventDefault(); setDraft(group.name); setEditing(group.id); }}
-      >
-        {group.name && <span>{group.name}</span>}
-      </button>
-    ))}
+  return <div className="app-shell">
+    <aside className="sidebar">
+      <div className="brand-mark"><span>R</span><div><strong>RedKey</strong><small>需求工作台</small></div></div>
+      <nav>
+        <NavButton active={view === "active"} icon={<ListTodo />} label="进行中" onClick={() => setView("active")} />
+        <NavButton active={view === "completed"} icon={<CircleCheck />} label="已完成" onClick={() => setView("completed")} />
+        <NavButton active={view === "settings"} icon={<SettingsIcon />} label="设置" onClick={() => setView("settings")} />
+      </nav>
+    </aside>
+    <main className="main-view">
+      {view === "settings" ? <SettingsView snapshot={snapshot} setSnapshot={setSnapshot} notify={notify} />
+        : view === "completed" ? <CompletedList tasks={completedTasks} onNew={() => { setPrefillUrl(""); setPrefillSlot(null); setCreating(true); }} notify={notify} />
+        : selectedTask && document ?
+        <DocumentWorkspace
+          document={document}
+          snapshot={snapshot}
+          setSnapshot={setSnapshot}
+          recordingElapsed={recordingElapsed}
+          recordingLevel={recordingLevel}
+          onToggleRecording={() => void toggleRecording(selectedTask.id)}
+          onNew={() => { setPrefillUrl(""); setPrefillSlot(null); setCreating(true); }}
+          onRefresh={() => setDocumentVersion((value) => value + 1)}
+          onDeleted={() => { setSelectedId(null); setDocumentVersion((value) => value + 1); }}
+          notify={notify}
+        /> : <EmptyDocument completed={false} onNew={() => { setPrefillUrl(""); setPrefillSlot(null); setCreating(true); }} />}
+    </main>
+    {creating && <CreateTaskDialog snapshot={snapshot} initialUrl={prefillUrl} initialSlot={prefillSlot} onClose={() => { setCreating(false); setPrefillSlot(null); }} onCreated={(next) => { setSnapshot(next); setCreating(false); setPrefillUrl(""); setPrefillSlot(null); setView("active"); setSelectedId(next.currentTaskId); }} notify={notify} />}
+    {overflowTasks.length > 10 && <TaskOverflowDialog tasks={overflowTasks} onResolved={(next) => { setSnapshot(next); setView("active"); setSelectedId(next.currentTaskId); }} notify={notify} />}
+    {notice && <div className="toast">{notice}</div>}
   </div>;
 }
 
-function SlotStrip({ snapshot, onSlotClick, onSlotEdit }: { snapshot: Snapshot; onSlotClick: (slot: number, task: Task | null) => void; onSlotEdit: (slot: number, task: Task | null) => void }) {
-  return (
-    <section className="slot-strip" aria-label="数字槽位">
-      {Array.from({ length: 10 }, (_, slot) => {
-        const task = snapshot.tasks.find((item) => item.group === snapshot.currentGroup && item.slot === slot && item.status === "active");
-        const key = slot === 9 ? 0 : slot + 1;
-        const text = slotTaskText(task ?? null);
-        return (
-          <div key={slot} className="slot-key-wrap" style={{ "--task-color": taskGroupColor(task?.group) } as React.CSSProperties}>
-            <button
-              className={`slot-key ${task?.id === snapshot.currentTaskId ? "active" : ""} ${task ? "bound" : ""}`}
-              title={task?.title ?? `槽位 ${key} 未绑定`}
-              onClick={() => onSlotClick(slot, task ?? null)}
-              onContextMenu={(event) => { event.preventDefault(); onSlotEdit(slot, task ?? null); }}
-            >
-              <kbd>{key}</kbd>
-              <span className="slot-key-labels">
-                {text.name && <strong>{text.name}</strong>}
-                <span>{text.title}</span>
-              </span>
-            </button>
-            {task && <button className="icon-button slot-key-edit" title="编辑任务" aria-label="编辑任务" onClick={() => onSlotEdit(slot, task)}><Pencil size={15} /></button>}
-          </div>
-        );
-      })}
-    </section>
-  );
+function useTaskDocument(taskId: string | null, snapshot: Snapshot | null, version: number) {
+  const [document, setDocument] = useState<TaskDocument | null>(null);
+  useEffect(() => {
+    if (!taskId) { setDocument(null); return; }
+    let active = true;
+    void api.taskDocument(taskId).then((value) => { if (active) setDocument(value); }).catch(() => { if (active) setDocument(null); });
+    return () => { active = false; };
+  }, [taskId, snapshot, version]);
+  return document;
 }
 
-function CompletedTaskList({ tasks, run, onEdit }: { tasks: Task[]; run: (op: () => Promise<Snapshot>, message?: string) => Promise<void>; onEdit: (task: Task) => void }) {
-  return <section className="completed-section" aria-label="已完成">
-    <h2>已完成</h2>
-    <div className="task-table">
-      {tasks.length === 0 ? <div className="empty-state compact"><strong>还没有已完成任务</strong></div> : tasks.map((task) => <CompletedTaskRow key={task.id} task={task} run={run} onEdit={() => onEdit(task)} />)}
-    </div>
-  </section>;
+function CompletedList({ tasks, onNew, notify }: { tasks: Task[]; onNew: () => void; notify: (message: string) => void }) {
+  return <div className="completed-list-page">
+    <header className="completed-list-header">
+      <div>
+        <small>归档</small>
+        <h1>已完成 <b>{tasks.length}</b></h1>
+      </div>
+      <button className="primary" onClick={onNew}><Plus />新建</button>
+    </header>
+    {tasks.length ? <div className="completed-list">
+      {tasks.map((task) => <div className="completed-list-item" key={task.id}>
+        <kbd>{slotLabel(task.slot)}</kbd>
+        <div className="completed-item-body">
+          <strong>{task.title}</strong>
+          <small>{task.contactName || "未指定联系人"} · {formatShortDate(task.completedAt ?? task.lastOpenedAt)}</small>
+        </div>
+        {task.url && <button className="completed-item-link" title="打开链接" onClick={() => void api.setCurrentTask(task.id, true).then(() => notify("已在浏览器打开")).catch((reason) => notify(String(reason)))}><ExternalLink /></button>}
+      </div>)}
+    </div> : <div className="completed-list-empty"><CircleCheck /><strong>还没有已完成需求</strong><span>完成的需求会保留全部文本、录音和总结。</span></div>}
+  </div>;
 }
 
-function CompletedTaskRow({ task, run, onEdit }: { task: Task; run: (op: () => Promise<Snapshot>, message?: string) => Promise<void>; onEdit: () => void }) {
-  const key = slotLabel(task.slot);
-  return (
-    <div className="task-row" onClick={onEdit}>
-      <div className="task-title-button" style={{ "--task-color": taskGroupColor(task.group) } as React.CSSProperties}>
-        <span className="task-color-bar" />
-        <span className="slot-badge">{key}</span>
-        <span><strong>{task.title}</strong><small>{task.url.length > 24 ? task.url.slice(0, 21) + "…" : task.url}</small></span>
-      </div>
-      <div className="row-progress" style={{ "--task-color": taskGroupColor(task.group) } as React.CSSProperties}>
-        <span className="row-progress-track"><i style={{ width: `${task.progress}%` }} /></span><b>{task.progress}%</b>
-      </div>
-      <div className="row-actions">
-        <button className="icon-button" title="恢复为进行中" onClick={(event) => { event.stopPropagation(); void run(async () => { await api.setCurrentGroup(task.group); await api.setCurrentTask(task.id, false); return api.dispatch({ type: "start_rework" }); }, "任务已恢复为进行中"); }}><Redo2 size={16} /></button>
-        <button className="icon-button" title="编辑任务" onClick={(event) => { event.stopPropagation(); onEdit(); }}><Pencil size={16} /></button>
-      </div>
-    </div>
-  );
-}
+function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, recordingLevel, onToggleRecording, onNew, onRefresh, onDeleted, notify }: {
+  document: TaskDocument; snapshot: Snapshot; setSnapshot: (value: Snapshot) => void; recordingElapsed: number; recordingLevel: number;
+  onToggleRecording: () => void; onNew: () => void; onRefresh: () => void; onDeleted: () => void; notify: (message: string) => void;
+}) {
+  const { task } = document;
+  const readOnly = task.status === "completed";
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [title, setTitle] = useState(task.title);
+  const [contactOpen, setContactOpen] = useState(false);
+  const [linkOpen, setLinkOpen] = useState(false);
+  const [editingCardId, setEditingCardId] = useState<string | null>(null);
+  const [confirmDeleteTask, setConfirmDeleteTask] = useState(false);
+  const cards = useMemo(() => [
+    ...document.textCards.map((card) => ({ type: "text" as const, createdAt: card.createdAt, card })),
+    ...document.recordings.map((recording) => ({ type: "recording" as const, createdAt: recording.createdAt, recording })),
+  ].sort((a, b) => b.createdAt.localeCompare(a.createdAt)), [document]);
+  const activeRecording = document.recordings.find((recording) => recording.status === "recording");
 
-function SettingsView({ snapshot, setSnapshot, notify }: { snapshot: Snapshot; setSnapshot: (value: Snapshot) => void; notify: (message: string) => void }) {
-  const [shortcuts, setShortcuts] = useState(snapshot.settings.shortcuts);
-  const [contactName, setContactName] = useState("");
-  const [importPayload, setImportPayload] = useState("");
-  const [capturing, setCapturing] = useState<string | null>(null);
-  const prefixCapture = useRef(new Set<string>());
-  const capturedPrefix = useRef<string | null>(null);
-  const [keyboardStatus, setKeyboardStatus] = useState<string | null>(null);
-  const [models, setModels] = useState<Record<string, ModelStatus>>({});
+  useEffect(() => { setTitle(task.title); }, [task.title]);
+  useEffect(() => { setEditingTitle(false); setContactOpen(false); setLinkOpen(false); }, [task.id]);
 
-  useEffect(() => {
-    for (const id of ["Qwen3-ASR-1.7B", "Qwen3-ForcedAligner-0.6B", "3D-Speaker-CAM++"]) void api.modelStatus(id).then((status) => setModels((current) => ({ ...current, [id]: status })));
-    let cleanup: (() => void) | undefined;
-    void onModelStatus((status) => setModels((current) => ({ ...current, [status.id]: status }))).then((unlisten) => { cleanup = unlisten; });
-    return () => cleanup?.();
-  }, []);
-
-  useEffect(() => {
-    const timer = window.setTimeout(() => { void api.keyboardListenerStatus().then(setKeyboardStatus).catch(() => setKeyboardStatus(null)); }, 200);
-    return () => window.clearTimeout(timer);
-  }, [snapshot.settings.shortcuts.taskPrefix]);
-
-  useEffect(() => {
-    if (!capturing) return;
-    const handleKeyDown = (event: KeyboardEvent) => {
-      event.preventDefault();
-      if (event.key === "Escape") {
-        prefixCapture.current.clear();
-        capturedPrefix.current = null;
-        setCapturing(null);
-        return;
-      }
-      const value = modifierFromKeyboardEvent(event);
-      if (value) {
-        prefixCapture.current.add(value);
-        capturedPrefix.current = prefixFromKeyboardEvent(event, true);
-      }
-    };
-    const handleKeyUp = (event: KeyboardEvent) => {
-      event.preventDefault();
-      const value = modifierFromKeyboardEvent(event);
-      if (!value) return;
-      prefixCapture.current.delete(value);
-      if (prefixCapture.current.size === 0) {
-        const prefix = capturedPrefix.current;
-        if (prefix) setShortcuts((current) => setShortcutValue(current, capturing, prefix));
-        capturedPrefix.current = null;
-        setCapturing(null);
-      }
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    window.addEventListener("keyup", handleKeyUp);
-    return () => { window.removeEventListener("keydown", handleKeyDown); window.removeEventListener("keyup", handleKeyUp); };
-  }, [capturing]);
-
-  function beginPrefixCapture(id: string | null) {
-    prefixCapture.current.clear();
-    capturedPrefix.current = null;
-    setCapturing(id);
+  async function saveTitle() {
+    const next = title.trim();
+    if (!next) { setTitle(task.title); setEditingTitle(false); return; }
+    try { setSnapshot(await api.updateTaskTitle(task.id, next)); setEditingTitle(false); onRefresh(); }
+    catch (reason) { notify(String(reason)); }
   }
 
-  async function saveShortcuts() {
+  async function addTextCard() {
+    try { const card = await api.createTextCard(task.id); setEditingCardId(card.id); onRefresh(); }
+    catch (reason) { notify(String(reason)); }
+  }
+
+  async function completeOrRework() {
     try {
-      setSnapshot(await api.saveShortcuts(shortcuts));
-      notify("快捷键已保存");
+      setSnapshot(await api.setCurrentTask(task.id, false));
+      setSnapshot(await api.dispatch({ type: readOnly ? "start_rework" : "complete_current" }));
+      notify(readOnly ? "需求已恢复为进行中" : "需求已完成"); onRefresh();
+    } catch (reason) { notify(String(reason)); }
+  }
+
+  return <div className="document-shell">
+    <header className="document-toolbar">
+      <div className="toolbar-side toolbar-left">
+        <IconButton label={task.url ? "打开或修改链接" : "添加链接"} onClick={() => setLinkOpen((value) => !value)}><Link2 /></IconButton>
+        <span className="last-opened">{task.lastOpenedAt ? `最近打开 ${formatDate(task.lastOpenedAt)}` : "尚未打开链接"}</span>
+        {linkOpen && <LinkPopover task={task} readOnly={readOnly} setSnapshot={setSnapshot} onClose={() => setLinkOpen(false)} notify={notify} />}
+      </div>
+      <div className="toolbar-center">
+        <IconButton label={activeRecording ? "停止录音" : "创建录音卡"} active={Boolean(activeRecording)} disabled={readOnly} onClick={onToggleRecording}>{activeRecording ? <MicOff /> : <Mic />}</IconButton>
+        <IconButton label="创建文本卡" disabled={readOnly} onClick={() => void addTextCard()}><FileText /></IconButton>
+        <IconButton label="图片卡后续开放" disabled><FileImage /></IconButton>
+      </div>
+      <div className="toolbar-side toolbar-right">
+        <IconButton label={readOnly ? "返工" : "完成"} onClick={() => void completeOrRework()}>{readOnly ? <RotateCcw /> : <Check />}</IconButton>
+        {readOnly && <IconButton danger label="删除需求" onClick={() => setConfirmDeleteTask(true)}><Trash2 /></IconButton>}
+        <IconButton label="新建需求" onClick={onNew}><Plus /></IconButton>
+      </div>
+    </header>
+    <section className="document-page">
+      <div className="document-identity">
+        <kbd>{slotLabel(task.slot)}</kbd>
+        <div className="contact-control">
+          <button disabled={readOnly} onClick={() => setContactOpen((value) => !value)}><UserRound />{task.contactName || "选择联系人"}<ChevronDown /></button>
+          {contactOpen && <ContactMenu contacts={snapshot.contacts} task={task} setSnapshot={setSnapshot} onClose={() => setContactOpen(false)} notify={notify} />}
+        </div>
+        {editingTitle ? <input className="title-input" autoFocus value={title} maxLength={80} onChange={(event) => setTitle(event.target.value)} onBlur={() => void saveTitle()} onKeyDown={(event) => { if (event.key === "Enter") void saveTitle(); if (event.key === "Escape") { setTitle(task.title); setEditingTitle(false); } }} /> : <button className="document-title" disabled={readOnly} onClick={() => setEditingTitle(true)}>{task.title}{!readOnly && <Pencil />}</button>}
+      </div>
+      <div className="document-rule" />
+      <div className="document-stream">
+        {cards.length ? cards.map((item) => item.type === "text" ? <TextCardView key={item.card.id} card={item.card} readOnly={readOnly} editing={editingCardId === item.card.id} onEditing={setEditingCardId} onRefresh={onRefresh} notify={notify} /> : <RecordingCard key={item.recording.id} recording={item.recording} summary={document.summaries.find((summary) => summary.recordingId === item.recording.id) ?? null} activeElapsed={recordingElapsed} activeLevel={recordingLevel} readOnly={readOnly} onStop={onToggleRecording} onRefresh={onRefresh} notify={notify} />) : <div className="empty-stream"><FileText /><strong>这份需求文档还没有内容</strong><span>通过上方工具栏添加文本或开始录音。</span></div>}
+      </div>
+    </section>
+    {confirmDeleteTask && <ConfirmDialog
+      title="删除这个需求？"
+      description="该需求的全部文本、录音、转写和 AI 总结都会被删除，无法恢复。"
+      confirmLabel="删除"
+      danger
+      onConfirm={() => { setConfirmDeleteTask(false); void api.deleteCompletedTask(task.id).then((next) => { setSnapshot(next); onDeleted(); }).catch((reason) => notify(String(reason))); }}
+      onCancel={() => setConfirmDeleteTask(false)}
+    />}
+  </div>;
+}
+
+function LinkPopover({ task, readOnly, setSnapshot, onClose, notify }: { task: Task; readOnly: boolean; setSnapshot: (value: Snapshot) => void; onClose: () => void; notify: (message: string) => void }) {
+  const [value, setValue] = useState(task.url ?? "");
+  const [resolving, setResolving] = useState(false);
+  async function updateTitleFromLink(url: string) {
+    const link = extractHttpUrl(url) ?? url.trim();
+    if (!link) return;
+    setResolving(true);
+    try {
+      const suggestion = await api.resolveTitle(link);
+      setSnapshot(await api.updateTaskTitle(task.id, suggestion.suggestedTitle));
+    } catch (reason) {
+      notify(`标题识别失败：${String(reason)}`);
+    } finally {
+      setResolving(false);
+    }
+  }
+  async function saveLink() {
+    const link = value.trim();
+    try {
+      setSnapshot(await api.updateTaskLink(task.id, link || null));
+      if (link) await updateTitleFromLink(link);
+      onClose();
     } catch (reason) {
       notify(String(reason));
     }
   }
-
-  async function exportData() {
-    const payload = await api.exportData();
-    try { await writeText(payload); } catch { await navigator.clipboard.writeText(payload); }
-    notify("备份 JSON 已复制到剪贴板");
+  function pasteLink(event: React.ClipboardEvent<HTMLInputElement>) {
+    const link = extractHttpUrl(event.clipboardData.getData("text"));
+    if (!link) return;
+    event.preventDefault();
+    setValue(link);
+    void updateTitleFromLink(link);
   }
-
-  return (
-    <div className="settings-page">
-
-      {/* ── 常用联系人 & 数据备份 ── */}
-      <section className="settings-section two-column-settings">
-        <div>
-          <div className="settings-heading"><UserPlus size={19} /><div><h2>常用联系人</h2><p>创建任务时可快速添加人名前缀</p></div></div>
-          <div className="input-action-row"><input value={contactName} onChange={(event) => setContactName(event.target.value)} placeholder="输入姓名" /><button className="secondary-button" onClick={() => void api.addContact(contactName).then((next) => { setSnapshot(next); setContactName(""); })}><Plus size={16} />添加</button></div>
-          <div className="contact-list">{snapshot.contacts.map((contact) => <span key={contact.id}>{contact.name}<button title="删除联系人" onClick={() => void api.removeContact(contact.id).then(setSnapshot)}><XIcon /></button></span>)}</div>
-        </div>
-        <div>
-          <div className="settings-heading"><Clipboard size={19} /><div><h2>数据备份</h2><p>导出 JSON 备份或粘贴已有备份恢复</p></div></div>
-          <div className="backup-actions"><button className="secondary-button" onClick={() => void exportData()}><Clipboard size={16} />复制备份</button><button className="secondary-button" onClick={() => void clipboardText().then(setImportPayload)}><Clipboard size={16} />从剪贴板粘贴</button><button className="danger-button" disabled={!importPayload.trim()} onClick={() => void api.importData(importPayload).then((next) => { setSnapshot(next); setImportPayload(""); notify("数据已恢复"); }).catch((reason) => notify(String(reason)))}>恢复备份</button></div>
-          <textarea value={importPayload} onChange={(event) => setImportPayload(event.target.value)} placeholder="粘贴 RedKey 备份 JSON" />
-        </div>
-      </section>
-
-      {/* ── 开关 ── */}
-      <section className="settings-section toggles-row">
-        <div className="toggle-card">
-          <div className="settings-heading"><CircleGauge size={19} /><div><h2>开机启动</h2><p>开机后自动启动 RedKey</p></div></div>
-          <label className="toggle-row"><input type="checkbox" checked={snapshot.settings.autostart} onChange={(event) => void api.setAutostart(event.target.checked).then(setSnapshot).catch((reason) => notify(String(reason)))} /><span>开机后自动启动 RedKey</span></label>
-        </div>
-        <div className="toggle-card">
-          <div className="settings-heading"><CircleGauge size={19} /><div><h2>桌面宠物</h2><p>在桌面显示或休眠 RedKey 宠物</p></div></div>
-          <label className="toggle-row"><input type="checkbox" checked={snapshot.settings.petVisible} onChange={(event) => void api.setPetVisible(event.target.checked).then(setSnapshot).catch((reason) => notify(String(reason)))} /><span>{snapshot.settings.petVisible ? "宠物已唤醒" : "宠物已休眠"}</span></label>
-        </div>
-        <div className="toggle-card">
-          <div className="settings-heading"><ListTodo size={19} /><div><h2>任务分组</h2><p>关闭后只显示红色组的 10 个任务键位</p></div></div>
-          <label className="toggle-row"><input type="checkbox" checked={snapshot.settings.multiGroupEnabled} onChange={(event) => void api.updateSettings({ ...snapshot.settings, multiGroupEnabled: event.target.checked }).then(setSnapshot).catch((reason) => notify(String(reason)))} /><span>启用五色分组</span></label>
-        </div>
-      </section>
-
-      {/* ── 全局快捷键 ── */}
-      <section className="settings-section">
-        <div className="settings-heading"><Keyboard size={19} /><div><h2>全局前缀</h2><p>按住前缀显示任务键位，并与固定按键组合操作</p></div></div>
-        <div className="prefix-settings">
-          <ShortcutCapture label="前缀" value={shortcuts.taskPrefix} id="taskPrefix" capturing={capturing} onCapture={beginPrefixCapture} />
-          <div className="prefix-map"><span><b>1-9 / 0</b> 打开任务</span><span><b>- / =</b> 调整进度</span><span><b>T</b> 开始或结束录音</span><span><b>Space</b> 打开控制台</span></div>
-        </div>
-        {keyboardStatus && <p className="keyboard-permission">键盘监听不可用：{keyboardStatus}。请在“系统设置 → 隐私与安全性 → 辅助功能、输入监控”中允许 RedKey。</p>}
-        {capturing ? <span className="shortcut-capture-hint">请输入按键组合</span> : <button className="primary-button" onClick={() => void saveShortcuts()}>保存快捷键</button>}
-      </section>
-
-      {/* ── 本地模型 ── */}
-      <section className="settings-section">
-        <div className="settings-heading"><Mic size={19} /><div><h2>本地模型</h2><p>保存在本机，用于离线语音处理</p></div></div>
-        <div className="model-list">
-          <ModelRow id="Qwen3-ASR-1.7B" note="录音转写与临时字幕" status={models["Qwen3-ASR-1.7B"]} progressColor={taskGroupColor(snapshot.currentGroup)} onDownload={() => void api.downloadModel("Qwen3-ASR-1.7B").catch((reason) => notify(String(reason)))} onCancel={() => void api.cancelModelDownload("Qwen3-ASR-1.7B").catch((reason) => notify(String(reason)))} onDelete={() => void api.deleteModel("Qwen3-ASR-1.7B").catch((reason) => notify(String(reason)))} onOpenFolder={() => void api.openModelFolder("Qwen3-ASR-1.7B").catch((reason) => notify(String(reason)))} />
-          <ModelRow id="Qwen3-ForcedAligner-0.6B" note="字符与词级时间戳" status={models["Qwen3-ForcedAligner-0.6B"]} progressColor={taskGroupColor(snapshot.currentGroup)} onDownload={() => void api.downloadModel("Qwen3-ForcedAligner-0.6B").catch((reason) => notify(String(reason)))} onCancel={() => void api.cancelModelDownload("Qwen3-ForcedAligner-0.6B")} onDelete={() => void api.deleteModel("Qwen3-ForcedAligner-0.6B").catch((reason) => notify(String(reason)))} onOpenFolder={() => void api.openModelFolder("Qwen3-ForcedAligner-0.6B")} />
-          <ModelRow id="3D-Speaker-CAM++" note="自动识别 1–5 位发言人" status={models["3D-Speaker-CAM++"]} progressColor={taskGroupColor(snapshot.currentGroup)} onDownload={() => void api.downloadModel("3D-Speaker-CAM++").catch((reason) => notify(String(reason)))} onCancel={() => void api.cancelModelDownload("3D-Speaker-CAM++")} onDelete={() => void api.deleteModel("3D-Speaker-CAM++").catch((reason) => notify(String(reason)))} onOpenFolder={() => void api.openModelFolder("3D-Speaker-CAM++")} />
-        </div>
-      </section>
-
+  return <div className="popover link-popover">
+    <div><strong>需求链接</strong><button onClick={onClose}><X /></button></div>
+    <input value={value} disabled={readOnly || resolving} placeholder="https://figma.com/..." onPaste={pasteLink} onChange={(event) => setValue(event.target.value)} />
+    <div className="popover-actions">
+      <button disabled={!task.url} onClick={() => void api.setCurrentTask(task.id, true).then(setSnapshot).then(onClose).catch((reason) => notify(String(reason)))}><ExternalLink />打开</button>
+      {!readOnly && <button className="primary" disabled={resolving} onClick={() => void saveLink()}>{resolving ? "识别中" : "保存"}</button>}
     </div>
-  );
-}
-
-function ModelRow({ id, note, status, progressColor, onDownload, onCancel, onDelete, onOpenFolder, disabled = false }: { id: string; note: string; status?: ModelStatus; progressColor: string; onDownload?: () => void; onCancel?: () => void; onDelete?: () => void; onOpenFolder?: () => void; disabled?: boolean }) {
-  const size = formatFileSize(status?.sizeBytes ?? 0);
-  const determinate = status?.downloading && status.progressKind === "download" && status.totalBytes != null && status.totalBytes > 0;
-  const percent = determinate ? Math.min(100, Math.round(status.downloadedBytes / status.totalBytes! * 100)) : 0;
-  const ready = !status?.downloading && status?.installed;
-  const [confirmingDelete, setConfirmingDelete] = useState(false);
-  const [diagnostics, setDiagnostics] = useState<string | null>(null);
-  return <><div className={`model-row ${status?.error ? "has-error" : ""}`} style={{ "--task-color": progressColor } as React.CSSProperties}><div><div className="model-title-line"><strong>{id}</strong><span className={`model-badge ${status?.verified ? "ready" : ""}`}>{status?.stage ?? "正在检查"}</span></div><span>{status?.error ? "本地组件处理失败，可重试或查看诊断信息" : status?.detail || note}</span><small>{note}{size ? ` · 本地 ${size}` : ""}</small>{status?.downloading && <div className={`model-progress-line ${determinate ? "" : "indeterminate"}`}><progress value={determinate ? percent : undefined} max={100} /><b>{determinate ? `${percent}%` : status.stage}</b></div>}{status?.error && <details className="model-diagnostics" onToggle={(event) => { if ((event.currentTarget as HTMLDetailsElement).open && diagnostics == null) void api.modelDiagnostics(id).then(setDiagnostics); }}><summary>诊断信息</summary><pre>{diagnostics ?? "正在读取…"}</pre></details>}</div><div className="model-actions">{ready && <button className="icon-button model-icon-button danger" title="删除模型" aria-label="删除模型" onClick={() => setConfirmingDelete(true)}><Trash2 size={15} /></button>}{ready && <button className="icon-button model-icon-button" title="打开文件夹" aria-label="打开文件夹" onClick={onOpenFolder}><Folder size={15} /></button>}{status?.downloading ? <button className="secondary-button" onClick={onCancel}>取消</button> : <button className="secondary-button" disabled={disabled || status?.installed} onClick={onDownload}>{disabled ? "后续开放" : status?.installed ? "可用" : status?.error ? "重试" : "下载"}</button>}</div></div>{confirmingDelete && <ConfirmDialog title="删除本地模型" message={`确定删除 ${id} 吗？删除后可以重新下载。`} confirmLabel="删除" onCancel={() => setConfirmingDelete(false)} onConfirm={() => { setConfirmingDelete(false); onDelete?.(); }} />}</>;
-}
-
-function ConfirmDialog({ title, message, confirmLabel, onCancel, onConfirm }: { title: string; message: string; confirmLabel: string; onCancel: () => void; onConfirm: () => void }) {
-  return <div className="modal-backdrop confirm-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onCancel()}><section className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title"><h2 id="confirm-title">{title}</h2><p>{message}</p><div><button className="secondary-button" onClick={onCancel}>取消</button><button className="danger-button" onClick={onConfirm}>{confirmLabel}</button></div></section></div>;
-}
-
-function formatFileSize(bytes: number): string { if (!bytes) return ""; return bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(2)} GB` : `${(bytes / 1024 ** 2).toFixed(1)} MB`; }
-
-function ShortcutCapture({ label, value, id, capturing, onCapture }: { label: string; value: string; id: string; capturing: string | null; onCapture: (id: string | null) => void }) {
-  const active = capturing === id;
-  return (
-    <label>{label}
-      <button type="button" className={`shortcut-capture ${active ? "capturing" : ""}`} aria-pressed={active} onClick={() => onCapture(id)}>
-        {active ? "请输入按键组合" : value}
-      </button>
-    </label>
-  );
-}
-
-function setShortcutValue(settings: ShortcutSettings, id: string, value: string): ShortcutSettings {
-  return id === "taskPrefix" ? { ...settings, taskPrefix: value } : settings;
-}
-
-function MeetingsView({ snapshot, setSnapshot, coolingDown, recordingElapsed, recordingLevel, onToggle, notify }: { snapshot: Snapshot; setSnapshot: (value: Snapshot) => void; coolingDown: boolean; recordingElapsed: number; recordingLevel: number; onToggle: () => void; notify: (message: string) => void }) {
-  const active = snapshot.recordings.find((recording) => recording.status === "recording");
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
-  const [partialText, setPartialText] = useState("");
-  const [expandedId, setExpandedId] = useState<string | null>(null);
-  useEffect(() => { let cleanup: (() => void) | undefined; void onPartialTranscript((value) => { if (value.recordingId === active?.id) setPartialText(value.text); }).then((unlisten) => { cleanup = unlisten; }); return () => cleanup?.(); }, [active?.id]);
-  return <div className="meetings-page">
-    <button className={`recording-control ${active ? "recording" : ""} ${coolingDown ? "cooling-down" : ""}`} data-disabled={coolingDown || undefined} onClick={onToggle}>
-      {active ? <><span className="recording-control-state"><i />正在录音</span><strong>{formatRecordingDuration(recordingElapsed)}</strong><AudioMeter level={recordingLevel} /><span className="recording-control-action"><MicOff size={17} />停止录音</span></> : <><Mic size={21} /><strong>{coolingDown ? "请稍候" : "开始录音"}</strong><span>{coolingDown ? "录音正在保存" : "开始一段新的本地录音"}</span></>}
-    </button>
-    {active && <section className="live-transcript"><span className="live-dot" /><strong>临时字幕</strong><p>{partialText || "正在聆听…"}</p></section>}
-    <div className="meeting-list">{snapshot.recordings.length === 0 ? <div className="empty-state"><Mic size={26} /><strong>还没有对接记录</strong><span>按录音快捷键开始保存一次对接。</span></div> : snapshot.recordings.map((recording) => {
-      const expanded = expandedId === recording.id;
-      const isRecording = recording.status === "recording";
-      return <article className={`meeting-row ${expanded ? "expanded" : ""} ${isRecording ? "recording" : ""}`} key={recording.id} onClick={() => setExpandedId(expanded ? null : recording.id)}>
-        <div className="meeting-main"><strong>{recording.taskTitle ?? "未绑定任务"}</strong><small>{new Date(recording.createdAt).toLocaleString()}</small></div>
-        <span className={`meeting-status ${isRecording ? "recording" : ""}`}>{isRecording && <i />}{isRecording ? "录音中" : recording.status === "transcribing" ? "转写中" : recording.status === "error" ? "转写失败" : "已完成"}</span>
-        <b>{Math.round(recording.duration)}s</b>
-        <div className="meeting-actions" onClick={(event) => event.stopPropagation()}>
-          {editingId === recording.id ? <><select value={selectedTaskId ?? ""} onChange={(event) => setSelectedTaskId(event.target.value || null)}><option value="">未绑定任务</option>{snapshot.tasks.filter((task) => task.status === "active").map((task) => <option key={task.id} value={task.id}>{task.title}</option>)}</select><button className="secondary-button compact" onClick={() => void api.reassignRecording(recording.id, selectedTaskId).then((next) => { setSnapshot(next); setEditingId(null); })}>保存</button></> : <button className="icon-button" title="纠偏归属任务" onClick={() => { setEditingId(recording.id); setSelectedTaskId(recording.taskId); }}><Pencil size={16} /></button>}
-          {recording.status === "error" && <button className="secondary-button compact" onClick={() => void api.retryTranscription(recording.id).then(setSnapshot)}>重试</button>}
-          <button className="icon-button danger" title="删除记录" onClick={() => void api.deleteRecording(recording.id).then(setSnapshot)}><Trash2 size={16} /></button>
-        </div>
-        {!expanded && <p className="meeting-summary">{recording.errorMessage || recording.transcript || (recording.status === "transcribing" ? "正在识别录音内容…" : "暂无转写文本")}</p>}
-        {expanded && <RecordingTimeline recordingId={recording.id} fallback={recording.transcript} onSnapshot={setSnapshot} notify={notify} />}
-      </article>;
-    })}</div>
   </div>;
 }
 
-function AudioMeter({ level }: { level: number }) {
-  return <span className="audio-meter" aria-label="实时音量">{Array.from({ length: 20 }, (_, index) => {
-    const variation = 0.35 + ((index * 7) % 9) / 14;
-    const height = Math.max(12, Math.min(100, 12 + level * 170 * variation));
-    return <i key={index} style={{ height: `${height}%` }} />;
-  })}</span>;
+function ContactMenu({ contacts, task, setSnapshot, onClose, notify }: { contacts: Snapshot["contacts"]; task: Task; setSnapshot: (value: Snapshot) => void; onClose: () => void; notify: (message: string) => void }) {
+  const [newName, setNewName] = useState("");
+  const select = (contactId: string | null) => void api.updateTaskContact(task.id, contactId).then(setSnapshot).then(onClose).catch((reason) => notify(String(reason)));
+  return <div className="popover contact-popover">
+    <button className={!task.contactId ? "selected" : ""} onClick={() => select(null)}>未指定联系人</button>
+    {contacts.map((contact) => <button className={task.contactId === contact.id ? "selected" : ""} key={contact.id} onClick={() => select(contact.id)}>{contact.name}</button>)}
+    <div className="contact-add"><input value={newName} placeholder="新增联系人" onChange={(event) => setNewName(event.target.value)} /><button disabled={!newName.trim()} onClick={() => void api.addContact(newName).then(setSnapshot).then(() => setNewName("")).catch((reason) => notify(String(reason)))}><Plus /></button></div>
+  </div>;
 }
 
-function formatRecordingDuration(seconds: number): string {
-  return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
-}
-
-function RecordingTimeline({ recordingId, fallback, onSnapshot, notify }: { recordingId: string; fallback: string; onSnapshot: (value: Snapshot) => void; notify: (message: string) => void }) {
-  const [detail, setDetail] = useState<RecordingDetail | null>(null);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [activeSegmentId, setActiveSegmentId] = useState<string | null>(null);
-  const [duration, setDuration] = useState(0);
-  const [playbackRate, setPlaybackRate] = useState(1);
-  const [audioLoaded, setAudioLoaded] = useState(false);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const audioUrlRef = useRef<string | null>(null);
-  const animationFrameRef = useRef<number | null>(null);
-  const currentTimeRef = useRef(0);
-  const durationRef = useRef(0);
-  const activeSegmentIdRef = useRef<string | null>(null);
-  const displayedSecondRef = useRef(-1);
-  const segmentsRef = useRef<RecordingDetail["segments"]>([]);
-  const timeLabelRef = useRef<HTMLSpanElement | null>(null);
-  const seekRef = useRef<HTMLDivElement | null>(null);
-  const seekFillRef = useRef<HTMLDivElement | null>(null);
-  segmentsRef.current = detail?.segments ?? [];
-  useEffect(() => { void api.recordingDetail(recordingId).then(setDetail); return () => { if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current); }; }, [recordingId]);
+function TextCardView({ card, readOnly, editing, onEditing, onRefresh, notify }: { card: TextCard; readOnly: boolean; editing: boolean; onEditing: (id: string | null) => void; onRefresh: () => void; notify: (message: string) => void }) {
+  const [content, setContent] = useState(card.content);
+  const savedRef = useRef(card.content);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  useEffect(() => { setContent(card.content); savedRef.current = card.content; }, [card.id, card.content]);
   useEffect(() => {
-    const processing = detail?.recording.status === "recording" || ["transcribing", "aligning", "diarizing", "merging"].includes(detail?.recording.processingStatus ?? "");
-    if (!processing) return;
-    const timer = window.setInterval(() => void api.recordingDetail(recordingId).then(setDetail), 1500);
-    return () => window.clearInterval(timer);
-  }, [recordingId, detail?.recording.status, detail?.recording.processingStatus]);
-  useEffect(() => () => {
-    if (animationFrameRef.current !== null) window.cancelAnimationFrame(animationFrameRef.current);
-    const audio = audioRef.current;
-    if (audio) { audio.pause(); audio.onloadedmetadata = null; audio.ontimeupdate = null; audio.onplay = null; audio.onpause = null; audio.onended = null; audio.onerror = null; }
-    if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
-    audioRef.current = null;
-    audioUrlRef.current = null;
-  }, [recordingId]);
-  function syncPlaybackUi(value: number) {
-    const safeTime = Math.max(0, Math.min(value, durationRef.current || value));
-    currentTimeRef.current = safeTime;
-    if (seekFillRef.current) seekFillRef.current.style.transform = `scaleX(${durationRef.current > 0 ? safeTime / durationRef.current : 0})`;
-    const displayedSecond = Math.floor(safeTime);
-    if (displayedSecondRef.current !== displayedSecond) {
-      displayedSecondRef.current = displayedSecond;
-      if (timeLabelRef.current) timeLabelRef.current.textContent = `${formatTimestamp(safeTime * 1000)} / ${formatTimestamp(durationRef.current * 1000)}`;
-      if (seekRef.current) seekRef.current.setAttribute("aria-valuenow", String(safeTime));
-    }
-    const segmentId = segmentsRef.current.find((segment) => safeTime * 1000 >= segment.startMs && safeTime * 1000 < segment.endMs)?.id ?? null;
-    if (activeSegmentIdRef.current !== segmentId) {
-      activeSegmentIdRef.current = segmentId;
-      setActiveSegmentId(segmentId);
-    }
-  }
-  function stopProgressAnimation() {
-    if (animationFrameRef.current !== null) window.cancelAnimationFrame(animationFrameRef.current);
-    animationFrameRef.current = null;
-  }
-  function startProgressAnimation() {
-    stopProgressAnimation();
-    const update = () => {
-      const audio = audioRef.current;
-      if (!audio || audio.paused) { animationFrameRef.current = null; return; }
-      syncPlaybackUi(audio.currentTime);
-      animationFrameRef.current = window.requestAnimationFrame(update);
-    };
-    animationFrameRef.current = window.requestAnimationFrame(update);
-  }
-  async function process() {
-    onSnapshot(await api.processRecording(recordingId));
-    setDetail(await api.recordingDetail(recordingId));
-  }
-  async function copyAiMaterial() {
-    if (!detail) { notify("正在读取对接内容"); return; }
-    const lines = detail?.segments.map((segment) => {
-      const speaker = detail.speakers.find((item) => item.speakerId === segment.speakerId)?.displayName ?? "Speaker";
-      return `[${formatTimestamp(segment.startMs)}] ${speaker}：${segment.text}`;
-    }) ?? [];
-    const transcript = lines.length ? lines.join("\n") : fallback.trim();
-    if (!transcript) { notify("暂无可复制的转写内容"); return; }
-    const prompt = `你是项目对接记录整理助手。请只依据对话内容，整理出可执行、可追溯的信息，不补充猜测或事实。区分已确认内容与待确认事项；没有内容的栏目不要输出。\n\n请按以下结构输出：\n# 对接结论\n# 已确认需求\n# 需求变更\n# 已做决定\n# 待办事项\n# 待确认问题\n# 风险与限制\n\n待办事项请标注负责人和截止时间；未知时写“负责人待定”或“时间待定”。\n\n以下是对话记录：`;
-    const metadata = [`任务：${detail.recording.taskTitle ?? "未绑定任务"}`, `时间：${new Date(detail.recording.createdAt).toLocaleString()}`, "", transcript].join("\n");
+    if (!editing || content === savedRef.current) return;
+    const timer = window.setTimeout(() => { void api.updateTextCard(card.id, content).then(() => { savedRef.current = content; }).catch((reason) => notify(String(reason))); }, 600);
+    return () => window.clearTimeout(timer);
+  }, [content, editing, card.id, notify]);
+  return <article className="content-card text-card">
+    <header><span>{formatDate(card.createdAt)}</span><div>{!readOnly && <IconButton label="编辑文本" onClick={() => onEditing(editing ? null : card.id)}><Pencil /></IconButton>}{!readOnly && <IconButton danger label="删除文本" onClick={() => setConfirmDelete(true)}><Trash2 /></IconButton>}</div></header>
+    {editing && !readOnly ? <textarea autoFocus value={content} placeholder="输入本次需求对接的补充信息…" onChange={(event) => setContent(event.target.value)} onBlur={() => onEditing(null)} /> : <p className={content ? "" : "placeholder"}>{content || "空文本卡"}</p>}
+    {confirmDelete && <ConfirmDialog
+      title="删除这张文本卡？"
+      description="删除后无法恢复。"
+      confirmLabel="删除"
+      danger
+      onConfirm={() => { setConfirmDelete(false); void api.deleteTextCard(card.id).then(() => { onEditing(null); onRefresh(); }).catch((reason) => notify(String(reason))); }}
+      onCancel={() => setConfirmDelete(false)}
+    />}
+  </article>;
+}
+
+function RecordingCard({ recording, summary, activeElapsed, activeLevel, readOnly, onStop, onRefresh, notify }: { recording: Recording; summary: RecordingSummary | null; activeElapsed: number; activeLevel: number; readOnly: boolean; onStop: () => void; onRefresh: () => void; notify: (message: string) => void }) {
+  const [expanded, setExpanded] = useState(recording.status === "recording");
+  const [detail, setDetail] = useState<RecordingDetail | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [confirmResummarize, setConfirmResummarize] = useState(false);
+  useEffect(() => {
+    if (!expanded || recording.status === "recording") return;
+    let live = true;
+    void api.recordingDetail(recording.id).then((value) => { if (live) setDetail(value); });
+    void api.recordingAudioData(recording.id).then((bytes) => { if (live && bytes.length) setAudioUrl(URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: "audio/wav" }))); }).catch(() => undefined);
+    return () => { live = false; };
+  }, [expanded, recording.id, recording.status]);
+  useEffect(() => () => { if (audioUrl) URL.revokeObjectURL(audioUrl); }, [audioUrl]);
+
+  if (recording.status === "recording") return <article className="content-card recording-card recording-live">
+    <header><div className="recording-live-meta"><span className="status-badge recording"><i />正在录音</span><strong>{formatDuration(activeElapsed)}</strong><AudioMeter level={activeLevel} /></div><button className="stop-recording" onClick={onStop}><MicOff />停止录音</button></header>
+    <p className="recording-live-copy">录音结束后将自动完成本地转写、发言人处理与 AI 梳理。</p>
+  </article>;
+
+  const status = displayRecordingStatus(recording, summary);
+  return <article className={`content-card recording-card ${expanded ? "expanded" : ""}`}>
+    <header onClick={() => setExpanded((value) => !value)}>
+      <div className="recording-meta">{status.tone === "success" ? <><time>{formatDate(recording.createdAt)}</time><span className={`status-badge ${status.tone}`}>{status.loading && <LoaderCircle />}{status.label}</span></> : <><span className={`status-badge ${status.tone}`}>{status.loading && <LoaderCircle />}{status.label}</span><time>{formatDate(recording.createdAt)}</time></>}</div>
+      <div className="recording-actions" onClick={(event) => event.stopPropagation()}>
+        {!readOnly && summary && <IconButton label="编辑 AI 总结" onClick={() => setEditing(true)}><Pencil /></IconButton>}
+        {!readOnly && <IconButton danger label="删除录音" onClick={() => setConfirmDelete(true)}><Trash2 /></IconButton>}
+        <IconButton label={expanded ? "收起" : "展开"} onClick={() => setExpanded((value) => !value)}>{expanded ? <ChevronDown /> : <ChevronRight />}</IconButton>
+      </div>
+    </header>
+    {!expanded && <div className="recording-collapsed"><strong>{summary?.overview || recording.transcript || recording.processingError || "等待生成对接结论"}</strong>{summary?.pendingItems.length ? <ul>{summary.pendingItems.slice(0, 3).map((item) => <li key={item}>{item}</li>)}</ul> : <span>暂无待处理事项</span>}</div>}
+    {expanded && <div className="recording-expanded">
+      <SummaryView summary={summary} />
+      {(summary?.status === "error" || summary?.status === "stale" || !summary) && recording.transcript && <button className="summary-trigger" onClick={() => { if (summary?.userEdited) { setConfirmResummarize(true); return; } void api.retryRecordingSummary(recording.id).then(() => { notify("正在梳理录音"); onRefresh(); }).catch((reason) => notify(String(reason))); }}><RefreshCw />{summary?.status === "stale" ? "重新梳理" : "梳理总结"}</button>}
+      {recording.processingError && <p className="error-message"><CircleAlert />{recording.processingError}</p>}
+      <TranscriptTimeline detail={detail} fallback={recording.transcript} />
+      {audioUrl && <audio className="audio-player-native" controls src={audioUrl} />}
+    </div>}
+    {editing && summary && <SummaryEditor summary={summary} onClose={() => setEditing(false)} onSave={(next) => void api.updateRecordingSummary(recording.id, next).then(() => { setEditing(false); onRefresh(); }).catch((reason) => notify(String(reason)))} />}
+    {confirmDelete && <ConfirmDialog
+      title="删除这条录音？"
+      description="录音文件、转写文本和 AI 总结都会被删除，无法恢复。"
+      confirmLabel="删除"
+      danger
+      onConfirm={() => { setConfirmDelete(false); void api.deleteRecording(recording.id).then(() => onRefresh()).catch((reason) => notify(String(reason))); }}
+      onCancel={() => setConfirmDelete(false)}
+    />}
+    {confirmResummarize && <ConfirmDialog
+      title="重新梳理会覆盖人工修改"
+      description="你之前手动编辑过这份总结，重新梳理后会被 AI 生成的内容覆盖。"
+      confirmLabel="继续重新梳理"
+      onConfirm={() => { setConfirmResummarize(false); void api.retryRecordingSummary(recording.id).then(() => { notify("正在梳理录音"); onRefresh(); }).catch((reason) => notify(String(reason))); }}
+      onCancel={() => setConfirmResummarize(false)}
+    />}
+  </article>;
+}
+
+function SummaryView({ summary }: { summary: RecordingSummary | null }) {
+  if (!summary) return <section className="summary-empty"><LoaderCircle /><span>等待 AI 梳理</span></section>;
+  if (summary.status === "summarizing") return <section className="summary-empty"><LoaderCircle /><span>正在梳理对接内容</span></section>;
+  if (summary.status === "error") return <section className="summary-empty error"><CircleAlert /><span>{summary.errorMessage || "AI 梳理失败"}</span></section>;
+  return <section className="ai-summary">
+    <div className="summary-overview"><small>对接结论</small><strong>{summary.overview || "暂无明确结论"}</strong></div>
+    <SummaryList title="待处理" items={summary.pendingItems} />
+    <SummaryList title="已确认" items={summary.confirmedDecisions} />
+    <SummaryList title="需求变化" items={summary.requestedChanges} />
+    <SummaryList title="未解决问题" items={summary.openQuestions} />
+    {summary.actionItems.length > 0 && <div className="summary-section"><h4>行动项</h4><ul>{summary.actionItems.map((item, index) => <li key={`${item.text}-${index}`}>{item.text}{item.owner && <span>{item.owner}</span>}{item.due && <time>{item.due}</time>}</li>)}</ul></div>}
+  </section>;
+}
+
+function SummaryList({ title, items }: { title: string; items: string[] }) { return items.length ? <div className="summary-section"><h4>{title}</h4><ul>{items.map((item) => <li key={item}>{item}</li>)}</ul></div> : null; }
+
+function SummaryEditor({ summary, onClose, onSave }: { summary: RecordingSummary; onClose: () => void; onSave: (summary: RecordingSummary) => void }) {
+  const [overview, setOverview] = useState(summary.overview);
+  const [pending, setPending] = useState(summary.pendingItems.join("\n"));
+  const [decisions, setDecisions] = useState(summary.confirmedDecisions.join("\n"));
+  const [changes, setChanges] = useState(summary.requestedChanges.join("\n"));
+  const [questions, setQuestions] = useState(summary.openQuestions.join("\n"));
+  const lines = (value: string) => value.split("\n").map((item) => item.trim()).filter(Boolean);
+  return <div className="modal-backdrop"><section className="modal summary-editor"><header><strong>编辑录音总结</strong><IconButton label="关闭" onClick={onClose}><X /></IconButton></header><label>对接结论<textarea value={overview} onChange={(event) => setOverview(event.target.value)} /></label><label>待处理事项<textarea value={pending} onChange={(event) => setPending(event.target.value)} /></label><label>已确认事项<textarea value={decisions} onChange={(event) => setDecisions(event.target.value)} /></label><label>需求变化<textarea value={changes} onChange={(event) => setChanges(event.target.value)} /></label><label>未解决问题<textarea value={questions} onChange={(event) => setQuestions(event.target.value)} /></label><footer><button onClick={onClose}>取消</button><button className="primary" onClick={() => onSave({ ...summary, overview: overview.trim(), pendingItems: lines(pending), confirmedDecisions: lines(decisions), requestedChanges: lines(changes), openQuestions: lines(questions) })}>保存</button></footer></section></div>;
+}
+
+function TranscriptTimeline({ detail, fallback }: { detail: RecordingDetail | null; fallback: string }) {
+  return <section className="transcript-block"><h3>发言人时间轴</h3>{detail?.segments.length ? <div className="timeline-list">{detail.segments.map((segment) => <div className="timeline-segment" key={segment.id}><time>{formatTimestamp(segment.startMs)}</time><strong>{detail.speakers.find((speaker) => speaker.speakerId === segment.speakerId)?.displayName ?? "Speaker"}</strong><p>{segment.text}</p></div>)}</div> : <p>{fallback || "尚未生成转写内容。"}</p>}</section>;
+}
+
+function displayRecordingStatus(recording: Recording, summary: RecordingSummary | null) {
+  if (recording.status === "error" || recording.processingStatus.includes("error")) return { label: "处理失败", tone: "error", loading: false };
+  if (recording.processingStatus === "transcribing") return { label: "转写中", tone: "working", loading: true };
+  if (["diarizing", "aligning", "merging"].includes(recording.processingStatus)) return { label: "处理中", tone: "working", loading: true };
+  if (summary?.status === "summarizing") return { label: "梳理中", tone: "working", loading: true };
+  if (summary?.status === "error") return { label: "梳理失败", tone: "error", loading: false };
+  if (summary?.status === "stale") return { label: "需重新梳理", tone: "warning", loading: false };
+  if (summary?.status === "completed") return { label: "已完成", tone: "success", loading: false };
+  return { label: recording.processingStatus === "completed" ? "待梳理" : "处理中", tone: "working", loading: recording.processingStatus !== "completed" };
+}
+
+function CreateTaskDialog({ snapshot, initialUrl, initialSlot, onClose, onCreated, notify }: { snapshot: Snapshot; initialUrl: string; initialSlot: number | null; onClose: () => void; onCreated: (snapshot: Snapshot) => void; notify: (message: string) => void }) {
+  const occupied = snapshot.tasks.filter((task) => task.status === "active" && task.group === "red" && task.slot != null).map((task) => task.slot!);
+  const [title, setTitle] = useState("");
+  const [sourceTitle, setSourceTitle] = useState<string | null>(null);
+  const [url, setUrl] = useState(initialUrl);
+  const [slot, setSlot] = useState<number | null>(initialSlot != null && !occupied.includes(initialSlot) ? initialSlot : null);
+  const [contactId, setContactId] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [resolving, setResolving] = useState(false);
+  async function resolveTitle(urlValue: string) {
+    const link = extractHttpUrl(urlValue) ?? urlValue.trim();
+    if (!link) return;
+    setResolving(true);
     try {
-      await writeText(`${prompt}\n---\n${metadata}`);
-      notify("已复制提示词内容");
-    } catch {
-      try {
-        await navigator.clipboard.writeText(`${prompt}\n---\n${metadata}`);
-        notify("已复制提示词内容");
-      } catch (reason) {
-        notify(`复制失败：${String(reason)}`);
-      }
+      const suggestion = await api.resolveTitle(link);
+      setTitle(suggestion.suggestedTitle);
+      setSourceTitle(suggestion.sourceTitle);
+    } catch (reason) {
+      notify(`标题识别失败：${String(reason)}`);
+    } finally {
+      setResolving(false);
     }
   }
-  async function ensureAudio() {
-    if (audioRef.current) return audioRef.current;
-    if (!detail?.recording.audioPath || detail.recording.status === "recording") throw new Error("录音尚未保存完成");
-    const bytes = await api.recordingAudioData(recordingId);
-    if (bytes.length < 44 || String.fromCharCode(...bytes.slice(0, 4)) !== "RIFF" || String.fromCharCode(...bytes.slice(8, 12)) !== "WAVE") throw new Error("录音文件格式无效");
-    audioUrlRef.current = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: "audio/wav" }));
-    const audio = new Audio(audioUrlRef.current);
-    audio.preservesPitch = true;
-    audio.defaultPlaybackRate = playbackRate;
-    audio.playbackRate = playbackRate;
-    audio.onloadedmetadata = () => { const nextDuration = Number.isFinite(audio.duration) ? audio.duration : (detail?.recording.duration ?? 0); durationRef.current = nextDuration; setDuration(nextDuration); syncPlaybackUi(audio.currentTime); setAudioLoaded(true); };
-    audio.ontimeupdate = () => syncPlaybackUi(audio.currentTime);
-    audio.onplay = () => { setIsPlaying(true); startProgressAnimation(); };
-    audio.onpause = () => { stopProgressAnimation(); syncPlaybackUi(audio.currentTime); setIsPlaying(false); };
-    audio.onended = () => { stopProgressAnimation(); syncPlaybackUi(audio.duration || 0); setIsPlaying(false); activeSegmentIdRef.current = null; setActiveSegmentId(null); };
-    audio.onerror = () => setAudioLoaded(false);
-    audioRef.current = audio;
-    return audio;
+  useEffect(() => { if (initialUrl.trim()) void resolveTitle(initialUrl); }, [initialUrl]);
+  function pasteLink(event: React.ClipboardEvent<HTMLInputElement>) {
+    const link = extractHttpUrl(event.clipboardData.getData("text"));
+    if (!link) return;
+    event.preventDefault();
+    setUrl(link);
+    void resolveTitle(link);
   }
-  async function togglePlayback() {
-    try {
-      const audio = await ensureAudio();
-      if (audio.paused) await audio.play(); else audio.pause();
-    } catch (reason) { notify(`播放失败：${String(reason)}`); }
+  const urlMissing = !url.trim();
+  const slotMissing = slot == null;
+  const titleMissing = !title.trim();
+  const hint = urlMissing && slotMissing ? "请填写链接并选择数字键"
+    : urlMissing ? "请填写链接"
+    : slotMissing ? "请选择数字键"
+    : titleMissing ? "请填写标题"
+    : "";
+  const invalid = Boolean(hint);
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    if (invalid) return;
+    setSaving(true);
+    try { onCreated(await api.createTask({ title: title.trim(), titleMode: "title", sourceTitle: sourceTitle ?? title.trim(), url: url.trim(), group: "red", contactId: contactId || null, slot: slot! })); }
+    catch (reason) { notify(String(reason)); setSaving(false); }
   }
-  async function playSegment(segment: RecordingDetail["segments"][number]) {
-    try {
-      const audio = await ensureAudio();
-      audio.currentTime = segment.startMs / 1000;
-      syncPlaybackUi(audio.currentTime);
-      await audio.play();
-    } catch (reason) { notify(`播放失败：${String(reason)}`); }
-  }
-  function changeTime(value: number) {
-    syncPlaybackUi(value);
-    if (audioRef.current) audioRef.current.currentTime = value;
-  }
-  function changeRate(value: number) {
-    setPlaybackRate(value);
-    if (audioRef.current) {
-      audioRef.current.defaultPlaybackRate = value;
-      audioRef.current.playbackRate = value;
-      syncPlaybackUi(audioRef.current.currentTime);
-    }
-  }
-  if (!detail) return <div className="meeting-transcript">正在读取时间轴…</div>;
-  const status = detail.recording.processingStatus;
-  const processing = ["transcribing", "aligning", "diarizing", "merging"].includes(status);
-  const audioAvailable = Boolean(detail.recording.audioPath) && detail.recording.status !== "recording";
-  const playerDuration = duration || detail.recording.duration || 0;
-  durationRef.current = playerDuration;
-  return <div className="meeting-transcript" onClick={(event) => event.stopPropagation()}>
-    <div className="timeline-toolbar"><span>{processingLabel(status)}{status === "completed" && detail.recording.speakerCount > 0 ? ` · ${detail.recording.speakerCount} 位发言人` : ""}</span><div className="timeline-toolbar-actions"><button className="secondary-button compact" disabled={processing || (!detail.segments.length && !fallback.trim())} onClick={() => void copyAiMaterial()}>梳理总结</button><button className="secondary-button compact" disabled={processing} onClick={() => void process()}>重新处理</button></div></div>
-    {detail.recording.processingError && <p className="error-message">{detail.recording.processingError}</p>}
-    <section className="structured-transcript"><h3>发言人时间轴</h3>{detail.segments.length ? <div className="timeline-list">{detail.segments.map((segment) => <div className={`timeline-segment ${activeSegmentId === segment.id ? "playing" : ""}`} key={segment.id} style={{ "--speaker-color": speakerColor(segment.speakerId) } as React.CSSProperties} onClick={() => void playSegment(segment)}><time>{formatTimestamp(segment.startMs)}</time><strong>{detail.speakers.find((speaker) => speaker.speakerId === segment.speakerId)?.displayName ?? "Speaker"}</strong><p>{segment.text}</p></div>)}</div> : <p>{processing ? "正在识别不同发言人的讲话区间…" : "尚未生成发言人时间轴。"}</p>}</section>
-    <section className="raw-transcript"><h3>原始转写</h3><p>{detail.recording.rawTranscript || detail.recording.transcript || fallback || (detail.recording.status === "recording" ? "录音结束后生成转写。" : "暂无转写文本。")}</p></section>
-    <div className="audio-player" aria-label="录音播放器">
-      <button className="icon-button" disabled={!audioAvailable} title={isPlaying ? "暂停" : "播放"} aria-label={isPlaying ? "暂停" : "播放"} onClick={() => void togglePlayback()}>{isPlaying ? <span className="player-pause-icon" /> : <span className="player-play-icon" />}</button>
-      <span className="audio-time" ref={timeLabelRef}>{formatTimestamp(currentTimeRef.current * 1000)} / {formatTimestamp(playerDuration * 1000)}</span>
-      <div ref={seekRef} className="audio-seek" role="slider" aria-label="录音进度" aria-valuemin={0} aria-valuemax={Math.max(playerDuration, 0.01)} aria-valuenow={Math.min(currentTimeRef.current, playerDuration)} tabIndex={audioAvailable ? 0 : -1} onClick={audioAvailable ? (e) => { const rect = e.currentTarget.getBoundingClientRect(); changeTime(((e.clientX - rect.left) / rect.width) * Math.max(playerDuration, 0.01)); } : undefined} onKeyDown={audioAvailable ? (e) => { if (e.key === "ArrowRight") changeTime(Math.min(currentTimeRef.current + 1, playerDuration)); if (e.key === "ArrowLeft") changeTime(Math.max(currentTimeRef.current - 1, 0)); } : undefined}><div ref={seekFillRef} className="audio-seek-fill" style={{ transform: `scaleX(${playerDuration > 0 ? Math.min(currentTimeRef.current, playerDuration) / Math.max(playerDuration, 0.01) : 0})` }} /></div>
-      <select className="audio-rate" value={playbackRate} onChange={(event) => changeRate(Number(event.target.value))} aria-label="播放速度"><option value={0.75}>0.75×</option><option value={1}>1×</option><option value={1.25}>1.25×</option><option value={1.5}>1.5×</option><option value={2}>2×</option></select>
+  return <div className="modal-backdrop"><form className="modal create-dialog" onSubmit={submit}>
+    <header><strong>新建</strong><IconButton label="关闭" onClick={onClose}><X /></IconButton></header>
+    <label>链接<input autoFocus required value={url} disabled={resolving} onPaste={pasteLink} onChange={(event) => setUrl(event.target.value)} placeholder="https://figma.com/..." /></label>
+    <label>标题<input required maxLength={80} value={title} onChange={(event) => { setTitle(event.target.value); setSourceTitle(null); }} placeholder={resolving ? "正在根据链接生成标题…" : "例如：会员续费改版"} /></label>
+    <label>联系人<select value={contactId} onChange={(event) => setContactId(event.target.value)}><option value="">稍后选择</option>{snapshot.contacts.map((contact) => <option value={contact.id} key={contact.id}>{contact.name}</option>)}</select></label>
+    <div className="slot-blocks">
+      <span className="slot-blocks-label">数字键</span>
+      <div className="slot-blocks-grid">
+        {Array.from({ length: 10 }, (_, index) => {
+          const isOccupied = occupied.includes(index);
+          const isSelected = slot === index;
+          return <button type="button" key={index} className={`slot-block${isSelected ? " selected" : ""}${isOccupied ? " occupied" : ""}`} disabled={isOccupied} onClick={() => setSlot(index)} title={isOccupied ? "已占用" : `选择 ${slotLabel(index)}`}>
+            <kbd>{slotLabel(index)}</kbd>
+          </button>;
+        })}
+      </div>
     </div>
-  </div>;
+    <footer>
+      {invalid ? <span className="form-hint"><CircleAlert />{hint}</span> : <span className="form-hint-placeholder" />}
+      <button type="button" onClick={onClose}>取消</button>
+      <button className="primary" type="submit" disabled={saving || resolving}>{saving ? "创建中" : resolving ? "识别标题中" : "创建"}</button>
+    </footer>
+  </form></div>;
 }
 
-function formatTimestamp(milliseconds: number): string { const seconds = Math.floor(milliseconds / 1000); return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`; }
-function speakerColor(speakerId: string | null): string {
-  const index = Number(speakerId?.match(/\d+$/)?.[0]);
-  return ["var(--task-red)", "var(--task-amber)", "var(--task-purple)", "var(--task-green)", "var(--task-blue)"][index] ?? "var(--fg)";
+function TaskOverflowDialog({ tasks, onResolved, notify }: { tasks: Task[]; onResolved: (snapshot: Snapshot) => void; notify: (message: string) => void }) {
+  const [selected, setSelected] = useState(() => new Set(tasks.slice(0, 10).map((task) => task.id)));
+  const [saving, setSaving] = useState(false);
+  function toggle(taskId: string) {
+    setSelected((current) => {
+      const next = new Set(current);
+      if (next.has(taskId)) next.delete(taskId);
+      else if (next.size < 10) next.add(taskId);
+      return next;
+    });
+  }
+  async function resolve() {
+    setSaving(true);
+    try { onResolved(await api.resolveTaskOverflow(tasks.filter((task) => selected.has(task.id)).map((task) => task.id))); }
+    catch (reason) { notify(String(reason)); setSaving(false); }
+  }
+  return <div className="modal-backdrop migration-backdrop"><section className="modal overflow-dialog"><header><div><small>升级整理</small><strong>选择 10 个进行中需求</strong></div><span>{selected.size}/10</span></header><p>旧版本的颜色分组允许超过 10 个进行中需求。请选择要保留在数字键工作区的 10 个，其余需求会移动到“已完成”，内容不会删除。</p><div className="overflow-list">{tasks.map((task) => <label key={task.id} className={selected.has(task.id) ? "selected" : ""}><input type="checkbox" checked={selected.has(task.id)} disabled={!selected.has(task.id) && selected.size >= 10} onChange={() => toggle(task.id)} /><kbd>{slotLabel(task.slot)}</kbd><span><strong>{task.title}</strong><small>{task.contactName || "未指定联系人"} · {formatShortDate(task.lastOpenedAt)}</small></span></label>)}</div><footer><button className="primary" disabled={saving || selected.size !== 10} onClick={() => void resolve()}>{saving ? "整理中" : "完成整理"}</button></footer></section></div>;
 }
-function processingLabel(status: string): string { return ({ transcribing: "转写中", aligning: "处理中", diarizing: "处理中", merging: "处理中", completed: "已完成", waiting_alignment: "处理失败", alignment_error: "处理失败", diarization_error: "处理失败" } as Record<string,string>)[status] ?? status; }
 
-function modifierFromKeyboardEvent(event: KeyboardEvent): string | null {
-  return ({ Control: "Control", Alt: "Alt", Shift: "Shift", Meta: "Command" } as Record<string, string>)[event.key] ?? null;
+function SettingsView({ snapshot, setSnapshot, notify }: { snapshot: Snapshot; setSnapshot: (value: Snapshot) => void; notify: (message: string) => void }) {
+  return <div className="settings-page"><header><small>应用设置</small><h1>设置</h1></header><section className="settings-section"><h2>通用</h2><SettingToggle label="开机启动" description="登录系统后在后台启动 RedKey" checked={snapshot.settings.autostart} onChange={(value) => void api.setAutostart(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><SettingToggle label="宠物悬浮窗" description="显示悬浮按键和快速任务列表" checked={snapshot.settings.petVisible} onChange={(value) => void api.setPetVisible(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><ShortcutPrefix value={snapshot.settings.shortcuts.taskPrefix} onSaved={setSnapshot} notify={notify} /></section><SnapshotTools setSnapshot={setSnapshot} notify={notify} /><DeepSeekPanel notify={notify} /><LocalModels notify={notify} /></div>;
 }
 
-function prefixFromKeyboardEvent(event: KeyboardEvent, includeReleased = false): string | null {
-  const modifiers: string[] = [];
-  if (event.ctrlKey || (includeReleased && event.key === "Control")) modifiers.push("Control");
-  if (event.altKey || (includeReleased && event.key === "Alt")) modifiers.push("Alt");
-  if (event.shiftKey || (includeReleased && event.key === "Shift")) modifiers.push("Shift");
-  if (event.metaKey || (includeReleased && event.key === "Meta")) modifiers.push("Command");
-  return modifiers.length ? modifiers.join("+") : null;
+function ShortcutPrefix({ value, onSaved, notify }: { value: string; onSaved: (value: Snapshot) => void; notify: (message: string) => void }) {
+  const [draft, setDraft] = useState(value); const [capturing, setCapturing] = useState(false); const timer = useRef<number | null>(null);
+  useEffect(() => setDraft(value), [value]);
+  function capture(event: React.KeyboardEvent<HTMLButtonElement>) {
+    const names: string[] = [];
+    if (event.ctrlKey || event.key === "Control") names.push("Control");
+    if (event.altKey || event.key === "Alt") names.push("Alt");
+    if (event.shiftKey || event.key === "Shift") names.push("Shift");
+    if (event.metaKey || event.key === "Meta") names.push("Command");
+    if (!names.length) return;
+    event.preventDefault(); setCapturing(true); const next = Array.from(new Set(names)).join("+"); setDraft(next);
+    if (timer.current != null) window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => { void api.saveShortcuts({ taskPrefix: next }).then(onSaved).then(() => notify(`快捷键前缀已设为 ${next}`)).catch((reason) => notify(String(reason))); setCapturing(false); }, 250);
+  }
+  return <div className="shortcut-prefix"><span><strong>数字键快捷前缀</strong><small>点击右侧控件后按下修饰键；只注册 1–9、0 数字键。</small></span><button className={`shortcut-capture ${capturing ? "capturing" : ""}`} onKeyDown={capture} onKeyUp={() => setCapturing(false)} onClick={(event) => (event.currentTarget as HTMLButtonElement).focus()}>{capturing ? "按下修饰键…" : draft || "Control"}</button></div>;
 }
 
-function shortcutKeyName(event: KeyboardEvent): string | null {
-  const code = event.code;
-  if (code.startsWith("Digit")) return code.slice(5);
-  if (code.startsWith("Key")) return code.slice(3).toUpperCase();
-  if (/^F([1-9]|1[0-9]|2[0-4])$/.test(code)) return code;
-  const names: Record<string, string> = {
-    Minus: "Minus",
-    Equal: "Equal",
-    Space: "Space",
-    Enter: "Enter",
-    Tab: "Tab",
-    Backspace: "Backspace",
-    Delete: "Delete",
-    ArrowUp: "Up",
-    ArrowDown: "Down",
-    ArrowLeft: "Left",
-    ArrowRight: "Right",
-    Home: "Home",
-    End: "End",
-    PageUp: "PageUp",
-    PageDown: "PageDown",
-  };
-  if (names[code]) return names[code];
-  if (event.key.length === 1) return event.key.toUpperCase();
-  return null;
+function SnapshotTools({ setSnapshot, notify }: { setSnapshot: (value: Snapshot) => void; notify: (message: string) => void }) {
+  const [busy, setBusy] = useState(false);
+  async function copySnapshot() { setBusy(true); try { await writeText(await api.exportData()); notify("快照已复制到剪贴板"); } catch (reason) { notify(String(reason)); } finally { setBusy(false); } }
+  async function pasteSnapshot() { setBusy(true); try { const payload = await readText(); if (!payload.trim()) throw new Error("剪贴板没有快照内容"); setSnapshot(await api.importData(payload)); notify("快照已粘贴并恢复"); } catch (reason) { notify(String(reason)); } finally { setBusy(false); } }
+  async function clearAll() { setBusy(true); try { setSnapshot(await api.clearAllData()); notify("数据已清除，本地模型保留"); } catch (reason) { notify(String(reason)); } finally { setBusy(false); } }
+  const [confirmClear, setConfirmClear] = useState(false);
+  return <section className="settings-section data-tools"><div className="section-heading"><div><h2>数据</h2><p>快照只通过剪贴板传递；清除数据不会删除本地模型。</p></div></div><div className="data-tool-actions"><button disabled={busy} onClick={() => void copySnapshot()}><Clipboard />复制快照</button><button disabled={busy} onClick={() => void pasteSnapshot()}><ClipboardPaste />粘贴快照</button><button className="danger-action" disabled={busy} onClick={() => setConfirmClear(true)}><Trash2 />清除全部数据</button></div>{confirmClear && <ConfirmDialog
+    title="清除全部数据？"
+    description="所有需求、联系人、录音、文本卡和 AI 总结都会被删除。本地模型文件会保留。"
+    confirmLabel="清除全部"
+    danger
+    onConfirm={() => { setConfirmClear(false); void clearAll(); }}
+    onCancel={() => setConfirmClear(false)}
+  />}</section>;
+}
+
+function DeepSeekPanel({ notify }: { notify: (message: string) => void }) {
+  const [settings, setSettings] = useState<DeepSeekSettings | null>(null); const [key, setKey] = useState(""); const [busy, setBusy] = useState(false);
+  useEffect(() => { void api.deepSeekSettings().then(setSettings).catch(() => setSettings({ configured: false, model: "deepseek-v4-flash" })); }, []);
+  async function save() { setBusy(true); try { setSettings(await api.saveDeepSeekApiKey(key)); setKey(""); notify("API Key 已保存到系统钥匙串"); } catch (reason) { notify(String(reason)); } finally { setBusy(false); } }
+  async function test() { setBusy(true); try { await api.testDeepSeekConnection(); notify("DeepSeek 连接正常"); } catch (reason) { notify(String(reason)); } finally { setBusy(false); } }
+  return <section className="settings-section"><div className="section-heading"><div><h2>云端 AI</h2><p>录音处理完成后自动梳理对接结论和待处理事项。</p></div><span className={`status-badge ${settings?.configured ? "success" : "warning"}`}>{settings?.configured ? "已配置" : "未配置"}</span></div><div className="api-row"><KeyRound /><div><strong>DeepSeek</strong><small>{settings?.model ?? "deepseek-v4-flash"} · Key 保存在系统钥匙串</small></div><input type="password" value={key} placeholder={settings?.configured ? "输入新 Key 以替换" : "sk-..."} onChange={(event) => setKey(event.target.value)} /><button className="primary" disabled={!key.trim() || busy} onClick={() => void save()}>保存</button>{settings?.configured && <button disabled={busy} onClick={() => void test()}>测试</button>}{settings?.configured && <IconButton danger label="删除 API Key" onClick={() => void api.deleteDeepSeekApiKey().then(setSettings).then(() => notify("API Key 已删除")).catch((reason) => notify(String(reason)))}><Trash2 /></IconButton>}</div></section>;
+}
+
+function LocalModels({ notify }: { notify: (message: string) => void }) {
+  const models = [{ id: "Qwen3-ASR-1.7B", note: "本地录音转写" }, { id: "Qwen3-ForcedAligner-0.6B", note: "文字时间对齐" }, { id: "3D-Speaker-CAM++", note: "发言人分离" }];
+  return <section className="settings-section"><div className="section-heading"><div><h2>本地模型</h2><p>录音与转写保留在本机，云端 AI 只接收最终文本。</p></div></div>{models.map((model) => <ModelRow key={model.id} id={model.id} note={model.note} notify={notify} />)}</section>;
+}
+
+function ModelRow({ id, note, notify }: { id: string; note: string; notify: (message: string) => void }) {
+  const [status, setStatus] = useState<ModelStatus | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  useEffect(() => { void api.modelStatus(id).then(setStatus); let stop: (() => void) | undefined; void onModelStatus((value) => { if (value.id === id) setStatus(value); }).then((cleanup) => { stop = cleanup; }); return () => stop?.(); }, [id]);
+  return <div className="model-row"><div><strong>{id}</strong><small>{note}</small>{status?.downloading && <progress value={status.progressKind === "download" ? status.progress : undefined} max={100} />}</div><span className={`status-badge ${status?.installed ? "success" : status?.error ? "error" : "warning"}`}>{status?.stage ?? "检查中"}</span>{status?.installed ? <IconButton danger label="删除模型" onClick={() => setConfirmDelete(true)}><Trash2 /></IconButton> : <button disabled={status?.downloading} onClick={() => void api.downloadModel(id).catch((reason) => notify(String(reason)))}><Download />{status?.error ? "重试" : "下载"}</button>}{confirmDelete && <ConfirmDialog
+    title={`删除 ${id}？`}
+    description="删除后可以重新下载。"
+    confirmLabel="删除"
+    danger
+    onConfirm={() => { setConfirmDelete(false); void api.deleteModel(id).then(() => api.modelStatus(id)).then(setStatus).catch((reason) => notify(String(reason))); }}
+    onCancel={() => setConfirmDelete(false)}
+  />}</div>;
+}
+
+function SettingToggle({ label, description, checked, onChange }: { label: string; description: string; checked: boolean; onChange: (value: boolean) => void }) { return <label className="setting-toggle"><span><strong>{label}</strong><small>{description}</small></span><input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} /></label>; }
+
+function EmptyDocument({ completed, onNew }: { completed: boolean; onNew: () => void }) { return <div className="empty-document"><div><FileText /><h1>{completed ? "还没有已完成需求" : "创建第一份需求文档"}</h1><p>{completed ? "完成的需求会保留全部文本、录音和总结。" : "将需求绑定到数字键，随时切换并记录对接内容。"}</p>{!completed && <button className="primary" onClick={onNew}><Plus />新建需求</button>}</div></div>; }
+
+function TaskHudWindow() {
+  const [payload, setPayload] = useState<TaskHudPayload | null>(null);
+  useEffect(() => { document.documentElement.classList.add("hud-document"); let stop: (() => void) | undefined; void onTaskHud(setPayload).then((cleanup) => { stop = cleanup; }); return () => { stop?.(); document.documentElement.classList.remove("hud-document"); }; }, []);
+  return <div className="task-hud-window">{payload && <section className="task-hud">{payload.slots.map(({ slot, name, title }) => <div className={title ? "bound" : ""} key={slot}><kbd>{slotLabel(slot)}</kbd><span><strong>{name || "未指定"}</strong><small>{title || "空"}</small></span></div>)}</section>}</div>;
 }
 
 function QuickPanel() {
-  const { snapshot, setSnapshot, currentTask } = useSnapshot();
-  const [link, setLink] = useState("");
-  const [message, setMessage] = useState("");
-  const [partialText, setPartialText] = useState("");
-  const activeTasks = useMemo(() => snapshot ? tasksForView(tasksForGroup(snapshot.tasks, snapshot.settings.multiGroupEnabled ? snapshot.currentGroup : "red"), "tasks") : [], [snapshot]);
-
-  useEffect(() => {
-    const prefillFromClipboard = () => {
-      void clipboardText().then((value) => {
-        const url = completeHttpUrl(value);
-        if (url) {
-          setLink(url);
-          setMessage("");
-        }
-      });
-    };
-    let unlistenDrop: (() => void) | undefined;
-    let unlistenShown: (() => void) | undefined;
-    prefillFromClipboard();
-    void onLinkDrop((url) => { setLink(url); setMessage(""); }).then((cleanup) => { unlistenDrop = cleanup; });
-    void onQuickPanelShown(prefillFromClipboard).then((cleanup) => { unlistenShown = cleanup; });
-    let unlistenPartial: (() => void) | undefined;
-    void onPartialTranscript((value) => setPartialText(value.text)).then((cleanup) => { unlistenPartial = cleanup; });
-    return () => {
-      unlistenDrop?.();
-      unlistenShown?.();
-      unlistenPartial?.();
-    };
-  }, []);
-
-  async function useLink(value: string) {
-    const candidate = extractHttpUrl(value);
-    if (!candidate) {
-      setMessage("没有识别到有效链接");
-      return;
-    }
-    try {
-      await api.openConsoleNewTask(candidate);
-      setLink("");
-      setMessage("");
-    } catch (reason) {
-      setMessage(String(reason));
-    }
-  }
-
+  const { snapshot, setSnapshot } = useSnapshot(); const [link, setLink] = useState(""); const [message, setMessage] = useState(""); const [partial, setPartial] = useState("");
+  const activeTasks = useMemo(() => sortRecent(snapshot?.tasks.filter((task) => task.status === "active" && task.group === "red") ?? []), [snapshot]);
+  useEffect(() => { const prefill = () => void readText().then((value) => { const url = extractHttpUrl(value); if (url) setLink(url); }); let a: (() => void) | undefined; let b: (() => void) | undefined; let c: (() => void) | undefined; prefill(); void onLinkDrop((url) => setLink(url)).then((stop) => { a = stop; }); void onQuickPanelShown(prefill).then((stop) => { b = stop; }); void onPartialTranscript((value) => setPartial(value.text)).then((stop) => { c = stop; }); return () => { a?.(); b?.(); c?.(); }; }, []);
+  async function useLink() { const url = extractHttpUrl(link); if (!url) { setMessage("没有识别到有效链接"); return; } try { await api.openConsoleNewTask(url); setLink(""); } catch (reason) { setMessage(String(reason)); } }
   if (!snapshot) return <LoadingState />;
-  return (
-    <div
-      className="quick-shell"
-      style={{ "--task-color": taskGroupColor(currentTask?.group ?? snapshot.currentGroup) } as React.CSSProperties}
-      onDragOver={(event) => {
-        if (!isSupportedLinkDrag(event.dataTransfer)) {
-          event.dataTransfer.dropEffect = "none";
-          return;
-        }
-        event.preventDefault();
-        event.dataTransfer.dropEffect = "copy";
-      }}
-      onDrop={(event) => {
-        event.preventDefault();
-        if (isSupportedLinkDrag(event.dataTransfer)) void droppedUrl(event.dataTransfer).then((value) => useLink(value ?? ""));
-      }}
-    >
-      <div className="quick-top"><span className="live-dot" /><strong>RedKey</strong><button onClick={() => void api.showConsole()}>打开控制台</button></div>
-      <section className="drop-link">
-        <Link2 size={18} /><div><strong>拖入或粘贴链接</strong><span>创建新的任务指令</span></div>
-        <div className="drop-input"><input value={link} onChange={(event) => setLink(event.target.value)} placeholder="https://figma.com/..." /><button onClick={() => void useLink(link)}>添加</button></div>
-      </section>
-      {message && <p className="quick-message">{message}</p>}
-      {currentTask ? (
-        <section className="quick-current">
-          <span className="eyebrow">当前任务</span>
-          <h1>{currentTask.title}</h1>
-          <div className="quick-progress-wrap">
-            <div className="quick-progress"><span style={{ width: `${currentTask.progress}%` }} /><b>{currentTask.progress}%</b></div>
-          </div>
-          <div className="quick-actions">
-            <button className={currentTask.status === "completed" ? "ghost-slot" : ""} title="进度 -20%" onClick={() => void api.dispatch({ type: "adjust_progress", delta: -20 }).then(setSnapshot)}><Minus /></button>
-            <button className={currentTask.status === "completed" ? "ghost-slot" : ""} title="进度 +20%" onClick={() => void api.dispatch({ type: "adjust_progress", delta: 20 }).then(setSnapshot)}><Plus /></button>
-            <button title="浏览器打开" onClick={() => void api.setCurrentTask(currentTask.id, true).then(setSnapshot)}><ExternalLink /></button>
-            {currentTask.status === "completed" ? <button title="恢复为进行中" onClick={() => void api.dispatch({ type: "start_rework" }).then(setSnapshot)}><Redo2 /></button> : <button className="complete" title="完成任务" onClick={() => void api.dispatch({ type: "complete_current" }).then(setSnapshot)}><Check /></button>}
-          </div>
-        </section>
-      ) : <div className="quick-empty"><CircleGauge /><strong>还没有当前任务</strong><span>按下已绑定的数字快捷键即可选中。</span></div>}
-      {snapshot.recordings.some((recording) => recording.status === "recording") && <div className="quick-live"><span className="live-dot" /><strong>录音中</strong><p>{partialText || "正在聆听…"}</p></div>}
-      <section className="quick-active-tasks" aria-label="进行中的任务">
-        <div className="quick-active-heading"><strong>进行中</strong><span>{activeTasks.length}</span></div>
-        <div className="quick-active-list">
-          {activeTasks.length === 0 ? <span className="quick-active-empty">没有进行中的任务</span> : activeTasks.map((task) => (
-            <button key={task.id} className={task.id === currentTask?.id ? "active" : ""} style={{ "--task-color": taskGroupColor(task.group) } as React.CSSProperties} title={task.title} onClick={() => void api.setCurrentTask(task.id, false).then(setSnapshot)}>
-              <kbd>{slotLabel(task.slot)}</kbd><span>{task.title}</span>
-            </button>
-          ))}
-        </div>
-      </section>
-    </div>
-  );
-}
-
-function completeHttpUrl(value: string): string | null {
-  const trimmed = value.trim();
-  return trimmed && !/\s/.test(trimmed) ? extractHttpUrl(trimmed) : null;
-}
-
-async function startPcmRecorder(stream: MediaStream, onLevel: (level: number) => void): Promise<{ stop: () => Promise<Uint8Array>; snapshot: () => Uint8Array }> {
-  const context = new AudioContext();
-  const source = context.createMediaStreamSource(stream);
-  const processor = context.createScriptProcessor(4096, 1, 1);
-  const chunks: Float32Array[] = [];
-  processor.onaudioprocess = (event) => {
-    const input = event.inputBuffer.getChannelData(0);
-    chunks.push(new Float32Array(input));
-    let sum = 0;
-    for (let index = 0; index < input.length; index++) sum += input[index] * input[index];
-    onLevel(Math.min(1, Math.sqrt(sum / input.length) * 5));
-  };
-  source.connect(processor);
-  processor.connect(context.destination);
-  const wavSnapshot = (lastSeconds?: number) => {
-    const length = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    const wanted = lastSeconds ? Math.min(length, Math.ceil(context.sampleRate * lastSeconds)) : length;
-    const input = new Float32Array(wanted);
-    let offset = 0;
-    let skipped = length - wanted;
-    for (const chunk of chunks) {
-      if (skipped >= chunk.length) { skipped -= chunk.length; continue; }
-      const slice = chunk.subarray(skipped);
-      const available = Math.min(slice.length, wanted - offset);
-      input.set(slice.subarray(0, available), offset);
-      offset += available; skipped = 0;
-      if (offset >= wanted) break;
-    }
-    const ratio = context.sampleRate / 16000;
-    const samples = new Int16Array(Math.floor(input.length / ratio));
-    for (let index = 0; index < samples.length; index++) {
-      const start = Math.floor(index * ratio);
-      const end = Math.min(Math.floor((index + 1) * ratio), input.length);
-      let sum = 0;
-      for (let sourceIndex = start; sourceIndex < end; sourceIndex++) sum += input[sourceIndex];
-      const value = Math.max(-1, Math.min(1, sum / Math.max(1, end - start)));
-      samples[index] = value < 0 ? value * 0x8000 : value * 0x7fff;
-    }
-    return encodeWav(samples, 16000);
-  };
-  return { snapshot: () => wavSnapshot(6), stop: async () => {
-    processor.disconnect(); source.disconnect();
-    stream.getTracks().forEach((track) => track.stop());
-    await context.close();
-    onLevel(0);
-    return wavSnapshot();
-  } };
-}
-
-function encodeWav(samples: Int16Array, sampleRate: number): Uint8Array {
-  const buffer = new ArrayBuffer(44 + samples.byteLength);
-  const view = new DataView(buffer);
-  const write = (offset: number, value: string) => Array.from(value).forEach((char, index) => view.setUint8(offset + index, char.charCodeAt(0)));
-  write(0, "RIFF"); view.setUint32(4, 36 + samples.byteLength, true); write(8, "WAVE"); write(12, "fmt ");
-  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true); view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true); write(36, "data"); view.setUint32(40, samples.byteLength, true);
-  new Int16Array(buffer, 44).set(samples);
-  return new Uint8Array(buffer);
+  return <div className="quick-shell"><div className="quick-top"><strong>RedKey</strong><button onClick={() => void api.showConsole()}>打开控制台</button></div><div className="quick-link"><Link2 /><input value={link} placeholder="粘贴需求链接" onChange={(event) => setLink(event.target.value)} /><button onClick={() => void useLink()}><Plus /></button></div>{message && <p className="quick-message">{message}</p>}{snapshot.recordings.some((recording) => recording.status === "recording") && <div className="quick-live"><span /><strong>录音中</strong><p>{partial || "正在聆听…"}</p></div>}<section className="quick-active"><header><strong>进行中</strong><span>{activeTasks.length}</span></header>{activeTasks.map((task) => <button key={task.id} className={task.id === snapshot.currentTaskId ? "active" : ""} onClick={() => void api.setCurrentTask(task.id, false).then(setSnapshot)}><kbd>{slotLabel(task.slot)}</kbd><span><strong>{task.contactName || "未指定"}</strong><small>{task.title}</small></span></button>)}</section></div>;
 }
 
 function Pet() {
-  const { currentTask, snapshot } = useSnapshot();
-  const [pressed, setPressed] = useState(false);
-  const pointerStart = useRef<{ x: number; y: number; id: number } | null>(null);
-  const dragging = useRef(false);
-  const state = petState(currentTask);
-  const key = currentTask ? slotLabel(currentTask.slot) : "R";
+  const { currentTask } = useSnapshot(); const [pressed, setPressed] = useState(false);
+  useEffect(() => { const timer = window.setInterval(() => void api.syncHoverState(), 80); return () => window.clearInterval(timer); }, []);
+  async function drag() { setPressed(true); try { await api.setPetDragging(true); await getCurrentWindow().startDragging(); } finally { setPressed(false); void api.setPetDragging(false); } }
+  return <div className={`pet-shell ${petState(currentTask)} ${pressed ? "pressed" : ""}`} onPointerDown={() => void drag()} onContextMenu={(event) => { event.preventDefault(); void api.showConsole(); }}><button className="keycap" title={currentTask?.title ?? "RedKey"}><span><b>{currentTask ? slotLabel(currentTask.slot) : "R"}</b><i>{currentTask ? "ACTIVE" : "READY"}</i></span></button></div>;
+}
 
-  useEffect(() => {
-    const timer = window.setInterval(() => { void api.syncHoverState(); }, 50);
-    void api.syncHoverState();
-    return () => window.clearInterval(timer);
-  }, []);
+function IconButton({ label, children, onClick, disabled, active, danger }: { label: string; children: React.ReactNode; onClick?: () => void; disabled?: boolean; active?: boolean; danger?: boolean }) { return <button type="button" className={`icon-button ${active ? "active" : ""} ${danger ? "danger" : ""}`} title={label} aria-label={label} disabled={disabled} onClick={onClick}>{children}</button>; }
 
-  async function pressPet(event: React.PointerEvent) {
-    if (event.button !== 0) return;
-    event.currentTarget.setPointerCapture(event.pointerId);
-    pointerStart.current = { x: event.screenX, y: event.screenY, id: event.pointerId };
-    dragging.current = true;
-    setPressed(true);
-    try {
-      await api.setPetDragging(true);
-      await getCurrentWindow().startDragging();
-    } finally {
-      dragging.current = false;
-      pointerStart.current = null;
-      setPressed(false);
-      void api.setPetDragging(false);
-    }
-  }
-
-  function releasePet(event: React.PointerEvent) {
-    if (pointerStart.current?.id === event.pointerId) {
-      if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
-    }
-  }
-
-  return (
-    <div
-      className={`pet-shell ${state} ${pressed ? "is-pressed" : ""}`}
-      onDragEnter={(event) => {
-        if (!dragging.current && isSupportedLinkDrag(event.dataTransfer)) event.preventDefault();
-        else event.dataTransfer.dropEffect = "none";
-      }}
-      onDragOver={(event) => {
-        if (dragging.current || !isSupportedLinkDrag(event.dataTransfer)) {
-          event.dataTransfer.dropEffect = "none";
-          return;
-        }
-        event.preventDefault();
-        event.dataTransfer.dropEffect = "copy";
-        void api.showQuickPanel();
-      }}
-      onDrop={(event) => {
-        event.preventDefault();
-        if (!dragging.current && isSupportedLinkDrag(event.dataTransfer)) void submitDroppedData(event.dataTransfer);
-      }}
-      onPointerDown={pressPet}
-      onPointerUp={releasePet}
-      onPointerCancel={releasePet}
-      onContextMenu={(event) => { event.preventDefault(); void api.showConsole(); }}
-    >
-      <button className="keycap" title={currentTask?.title ?? "拖动 RedKey"} style={{ "--group-color": taskGroupColor(currentTask?.group) } as React.CSSProperties}>
-        <span className="keycap-top"><b>{key}</b><i>{currentTask ? `${currentTask.progress}%` : "READY"}</i></span>
-        <span className="keycap-light" style={{ "--progress": `${snapshot && currentTask ? currentTask.progress : 0}%` } as React.CSSProperties} />
-      </button>
+function ConfirmDialog({ title, description, confirmLabel = "确认", cancelLabel = "取消", danger = false, onConfirm, onCancel }: { title: string; description?: string; confirmLabel?: string; cancelLabel?: string; danger?: boolean; onConfirm: () => void; onCancel: () => void; }) {
+  return <div className="modal-backdrop" onClick={onCancel}>
+    <div className="modal confirm-dialog" onClick={(e) => e.stopPropagation()}>
+      <header><div><strong>{title}</strong></div></header>
+      {description && <p>{description}</p>}
+      <footer>
+        <button onClick={onCancel}>{cancelLabel}</button>
+        <button className={danger ? "danger-action" : "primary"} onClick={onConfirm}>{confirmLabel}</button>
+      </footer>
     </div>
-  );
+  </div>;
+}
+function NavButton({ active, icon, label, onClick }: { active: boolean; icon: React.ReactElement; label: string; onClick: () => void }) { return <button className={`nav-button ${active ? "active" : ""}`} onClick={onClick}>{icon}<span>{label}</span></button>; }
+function AudioMeter({ level }: { level: number }) { return <span className="audio-meter">{Array.from({ length: 16 }, (_, index) => <i key={index} style={{ height: `${Math.max(12, Math.min(100, 12 + level * 160 * (0.4 + ((index * 7) % 9) / 14)))}%` }} />)}</span>; }
+function LoadingState({ error }: { error?: string | null }) { return <div className="loading-state"><span>R</span><p>{error ?? "正在加载 RedKey…"}</p></div>; }
+function sortRecent(tasks: Task[]) { return [...tasks].sort((a, b) => (b.lastOpenedAt ?? b.startedAt).localeCompare(a.lastOpenedAt ?? a.startedAt)); }
+function formatDate(value: string | null) { if (!value) return ""; const date = new Date(value); return `${date.getFullYear()}/${String(date.getMonth() + 1).padStart(2, "0")}/${String(date.getDate()).padStart(2, "0")} ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`; }
+function formatShortDate(value: string | null) { if (!value) return "未打开"; const date = new Date(value); return `${date.getMonth() + 1}/${date.getDate()} ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`; }
+function formatDuration(seconds: number) { return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`; }
+function formatTimestamp(milliseconds: number) { return formatDuration(Math.floor(milliseconds / 1000)); }
+
+async function startPcmRecorder(stream: MediaStream, onLevel: (level: number) => void): Promise<RecorderHandle> {
+  const context = new AudioContext(); const source = context.createMediaStreamSource(stream); const processor = context.createScriptProcessor(4096, 1, 1); const chunks: Float32Array[] = [];
+  processor.onaudioprocess = (event) => { const input = event.inputBuffer.getChannelData(0); chunks.push(new Float32Array(input)); let sum = 0; for (let index = 0; index < input.length; index++) sum += input[index] * input[index]; onLevel(Math.min(1, Math.sqrt(sum / input.length) * 5)); };
+  source.connect(processor); processor.connect(context.destination);
+  const snapshot = () => { const length = chunks.reduce((sum, chunk) => sum + chunk.length, 0); const input = new Float32Array(length); let offset = 0; for (const chunk of chunks) { input.set(chunk, offset); offset += chunk.length; } const ratio = context.sampleRate / 16000; const samples = new Int16Array(Math.floor(input.length / ratio)); for (let index = 0; index < samples.length; index++) { const start = Math.floor(index * ratio); const end = Math.min(Math.floor((index + 1) * ratio), input.length); let sum = 0; for (let sourceIndex = start; sourceIndex < end; sourceIndex++) sum += input[sourceIndex]; const value = Math.max(-1, Math.min(1, sum / Math.max(1, end - start))); samples[index] = value < 0 ? value * 0x8000 : value * 0x7fff; } return encodeWav(samples, 16000); };
+  return { snapshot, stop: async () => { processor.disconnect(); source.disconnect(); stream.getTracks().forEach((track) => track.stop()); const bytes = snapshot(); await context.close(); onLevel(0); return bytes; } };
 }
 
-async function submitDroppedData(data: DataTransfer) {
-  const direct = await droppedUrl(data);
-  if (direct) {
-    await api.submitDroppedLink(direct);
-    return;
-  }
-  const file = data.files?.[0];
-  if (file?.name.toLowerCase().endsWith(".webloc")) {
-    const content = await file.text();
-    const match = content.match(/https?:\/\/[^<\s]+/i);
-    const url = match ? extractHttpUrl(match[0]) : null;
-    if (url) await api.submitDroppedLink(url);
-  }
-}
-
-async function droppedUrl(data: DataTransfer): Promise<string | null> {
-  for (const type of ["text/uri-list", "text/plain", "text/x-moz-url"]) {
-    const value = data.getData(type);
-    const candidate = value.split(/\r?\n/).find((part) => part && !part.startsWith("#")) ?? value;
-    const url = extractHttpUrl(candidate);
-    if (url) return url;
-  }
-  const htmlUrl = extractHtmlUrl(data.getData("text/html"));
-  if (htmlUrl) return htmlUrl;
-  for (const item of Array.from(data.items)) {
-    if (item.kind !== "string") continue;
-    const value = await new Promise<string>((resolve) => item.getAsString(resolve));
-    const url = extractHttpUrl(value) ?? extractHtmlUrl(value);
-    if (url) return url;
-  }
-  return null;
-}
-
-function isSupportedLinkDrag(data: DataTransfer): boolean {
-  const supportedTypes = ["text/uri-list", "text/x-moz-url"];
-  return Array.from(data.types).some((type) => supportedTypes.includes(type))
-    || Array.from(data.files).some((file) => file.name.toLowerCase().endsWith(".webloc"));
-}
-
-function extractHtmlUrl(value: string): string | null {
-  if (!value) return null;
-  const href = value.match(/href\s*=\s*["']([^"']+)["']/i)?.[1];
-  return extractHttpUrl(href ?? value);
-}
-
-function NavButton({ active, icon, label, onClick }: { active: boolean; icon: React.ReactElement; label: string; onClick: () => void }) {
-  return <button className={`nav-button ${active ? "active" : ""}`} onClick={onClick}>{icon}<span>{label}</span></button>;
-}
-
-function LoadingState({ error }: { error?: string | null }) {
-  return <div className="loading-state"><span className="loading-key">R</span><p>{error ?? "正在加载 RedKey…"}</p></div>;
-}
-
-function XIcon() { return <Trash2 size={13} />; }
-
-function taskGroupColor(group: TaskGroup | undefined): string {
-  return group ? `var(--task-${group})` : "var(--task-red)";
-}
-
-function groupLabel(group: TaskGroup): string {
-  return ({ blue: "蓝色分组", green: "绿色分组", purple: "紫色分组", amber: "黄色分组", red: "红色分组" })[group];
-}
+function encodeWav(samples: Int16Array, sampleRate: number) { const buffer = new ArrayBuffer(44 + samples.byteLength); const view = new DataView(buffer); const write = (offset: number, value: string) => Array.from(value).forEach((char, index) => view.setUint8(offset + index, char.charCodeAt(0))); write(0, "RIFF"); view.setUint32(4, 36 + samples.byteLength, true); write(8, "WAVE"); write(12, "fmt "); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true); view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true); write(36, "data"); view.setUint32(40, samples.byteLength, true); new Int16Array(buffer, 44).set(samples); return new Uint8Array(buffer); }

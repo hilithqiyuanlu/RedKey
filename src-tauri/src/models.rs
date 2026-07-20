@@ -16,7 +16,6 @@ pub struct Task {
     pub manual_order: i64,
     pub last_opened_at: Option<String>,
     pub status: String,
-    pub progress: i64,
     pub started_at: String,
     pub completed_at: Option<String>,
     pub slot: Option<i64>,
@@ -43,7 +42,7 @@ pub struct ShortcutSettings {
     pub task_prefix: String,
 }
 
-fn default_task_prefix() -> String { "Control+Alt".into() }
+fn default_task_prefix() -> String { "Control".into() }
 
 impl Default for ShortcutSettings {
     fn default() -> Self {
@@ -80,7 +79,7 @@ fn default_pet_visible() -> bool { true }
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            autostart: false,
+            autostart: true,
             pet_visible: true,
             multi_group_enabled: true,
             shortcuts: ShortcutSettings::default(),
@@ -126,6 +125,59 @@ pub struct Recording {
     pub diarization_status: String,
     pub speaker_count: i64,
     pub processing_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TextCard {
+    pub id: String,
+    pub task_id: String,
+    pub content: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionItem {
+    pub text: String,
+    pub owner: Option<String>,
+    pub due: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingSummary {
+    pub recording_id: String,
+    pub overview: String,
+    pub pending_items: Vec<String>,
+    pub confirmed_decisions: Vec<String>,
+    pub requested_changes: Vec<String>,
+    pub action_items: Vec<ActionItem>,
+    pub open_questions: Vec<String>,
+    pub source_transcript_hash: Option<String>,
+    pub model: Option<String>,
+    pub prompt_version: String,
+    pub status: String,
+    pub error_message: Option<String>,
+    pub user_edited: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskDocument {
+    pub task: Task,
+    pub text_cards: Vec<TextCard>,
+    pub recordings: Vec<Recording>,
+    pub summaries: Vec<RecordingSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeepSeekSettings {
+    pub configured: bool,
+    pub model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,7 +249,6 @@ pub struct UpdateTaskInput {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AppAction {
     ActivateSlot { slot: i64 },
-    AdjustProgress { delta: i64 },
     CompleteCurrent,
     StartRework,
     PreviousGroup,
@@ -296,7 +347,7 @@ mod tests {
     #[test]
     fn default_shortcuts_use_task_prefix() {
         let shortcuts = ShortcutSettings::default();
-        assert_eq!(shortcuts.task_prefix, "Control+Alt");
+        assert_eq!(shortcuts.task_prefix, "Control");
         assert!(shortcuts.validate().is_ok());
     }
 
