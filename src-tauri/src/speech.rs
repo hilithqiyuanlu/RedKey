@@ -1,7 +1,7 @@
 use crate::models::ModelStatus;
 use anyhow::{bail, Context, Result};
 use serde_json::json;
-use std::{collections::HashSet, fs, fs::OpenOptions, io::{BufRead, BufReader, Write}, path::{Path, PathBuf}, process::{Child, ChildStdin, ChildStdout, Command, Stdio}, sync::{Arc, Mutex, OnceLock}, thread, time::Duration};
+use std::{collections::{HashMap, HashSet}, fs, fs::OpenOptions, io::{BufRead, BufReader, Write}, path::{Path, PathBuf}, process::{Child, ChildStdin, ChildStdout, Command, Stdio}, sync::{Arc, Mutex, OnceLock}, thread, time::Duration};
 use tauri::{AppHandle, Emitter, Manager};
 
 pub const ASR_ID: &str = "Qwen3-ASR-1.7B";
@@ -11,8 +11,17 @@ const CAMPP_MODEL: &str = "iic/speech_campplus_sv_zh_en_16k-common_advanced";
 const VAD_MODEL: &str = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch";
 const DIARIZATION_READY_VERSION: &str = "redkey-diarization-runtime-v2";
 static ACTIVE_DOWNLOADS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+// status() is called on every recording's processing pipeline (to check the
+// aligner/diarization models are installed) as well as on settings UI mounts.
+// Once a model is installed its directory is immutable, so the recursive
+// installed-check + directory_size walk is cached instead of re-walking the
+// whole model tree (which can hold thousands of files) on every call.
+// Cache is bypassed while a download is active, since the directory is
+// legitimately changing then, and is invalidated on delete().
+static STATUS_CACHE: OnceLock<Mutex<HashMap<String, (bool, u64)>>> = OnceLock::new();
 
 fn active_downloads() -> &'static Mutex<HashSet<String>> { ACTIVE_DOWNLOADS.get_or_init(|| Mutex::new(HashSet::new())) }
+fn status_cache() -> &'static Mutex<HashMap<String, (bool, u64)>> { STATUS_CACHE.get_or_init(|| Mutex::new(HashMap::new())) }
 
 fn models_dir(app: &AppHandle) -> Result<PathBuf> { Ok(app.path().app_data_dir()?.join("models")) }
 fn runtime_dir(app: &AppHandle) -> Result<PathBuf> { Ok(app.path().app_data_dir()?.join("speech-runtime")) }
@@ -44,11 +53,21 @@ pub fn status(app: &AppHandle, id: &str) -> Result<ModelStatus> {
     let mut value = fs::read_to_string(state_path(app, id)?).ok()
         .and_then(|text| serde_json::from_str::<ModelStatus>(&text).ok())
         .unwrap_or(ModelStatus { id: id.into(), installed: false, downloading: false, progress: 0, stage: "未安装".into(), error: None, size_bytes: 0, downloaded_bytes: 0, total_bytes: None, progress_kind: "idle".into(), detail: "尚未下载".into(), verified: false });
-    value.installed = if id == DIARIZATION_ID {
-        fs::read_to_string(dir.join(".ready")).is_ok_and(|value| value.lines().next() == Some(DIARIZATION_READY_VERSION))
-            && contains_weight(&dir.join("model-cache"))
-    } else { dir.join("config.json").exists() && contains_weight(&dir) };
-    value.size_bytes = directory_size(&dir);
+    let downloading_now = active_downloads().lock().unwrap().contains(id);
+    let cached = if downloading_now { None } else { status_cache().lock().unwrap().get(id).copied() };
+    if let Some((installed, size_bytes)) = cached {
+        value.installed = installed;
+        value.size_bytes = size_bytes;
+    } else {
+        value.installed = if id == DIARIZATION_ID {
+            fs::read_to_string(dir.join(".ready")).is_ok_and(|value| value.lines().next() == Some(DIARIZATION_READY_VERSION))
+                && contains_weight(&dir.join("model-cache"))
+        } else { dir.join("config.json").exists() && contains_weight(&dir) };
+        value.size_bytes = directory_size(&dir);
+        if !downloading_now {
+            status_cache().lock().unwrap().insert(id.to_string(), (value.installed, value.size_bytes));
+        }
+    }
     value.verified = value.installed;
     if value.installed { value.downloading = false; value.progress = 100; value.downloaded_bytes = value.total_bytes.unwrap_or(value.size_bytes); value.progress_kind = "idle".into(); value.stage = "已安装".into(); value.detail = "模型文件已校验，可离线使用".into(); }
     else if value.downloading && !active_downloads().lock().unwrap().contains(id) {
@@ -112,6 +131,7 @@ pub fn delete(app: &AppHandle, id: &str) -> Result<()> {
     let dir = models_dir(app)?.join(id);
     if dir.exists() { fs::remove_dir_all(&dir).with_context(|| format!("删除模型目录失败：{}", dir.display()))?; }
     let _ = fs::remove_file(state_path(app, id)?);
+    status_cache().lock().unwrap().remove(id);
     save_status(app, &ModelStatus {
         id: id.into(),
         installed: false,

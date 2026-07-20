@@ -35,7 +35,7 @@ extern "C" {
 }
 
 struct RuntimeState {
-    db: Mutex<Database>,
+    db: Mutex<Option<Database>>,
     tray_icon: Mutex<Option<TrayIcon>>,
     keyboard_monitor: Mutex<Option<KeyboardMonitor>>,
     hover_regions: Mutex<HoverRegions>,
@@ -45,6 +45,38 @@ struct RuntimeState {
     partial_busy: std::sync::atomic::AtomicBool,
     native_recording: Mutex<Option<NativeRecording>>,
     hud_state: Mutex<HudState>,
+}
+
+impl Default for RuntimeState {
+    fn default() -> Self {
+        Self {
+            db: Mutex::new(None),
+            tray_icon: Mutex::new(None),
+            keyboard_monitor: Mutex::new(None),
+            hover_regions: Mutex::new(HoverRegions::default()),
+            speech_worker: Mutex::new(None),
+            speech_worker_process: Mutex::new(None),
+            processing_cancellations: Mutex::new(HashMap::new()),
+            partial_busy: std::sync::atomic::AtomicBool::new(false),
+            native_recording: Mutex::new(None),
+            hud_state: Mutex::new(HudState::default()),
+        }
+    }
+}
+
+impl RuntimeState {
+    fn db(&self) -> parking_lot::MappedMutexGuard<'_, Database> {
+        let mut guard = self.db.lock();
+        if guard.is_none() {
+            eprintln!("Database not initialized, falling back to in-memory database");
+            if let Ok(memory_db) = Database::memory() {
+                *guard = Some(memory_db);
+            }
+        }
+        parking_lot::MutexGuard::map(guard, |opt| {
+            opt.as_mut().expect("Database not initialized")
+        })
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -85,7 +117,7 @@ fn err(error: impl std::fmt::Display) -> String {
 }
 
 fn snapshot(app: &AppHandle) -> Result<Snapshot> {
-    app.state::<RuntimeState>().db.lock().snapshot()
+    app.state::<RuntimeState>().db().snapshot()
 }
 
 fn emit_snapshot(app: &AppHandle) -> Result<Snapshot> {
@@ -144,15 +176,15 @@ fn run_transcription_pipeline(app: AppHandle, path: std::path::PathBuf, recordin
     if processing_cancelled(&app, &recording_id) { finish_processing(&app, &recording_id); return; }
     match result {
         Ok(text) => {
-            if app.state::<RuntimeState>().db.lock().complete_transcription(&recording_id, &text).is_ok()
+            if app.state::<RuntimeState>().db().complete_transcription(&recording_id, &text).is_ok()
                 && !processing_cancelled(&app, &recording_id)
-                && app.state::<RuntimeState>().db.lock().prepare_recording_processing(&recording_id).is_ok()
+                && app.state::<RuntimeState>().db().prepare_recording_processing(&recording_id).is_ok()
             {
                 let _ = process_recording_pipeline(&app, &recording_id);
             }
         }
         Err(error) => {
-            if !processing_cancelled(&app, &recording_id) { let _ = app.state::<RuntimeState>().db.lock().fail_recording(&recording_id, &error.to_string()); }
+            if !processing_cancelled(&app, &recording_id) { let _ = app.state::<RuntimeState>().db().fail_recording(&recording_id, &error.to_string()); }
         }
     }
     finish_processing(&app, &recording_id);
@@ -161,25 +193,25 @@ fn run_transcription_pipeline(app: AppHandle, path: std::path::PathBuf, recordin
 
 fn process_recording_pipeline(app: &AppHandle, recording_id: &str) -> Result<()> {
     if processing_cancelled(app, recording_id) { return Ok(()); }
-    let detail = app.state::<RuntimeState>().db.lock().recording_detail(recording_id)?;
+    let detail = app.state::<RuntimeState>().db().recording_detail(recording_id)?;
     let path = detail.recording.audio_path.as_ref().map(std::path::PathBuf::from).context("录音文件不存在")?;
     if !speech::status(app, speech::DIARIZATION_ID)?.installed {
-        app.state::<RuntimeState>().db.lock().set_processing_stage(recording_id, "diarization_error", Some("发言人分离组件尚未安装完成"))?;
+        app.state::<RuntimeState>().db().set_processing_stage(recording_id, "diarization_error", Some("发言人分离组件尚未安装完成"))?;
         let _ = emit_snapshot(app);
         return Ok(());
     }
-    app.state::<RuntimeState>().db.lock().set_processing_stage(recording_id, "diarizing", None)?;
+    app.state::<RuntimeState>().db().set_processing_stage(recording_id, "diarizing", None)?;
     let _ = emit_snapshot(app);
     let turns = match speech::diarize(app, &path, || processing_cancelled(app, recording_id)).map(smooth_speaker_turns) {
         Ok(turns) if !turns.is_empty() => turns,
         Ok(_) => {
-            app.state::<RuntimeState>().db.lock().set_processing_stage(recording_id, "diarization_error", Some("没有检测到可分离的讲话内容"))?;
+            app.state::<RuntimeState>().db().set_processing_stage(recording_id, "diarization_error", Some("没有检测到可分离的讲话内容"))?;
             let _ = emit_snapshot(app);
             return Ok(());
         }
         Err(error) => {
             if processing_cancelled(app, recording_id) { return Ok(()); }
-            app.state::<RuntimeState>().db.lock().set_processing_stage(recording_id, "diarization_error", Some("发言人分离失败，请在设置中检查本地模型"))?;
+            app.state::<RuntimeState>().db().set_processing_stage(recording_id, "diarization_error", Some("发言人分离失败，请在设置中检查本地模型"))?;
             let _ = emit_snapshot(app);
             return Err(error);
         }
@@ -187,11 +219,11 @@ fn process_recording_pipeline(app: &AppHandle, recording_id: &str) -> Result<()>
     if processing_cancelled(app, recording_id) { return Ok(()); }
     let speaker_count = turns.iter().filter_map(|turn| turn.speaker_id.strip_prefix("speaker_")?.parse::<usize>().ok()).max().map(|value| value + 1).unwrap_or(0) as i64;
     if !speech::status(app, speech::ALIGNER_ID)?.installed {
-        app.state::<RuntimeState>().db.lock().set_processing_stage(recording_id, "waiting_alignment", None)?;
+        app.state::<RuntimeState>().db().set_processing_stage(recording_id, "waiting_alignment", None)?;
         let _ = emit_snapshot(app);
         return Ok(());
     }
-    app.state::<RuntimeState>().db.lock().set_processing_stage(recording_id, "aligning", None)?;
+    app.state::<RuntimeState>().db().set_processing_stage(recording_id, "aligning", None)?;
     let _ = emit_snapshot(app);
     let words_result = (|| -> Result<Vec<TranscriptWord>> {
         let state = app.state::<RuntimeState>(); let mut worker = state.speech_worker.lock();
@@ -201,30 +233,30 @@ fn process_recording_pipeline(app: &AppHandle, recording_id: &str) -> Result<()>
     let words = match words_result {
         Ok(words) if !words.is_empty() => words,
         Ok(_) => {
-            app.state::<RuntimeState>().db.lock().set_processing_stage(recording_id, "alignment_error", Some("没有生成可用的文字时间戳"))?;
+            app.state::<RuntimeState>().db().set_processing_stage(recording_id, "alignment_error", Some("没有生成可用的文字时间戳"))?;
             let _ = emit_snapshot(app);
             return Ok(());
         }
         Err(error) => {
             if processing_cancelled(app, recording_id) { return Ok(()); }
-            app.state::<RuntimeState>().db.lock().set_processing_stage(recording_id, "alignment_error", Some("文字时间对齐失败，请重新处理"))?;
+            app.state::<RuntimeState>().db().set_processing_stage(recording_id, "alignment_error", Some("文字时间对齐失败，请重新处理"))?;
             let _ = emit_snapshot(app);
             return Err(error);
         }
     };
     if processing_cancelled(app, recording_id) { return Ok(()); }
-    app.state::<RuntimeState>().db.lock().save_words(recording_id, &words)?;
-    app.state::<RuntimeState>().db.lock().set_processing_stage(recording_id, "merging", None)?;
+    app.state::<RuntimeState>().db().save_words(recording_id, &words)?;
+    app.state::<RuntimeState>().db().set_processing_stage(recording_id, "merging", None)?;
     let _ = emit_snapshot(app);
     let segments = build_speaker_segments(&words, &turns);
     if processing_cancelled(app, recording_id) { return Ok(()); }
     if segments.is_empty() {
-        app.state::<RuntimeState>().db.lock().set_processing_stage(recording_id, "diarization_error", Some("没有生成可展示的发言人对话"))?;
+        app.state::<RuntimeState>().db().set_processing_stage(recording_id, "diarization_error", Some("没有生成可展示的发言人对话"))?;
         let _ = emit_snapshot(app);
         return Ok(());
     }
     let state = app.state::<RuntimeState>();
-    let mut db = state.db.lock();
+    let mut db = state.db();
     db.save_speaker_turns(recording_id, &turns)?;
     db.ensure_speakers(recording_id, speaker_count)?;
     db.save_segments(recording_id, &segments)?;
@@ -244,19 +276,19 @@ fn spawn_recording_summary_with_force(app: &AppHandle, recording_id: &str, force
     let recording_id = recording_id.to_string();
     tauri::async_runtime::spawn(async move {
         if !llm::settings().map(|settings| settings.configured).unwrap_or(false) { return; }
-        let document = match app.state::<RuntimeState>().db.lock().task_document_for_recording(&recording_id) {
+        let document = match app.state::<RuntimeState>().db().task_document_for_recording(&recording_id) {
             Ok(document) => document,
-            Err(error) => { let _ = app.state::<RuntimeState>().db.lock().set_recording_summary_status(&recording_id, "error", Some(&error.to_string())); let _ = emit_snapshot(&app); return; }
+            Err(error) => { let _ = app.state::<RuntimeState>().db().set_recording_summary_status(&recording_id, "error", Some(&error.to_string())); let _ = emit_snapshot(&app); return; }
         };
         if !force && document.summaries.iter().any(|summary| summary.recording_id == recording_id && summary.user_edited) {
             let _ = emit_snapshot(&app);
             return;
         }
-        let _ = app.state::<RuntimeState>().db.lock().set_recording_summary_status(&recording_id, "summarizing", None);
+        let _ = app.state::<RuntimeState>().db().set_recording_summary_status(&recording_id, "summarizing", None);
         let _ = emit_snapshot(&app);
         match llm::summarize(&document, &recording_id).await {
-            Ok(summary) => { let _ = app.state::<RuntimeState>().db.lock().save_recording_summary(&summary); }
-            Err(error) => { let _ = app.state::<RuntimeState>().db.lock().set_recording_summary_status(&recording_id, "error", Some(&error.to_string())); }
+            Ok(summary) => { let _ = app.state::<RuntimeState>().db().save_recording_summary(&summary); }
+            Err(error) => { let _ = app.state::<RuntimeState>().db().set_recording_summary_status(&recording_id, "error", Some(&error.to_string())); }
         }
         let _ = emit_snapshot(&app);
     });
@@ -428,7 +460,7 @@ pub fn dispatch_internal(app: &AppHandle, action: AppAction) -> Result<Snapshot>
     }
     let url = {
         let state = app.state::<RuntimeState>();
-        let mut db = state.db.lock();
+        let mut db = state.db();
         db.dispatch(&action)?
     };
     if let Some(url) = url {
@@ -597,15 +629,15 @@ fn update_keyboard_listener(app: &AppHandle, settings: &ShortcutSettings) -> Res
 fn set_pet_visible_inner(app: &AppHandle, visible: bool) -> Result<()> {
     let pet = app.get_webview_window("pet").context("宠物窗口不存在")?;
     if visible { pet.show()?; } else { pet.hide()?; }
-    let mut settings = app.state::<RuntimeState>().db.lock().settings()?;
+    let mut settings = app.state::<RuntimeState>().db().settings()?;
     settings.pet_visible = visible;
-    app.state::<RuntimeState>().db.lock().save_settings(&settings)?;
+    app.state::<RuntimeState>().db().save_settings(&settings)?;
     Ok(())
 }
 
 fn setup_tray(app: &tauri::App) -> Result<()> {
     let show = MenuItem::with_id(app, "show", "打开控制台", true, None::<&str>)?;
-    let pet_visible = app.state::<RuntimeState>().db.lock().settings()?.pet_visible;
+    let pet_visible = app.state::<RuntimeState>().db().settings()?.pet_visible;
     let toggle_pet = MenuItem::with_id(app, "toggle_pet", if pet_visible { "休眠宠物" } else { "唤醒宠物" }, true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
@@ -799,69 +831,69 @@ fn get_snapshot(app: AppHandle) -> Result<Snapshot, String> {
 
 #[tauri::command]
 fn get_task_document(app: AppHandle, task_id: String) -> Result<TaskDocument, String> {
-    app.state::<RuntimeState>().db.lock().task_document(&task_id).map_err(err)
+    app.state::<RuntimeState>().db().task_document(&task_id).map_err(err)
 }
 
 #[tauri::command]
 fn create_text_card(app: AppHandle, task_id: String) -> Result<TextCard, String> {
-    let card = app.state::<RuntimeState>().db.lock().create_text_card(&task_id).map_err(err)?;
+    let card = app.state::<RuntimeState>().db().create_text_card(&task_id).map_err(err)?;
     let _ = emit_snapshot(&app);
     Ok(card)
 }
 
 #[tauri::command]
 fn update_text_card(app: AppHandle, card_id: String, content: String) -> Result<(), String> {
-    app.state::<RuntimeState>().db.lock().update_text_card(&card_id, &content).map_err(err)
+    app.state::<RuntimeState>().db().update_text_card(&card_id, &content).map_err(err)
 }
 
 #[tauri::command]
 fn delete_text_card(app: AppHandle, card_id: String) -> Result<(), String> {
-    app.state::<RuntimeState>().db.lock().delete_text_card(&card_id).map_err(err)?;
+    app.state::<RuntimeState>().db().delete_text_card(&card_id).map_err(err)?;
     let _ = emit_snapshot(&app);
     Ok(())
 }
 
 #[tauri::command]
 fn update_task_title(app: AppHandle, task_id: String, title: String) -> Result<Snapshot, String> {
-    app.state::<RuntimeState>().db.lock().update_task_title(&task_id, &title).map_err(err)?;
+    app.state::<RuntimeState>().db().update_task_title(&task_id, &title).map_err(err)?;
     emit_snapshot(&app).map_err(err)
 }
 
 #[tauri::command]
 fn update_task_contact(app: AppHandle, task_id: String, contact_id: Option<String>) -> Result<Snapshot, String> {
-    app.state::<RuntimeState>().db.lock().update_task_contact(&task_id, contact_id.as_deref()).map_err(err)?;
+    app.state::<RuntimeState>().db().update_task_contact(&task_id, contact_id.as_deref()).map_err(err)?;
     emit_snapshot(&app).map_err(err)
 }
 
 #[tauri::command]
 fn update_task_link(app: AppHandle, task_id: String, url: Option<String>) -> Result<Snapshot, String> {
-    app.state::<RuntimeState>().db.lock().update_task_link(&task_id, url.as_deref()).map_err(err)?;
+    app.state::<RuntimeState>().db().update_task_link(&task_id, url.as_deref()).map_err(err)?;
     emit_snapshot(&app).map_err(err)
 }
 
 #[tauri::command]
 fn delete_completed_task(app: AppHandle, task_id: String) -> Result<Snapshot, String> {
-    let paths = app.state::<RuntimeState>().db.lock().task_document(&task_id).map_err(err)?.recordings.into_iter().filter_map(|recording| recording.audio_path).collect::<Vec<_>>();
-    app.state::<RuntimeState>().db.lock().delete_completed_task(&task_id).map_err(err)?;
+    let paths = app.state::<RuntimeState>().db().task_document(&task_id).map_err(err)?.recordings.into_iter().filter_map(|recording| recording.audio_path).collect::<Vec<_>>();
+    app.state::<RuntimeState>().db().delete_completed_task(&task_id).map_err(err)?;
     for path in paths { let _ = std::fs::remove_file(path); }
     emit_snapshot(&app).map_err(err)
 }
 
 #[tauri::command]
 fn clear_all_data(app: AppHandle) -> Result<Snapshot, String> {
-    if app.state::<RuntimeState>().native_recording.lock().is_some() || app.state::<RuntimeState>().db.lock().snapshot().map_err(err)?.recordings.iter().any(|recording| recording.status == "recording") {
+    if app.state::<RuntimeState>().native_recording.lock().is_some() || app.state::<RuntimeState>().db().snapshot().map_err(err)?.recordings.iter().any(|recording| recording.status == "recording") {
         return Err("录音进行中，无法清除数据".into());
     }
-    app.state::<RuntimeState>().db.lock().clear_all_data().map_err(err)?;
+    app.state::<RuntimeState>().db().clear_all_data().map_err(err)?;
     llm::delete_key().map_err(err)?;
-    let settings = app.state::<RuntimeState>().db.lock().settings().map_err(err)?;
+    let settings = app.state::<RuntimeState>().db().settings().map_err(err)?;
     if settings.autostart { app.autolaunch().enable().map_err(|error| format!("无法恢复开机启动：{error}"))?; }
     emit_snapshot(&app).map_err(err)
 }
 
 #[tauri::command]
 fn resolve_task_overflow(app: AppHandle, keep_ids: Vec<String>) -> Result<Snapshot, String> {
-    app.state::<RuntimeState>().db.lock().resolve_task_overflow(&keep_ids).map_err(err)?;
+    app.state::<RuntimeState>().db().resolve_task_overflow(&keep_ids).map_err(err)?;
     emit_snapshot(&app).map_err(err)
 }
 
@@ -885,7 +917,7 @@ async fn test_deepseek_connection() -> Result<(), String> { llm::test_connection
 
 #[tauri::command]
 fn summarize_recording(app: AppHandle, recording_id: String) -> Result<(), String> {
-    let document = app.state::<RuntimeState>().db.lock().task_document_for_recording(&recording_id).map_err(err)?;
+    let document = app.state::<RuntimeState>().db().task_document_for_recording(&recording_id).map_err(err)?;
     let recording = document.recordings.iter().find(|recording| recording.id == recording_id).ok_or("录音记录不存在")?;
     if recording.transcript.trim().is_empty() && recording.raw_transcript.trim().is_empty() { return Err("录音尚未完成转写".into()); }
     spawn_recording_summary_with_force(&app, &recording_id, true);
@@ -902,7 +934,7 @@ fn update_recording_summary(app: AppHandle, recording_id: String, mut summary: R
     summary.error_message = None;
     summary.user_edited = true;
     summary.updated_at = chrono::Utc::now().to_rfc3339();
-    app.state::<RuntimeState>().db.lock().save_recording_summary(&summary).map_err(err)?;
+    app.state::<RuntimeState>().db().save_recording_summary(&summary).map_err(err)?;
     let _ = emit_snapshot(&app);
     Ok(())
 }
@@ -922,8 +954,7 @@ fn keyboard_listener_status(app: AppHandle) -> Option<String> {
 #[tauri::command]
 fn create_task(app: AppHandle, input: CreateTaskInput) -> Result<Snapshot, String> {
     app.state::<RuntimeState>()
-        .db
-        .lock()
+        .db()
         .create_task(input)
         .map_err(err)?;
     emit_snapshot(&app).map_err(err)
@@ -932,8 +963,7 @@ fn create_task(app: AppHandle, input: CreateTaskInput) -> Result<Snapshot, Strin
 #[tauri::command]
 fn update_task(app: AppHandle, input: UpdateTaskInput) -> Result<Snapshot, String> {
     app.state::<RuntimeState>()
-        .db
-        .lock()
+        .db()
         .update_task(input)
         .map_err(err)?;
     emit_snapshot(&app).map_err(err)
@@ -942,8 +972,7 @@ fn update_task(app: AppHandle, input: UpdateTaskInput) -> Result<Snapshot, Strin
 #[tauri::command]
 fn delete_task(app: AppHandle, task_id: String) -> Result<Snapshot, String> {
     app.state::<RuntimeState>()
-        .db
-        .lock()
+        .db()
         .delete_task(&task_id)
         .map_err(err)?;
     emit_snapshot(&app).map_err(err)
@@ -953,8 +982,7 @@ fn delete_task(app: AppHandle, task_id: String) -> Result<Snapshot, String> {
 fn set_current_task(app: AppHandle, task_id: String, open: bool) -> Result<Snapshot, String> {
     let url = app
         .state::<RuntimeState>()
-        .db
-        .lock()
+        .db()
         .set_current_task(&task_id)
         .map_err(err)?;
     if open && !url.trim().is_empty() {
@@ -966,8 +994,7 @@ fn set_current_task(app: AppHandle, task_id: String, open: bool) -> Result<Snaps
 #[tauri::command]
 fn bind_slot(app: AppHandle, group: String, slot: i64, task_id: Option<String>) -> Result<Snapshot, String> {
     app.state::<RuntimeState>()
-        .db
-        .lock()
+        .db()
         .bind_slot(&group, slot, task_id.as_deref())
         .map_err(err)?;
     emit_snapshot(&app).map_err(err)
@@ -975,21 +1002,20 @@ fn bind_slot(app: AppHandle, group: String, slot: i64, task_id: Option<String>) 
 
 #[tauri::command]
 fn set_current_group(app: AppHandle, group: String) -> Result<Snapshot, String> {
-    app.state::<RuntimeState>().db.lock().set_current_group(&group).map_err(err)?;
+    app.state::<RuntimeState>().db().set_current_group(&group).map_err(err)?;
     emit_snapshot(&app).map_err(err)
 }
 
 #[tauri::command]
 fn set_group_name(app: AppHandle, group: String, name: String) -> Result<Snapshot, String> {
-    app.state::<RuntimeState>().db.lock().set_group_name(&group, &name).map_err(err)?;
+    app.state::<RuntimeState>().db().set_group_name(&group, &name).map_err(err)?;
     emit_snapshot(&app).map_err(err)
 }
 
 #[tauri::command]
 fn move_task_to_top(app: AppHandle, task_id: String) -> Result<Snapshot, String> {
     app.state::<RuntimeState>()
-        .db
-        .lock()
+        .db()
         .move_task_to_top(&task_id)
         .map_err(err)?;
     emit_snapshot(&app).map_err(err)
@@ -998,8 +1024,7 @@ fn move_task_to_top(app: AppHandle, task_id: String) -> Result<Snapshot, String>
 #[tauri::command]
 fn add_contact(app: AppHandle, name: String) -> Result<Snapshot, String> {
     app.state::<RuntimeState>()
-        .db
-        .lock()
+        .db()
         .add_contact(&name)
         .map_err(err)?;
     emit_snapshot(&app).map_err(err)
@@ -1008,8 +1033,7 @@ fn add_contact(app: AppHandle, name: String) -> Result<Snapshot, String> {
 #[tauri::command]
 fn remove_contact(app: AppHandle, contact_id: String) -> Result<Snapshot, String> {
     app.state::<RuntimeState>()
-        .db
-        .lock()
+        .db()
         .remove_contact(&contact_id)
         .map_err(err)?;
     emit_snapshot(&app).map_err(err)
@@ -1025,8 +1049,7 @@ fn update_settings(app: AppHandle, settings: Settings) -> Result<Snapshot, Strin
     settings.validate().map_err(err)?;
     let previous = app
         .state::<RuntimeState>()
-        .db
-        .lock()
+        .db()
         .settings()
         .map_err(err)?;
     update_keyboard_listener(&app, &settings.shortcuts).map_err(err)?;
@@ -1043,8 +1066,7 @@ fn update_settings(app: AppHandle, settings: Settings) -> Result<Snapshot, Strin
         }
     }
     app.state::<RuntimeState>()
-        .db
-        .lock()
+        .db()
         .save_settings(&settings)
         .map_err(err)?;
     if settings.pet_visible != previous.pet_visible {
@@ -1058,8 +1080,7 @@ fn update_settings(app: AppHandle, settings: Settings) -> Result<Snapshot, Strin
 fn set_autostart(app: AppHandle, enabled: bool) -> Result<Snapshot, String> {
     let previous = app
         .state::<RuntimeState>()
-        .db
-        .lock()
+        .db()
         .settings()
         .map_err(err)?;
     let mut settings = previous.clone();
@@ -1075,8 +1096,7 @@ fn set_autostart(app: AppHandle, enabled: bool) -> Result<Snapshot, String> {
         changed.map_err(|error| format!("无法修改开机启动：{error}"))?;
     }
     app.state::<RuntimeState>()
-        .db
-        .lock()
+        .db()
         .save_settings(&settings)
         .map_err(err)?;
     emit_snapshot(&app).map_err(err)
@@ -1092,8 +1112,7 @@ fn set_pet_visible(app: AppHandle, visible: bool) -> Result<Snapshot, String> {
 fn save_shortcuts(app: AppHandle, shortcuts: ShortcutSettings) -> Result<Snapshot, String> {
     let previous = app
         .state::<RuntimeState>()
-        .db
-        .lock()
+        .db()
         .settings()
         .map_err(err)?;
     let settings = Settings {
@@ -1105,8 +1124,7 @@ fn save_shortcuts(app: AppHandle, shortcuts: ShortcutSettings) -> Result<Snapsho
     settings.validate().map_err(err)?;
     update_keyboard_listener(&app, &settings.shortcuts).map_err(err)?;
     app.state::<RuntimeState>()
-        .db
-        .lock()
+        .db()
         .save_settings(&settings)
         .map_err(err)?;
     emit_snapshot(&app).map_err(err)
@@ -1114,10 +1132,10 @@ fn save_shortcuts(app: AppHandle, shortcuts: ShortcutSettings) -> Result<Snapsho
 
 #[tauri::command]
 fn start_recording(app: AppHandle) -> Result<String, String> {
-    let snapshot = app.state::<RuntimeState>().db.lock().snapshot().map_err(err)?;
+    let snapshot = app.state::<RuntimeState>().db().snapshot().map_err(err)?;
     let current = snapshot.current_task_id.as_deref().and_then(|id| snapshot.tasks.iter().find(|task| task.id == id && task.status == "active" && task.slot.is_some()))
         .or_else(|| snapshot.tasks.iter().filter(|task| task.status == "active" && task.slot.is_some()).min_by_key(|task| task.manual_order));
-    let id = app.state::<RuntimeState>().db.lock().start_recording(current.map(|task| task.id.as_str())).map_err(err)?;
+    let id = app.state::<RuntimeState>().db().start_recording(current.map(|task| task.id.as_str())).map_err(err)?;
     emit_snapshot(&app).map_err(err)?;
     Ok(id)
 }
@@ -1165,7 +1183,7 @@ fn start_native_recording(app: AppHandle) -> Result<String, String> {
         reader.read_line(&mut ready).map_err(err)?;
         if ready.trim() != "READY" {
             let _ = child.kill();
-            app.state::<RuntimeState>().db.lock().fail_recording(&id, "无法启动系统麦克风").map_err(err)?;
+            app.state::<RuntimeState>().db().fail_recording(&id, "无法启动系统麦克风").map_err(err)?;
             return Err("无法启动系统麦克风，请检查麦克风权限".into());
         }
         *app.state::<RuntimeState>().native_recording.lock() = Some(NativeRecording { id: id.clone(), path, started: std::time::Instant::now(), child, input });
@@ -1193,7 +1211,7 @@ fn stop_native_recording(app: AppHandle) -> Result<Snapshot, String> {
         recording.input.flush().map_err(err)?;
         let status = recording.child.wait().map_err(err)?;
         if !status.success() {
-            app.state::<RuntimeState>().db.lock().fail_recording(&recording.id, "原生录音进程异常退出").map_err(err)?;
+            app.state::<RuntimeState>().db().fail_recording(&recording.id, "原生录音进程异常退出").map_err(err)?;
             return Err("录音保存失败".into());
         }
     }
@@ -1202,7 +1220,7 @@ fn stop_native_recording(app: AppHandle) -> Result<Snapshot, String> {
         recording.stop().map_err(err)?;
     }
     let duration = recording.started.elapsed().as_secs_f64();
-    app.state::<RuntimeState>().db.lock().finish_recording(&recording.id, duration, &recording.path.to_string_lossy()).map_err(err)?;
+    app.state::<RuntimeState>().db().finish_recording(&recording.id, duration, &recording.path.to_string_lossy()).map_err(err)?;
     emit_snapshot(&app).map_err(err)?;
     begin_processing(&app, &recording.id);
     let background_app = app.clone();
@@ -1216,7 +1234,7 @@ fn finish_recording(app: AppHandle, recording_id: String, audio: Vec<u8>, durati
     std::fs::create_dir_all(&recordings_dir).map_err(err)?;
     let path = recordings_dir.join(format!("{recording_id}.wav"));
     std::fs::write(&path, audio).map_err(err)?;
-    app.state::<RuntimeState>().db.lock().finish_recording(&recording_id, duration, &path.to_string_lossy()).map_err(err)?;
+    app.state::<RuntimeState>().db().finish_recording(&recording_id, duration, &path.to_string_lossy()).map_err(err)?;
     emit_snapshot(&app).map_err(err)?;
     begin_processing(&app, &recording_id);
     let background_app = app.clone();
@@ -1226,7 +1244,7 @@ fn finish_recording(app: AppHandle, recording_id: String, audio: Vec<u8>, durati
 
 #[tauri::command]
 fn fail_recording(app: AppHandle, recording_id: String, message: String) -> Result<Snapshot, String> {
-    app.state::<RuntimeState>().db.lock().fail_recording(&recording_id, &message).map_err(err)?;
+    app.state::<RuntimeState>().db().fail_recording(&recording_id, &message).map_err(err)?;
     emit_snapshot(&app).map_err(err)
 }
 
@@ -1235,7 +1253,7 @@ fn delete_recording(app: AppHandle, recording_id: String) -> Result<Snapshot, St
     cancel_processing(&app, &recording_id);
     let path = app.path().app_data_dir().map_err(err)?.join("recordings").join(format!("{recording_id}.wav"));
     let _ = std::fs::remove_file(path);
-    app.state::<RuntimeState>().db.lock().delete_recording(&recording_id).map_err(err)?;
+    app.state::<RuntimeState>().db().delete_recording(&recording_id).map_err(err)?;
     emit_snapshot(&app).map_err(err)
 }
 
@@ -1243,7 +1261,7 @@ fn delete_recording(app: AppHandle, recording_id: String) -> Result<Snapshot, St
 fn retry_transcription(app: AppHandle, recording_id: String) -> Result<Snapshot, String> {
     let recording = snapshot(&app).map_err(err)?.recordings.into_iter().find(|item| item.id == recording_id).ok_or("录音记录不存在")?;
     let path = recording.audio_path.map(std::path::PathBuf::from).ok_or("录音文件不存在")?;
-    app.state::<RuntimeState>().db.lock().finish_recording(&recording_id, recording.duration, &path.to_string_lossy()).map_err(err)?;
+    app.state::<RuntimeState>().db().finish_recording(&recording_id, recording.duration, &path.to_string_lossy()).map_err(err)?;
     begin_processing(&app, &recording_id);
     let background_app = app.clone();
     std::thread::spawn(move || run_transcription_pipeline(background_app, path, recording_id));
@@ -1271,16 +1289,16 @@ fn transcribe_partial(app: AppHandle, recording_id: String, audio: Vec<u8>) -> R
 
 #[tauri::command]
 fn reassign_recording(app: AppHandle, recording_id: String, task_id: Option<String>) -> Result<Snapshot, String> {
-    app.state::<RuntimeState>().db.lock().reassign_recording(&recording_id, task_id.as_deref()).map_err(err)?;
+    app.state::<RuntimeState>().db().reassign_recording(&recording_id, task_id.as_deref()).map_err(err)?;
     emit_snapshot(&app).map_err(err)
 }
 
 #[tauri::command]
-fn get_recording_detail(app: AppHandle, recording_id: String) -> Result<RecordingDetail, String> { app.state::<RuntimeState>().db.lock().recording_detail(&recording_id).map_err(err) }
+fn get_recording_detail(app: AppHandle, recording_id: String) -> Result<RecordingDetail, String> { app.state::<RuntimeState>().db().recording_detail(&recording_id).map_err(err) }
 
 #[tauri::command]
 fn process_recording(app: AppHandle, recording_id: String) -> Result<Snapshot, String> {
-    app.state::<RuntimeState>().db.lock().prepare_recording_processing(&recording_id).map_err(err)?;
+    app.state::<RuntimeState>().db().prepare_recording_processing(&recording_id).map_err(err)?;
     begin_processing(&app, &recording_id);
     let background = app.clone();
     std::thread::spawn(move || {
@@ -1292,7 +1310,7 @@ fn process_recording(app: AppHandle, recording_id: String) -> Result<Snapshot, S
 }
 
 #[tauri::command]
-fn recording_audio_data(app: AppHandle, recording_id: String) -> Result<Vec<u8>, String> { let detail = app.state::<RuntimeState>().db.lock().recording_detail(&recording_id).map_err(err)?; let path = detail.recording.audio_path.ok_or("录音文件不存在")?; std::fs::read(path).map_err(err) }
+fn recording_audio_data(app: AppHandle, recording_id: String) -> Result<Vec<u8>, String> { let detail = app.state::<RuntimeState>().db().recording_detail(&recording_id).map_err(err)?; let path = detail.recording.audio_path.ok_or("录音文件不存在")?; std::fs::read(path).map_err(err) }
 
 
 #[tauri::command]
@@ -1333,8 +1351,7 @@ fn model_diagnostics(app: AppHandle, model_id: String) -> Result<String, String>
 fn export_data(app: AppHandle) -> Result<String, String> {
     let bundle = app
         .state::<RuntimeState>()
-        .db
-        .lock()
+        .db()
         .export()
         .map_err(err)?;
     serde_json::to_string_pretty(&bundle).map_err(err)
@@ -1347,8 +1364,7 @@ fn import_data(app: AppHandle, payload: String) -> Result<Snapshot, String> {
     let settings = bundle.settings.clone();
     update_keyboard_listener(&app, &settings.shortcuts).map_err(err)?;
     app.state::<RuntimeState>()
-        .db
-        .lock()
+        .db()
         .import(bundle)
         .map_err(err)?;
     emit_snapshot(&app).map_err(err)
@@ -1460,6 +1476,7 @@ fn humanize_title(value: &str) -> String {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
+        .manage(RuntimeState::default())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             let _ = show_console_window(app);
         }))
@@ -1469,32 +1486,31 @@ pub fn run() {
             tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec!["--background"]))
         })
         .setup(|app| {
-            let data_dir = app.path().app_data_dir()?;
-            let database = Database::open(&data_dir.join("redkey.sqlite3"))?;
-            let settings = database.settings()?;
-            if settings.autostart { app.autolaunch().enable()?; }
-            app.manage(RuntimeState {
-                db: Mutex::new(database),
-                tray_icon: Mutex::new(None),
-                keyboard_monitor: Mutex::new(None),
-                hover_regions: Mutex::new(HoverRegions::default()),
-                speech_worker: Mutex::new(None),
-                speech_worker_process: Mutex::new(None),
-                processing_cancellations: Mutex::new(HashMap::new()),
-                partial_busy: std::sync::atomic::AtomicBool::new(false),
-                native_recording: Mutex::new(None),
-                hud_state: Mutex::new(HudState::default()),
-            });
-            update_keyboard_listener(app.handle(), &settings.shortcuts)?;
-            setup_tray(app)?;
+            let data_dir = app.path().app_data_dir().context("无法获取应用数据目录")?;
+            let database = match Database::open(&data_dir.join("redkey.sqlite3")) {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!("Failed to open database: {e}");
+                    Database::memory().context("无法创建内存数据库")?
+                }
+            };
+            let settings = database.settings().unwrap_or_default();
+            if settings.autostart { let _ = app.autolaunch().enable(); }
+            *app.state::<RuntimeState>().db.lock() = Some(database);
+            if let Err(e) = update_keyboard_listener(app.handle(), &settings.shortcuts) {
+                eprintln!("Failed to start keyboard listener: {e}");
+            }
+            if let Err(e) = setup_tray(app) {
+                eprintln!("Failed to setup tray: {e}");
+            }
             if !settings.pet_visible {
-                if let Some(pet) = app.get_webview_window("pet") { pet.hide()?; }
+                if let Some(pet) = app.get_webview_window("pet") { let _ = pet.hide(); }
             }
             // Force non-overlay scrollbar on macOS WebKit
             if let Some(window) = app.get_webview_window("console") { let _ = window.eval("document.documentElement.style.scrollbarGutter='stable'"); }
             if std::env::args().any(|argument| argument == "--background") {
                 if let Some(console) = app.get_webview_window("console") {
-                    console.hide()?;
+                    let _ = console.hide();
                 }
             }
             Ok(())

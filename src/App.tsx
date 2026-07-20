@@ -132,10 +132,10 @@ function ConsoleApp() {
 
   return <div className="app-shell">
     <aside className="sidebar">
-      <div className="brand-mark"><span>R</span><div><strong>RedKey</strong><small>需求工作台</small></div></div>
+      <div className="brand-mark"><span>R</span><div><strong>RedKey</strong><small>任务工作台</small></div></div>
       <nav>
-        <NavButton active={view === "active"} icon={<ListTodo />} label="进行中" onClick={() => setView("active")} />
-        <NavButton active={view === "completed"} icon={<CircleCheck />} label="已完成" onClick={() => setView("completed")} />
+        <NavButton active={view === "active"} icon={<ListTodo />} label="进行中" count={activeTasks.length} onClick={() => setView("active")} />
+        <NavButton active={view === "completed"} icon={<CircleCheck />} label="已完成" count={completedTasks.length} onClick={() => setView("completed")} />
         <NavButton active={view === "settings"} icon={<SettingsIcon />} label="设置" onClick={() => setView("settings")} />
       </nav>
     </aside>
@@ -191,7 +191,7 @@ function CompletedList({ tasks, onNew, notify }: { tasks: Task[]; onNew: () => v
         </div>
         {task.url && <button className="completed-item-link" title="打开链接" onClick={() => void api.setCurrentTask(task.id, true).then(() => notify("已在浏览器打开")).catch((reason) => notify(String(reason)))}><ExternalLink /></button>}
       </div>)}
-    </div> : <div className="completed-list-empty"><CircleCheck /><strong>还没有已完成需求</strong><span>完成的需求会保留全部文本、录音和总结。</span></div>}
+    </div> : <div className="completed-list-empty"><CircleCheck /><strong>还没有已完成任务</strong><span>完成的任务会保留全部文本、录音和总结。</span></div>}
   </div>;
 }
 
@@ -232,7 +232,7 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
     try {
       setSnapshot(await api.setCurrentTask(task.id, false));
       setSnapshot(await api.dispatch({ type: readOnly ? "start_rework" : "complete_current" }));
-      notify(readOnly ? "需求已恢复为进行中" : "需求已完成"); onRefresh();
+      notify(readOnly ? "任务已恢复为进行中" : "任务已完成"); onRefresh();
     } catch (reason) { notify(String(reason)); }
   }
 
@@ -250,8 +250,8 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
       </div>
       <div className="toolbar-side toolbar-right">
         <IconButton label={readOnly ? "返工" : "完成"} onClick={() => void completeOrRework()}>{readOnly ? <RotateCcw /> : <Check />}</IconButton>
-        {readOnly && <IconButton danger label="删除需求" onClick={() => setConfirmDeleteTask(true)}><Trash2 /></IconButton>}
-        <IconButton label="新建需求" onClick={onNew}><Plus /></IconButton>
+        {readOnly && <IconButton danger label="删除任务" onClick={() => setConfirmDeleteTask(true)}><Trash2 /></IconButton>}
+        <IconButton label="新建任务" onClick={onNew}><Plus /></IconButton>
       </div>
     </header>
     <section className="document-page">
@@ -265,12 +265,12 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
       </div>
       <div className="document-rule" />
       <div className="document-stream">
-        {cards.length ? cards.map((item) => item.type === "text" ? <TextCardView key={item.card.id} card={item.card} readOnly={readOnly} editing={editingCardId === item.card.id} onEditing={setEditingCardId} onRefresh={onRefresh} notify={notify} /> : <RecordingCard key={item.recording.id} recording={item.recording} summary={document.summaries.find((summary) => summary.recordingId === item.recording.id) ?? null} activeElapsed={recordingElapsed} activeLevel={recordingLevel} readOnly={readOnly} onStop={onToggleRecording} onRefresh={onRefresh} notify={notify} />) : <div className="empty-stream"><FileText /><strong>这份需求文档还没有内容</strong><span>通过上方工具栏添加文本或开始录音。</span></div>}
+        {cards.length ? cards.map((item) => item.type === "text" ? <TextCardView key={item.card.id} card={item.card} readOnly={readOnly} editing={editingCardId === item.card.id} onEditing={setEditingCardId} onRefresh={onRefresh} notify={notify} /> : <RecordingCard key={item.recording.id} recording={item.recording} summary={document.summaries.find((summary) => summary.recordingId === item.recording.id) ?? null} activeElapsed={recordingElapsed} activeLevel={recordingLevel} readOnly={readOnly} onStop={onToggleRecording} onRefresh={onRefresh} notify={notify} />) : <div className="empty-stream"><FileText /><strong>还没有内容</strong><span>通过工具栏添加文本或开始录音。</span><div className="empty-stream-actions">{!readOnly && <><button className="primary" onClick={() => void addTextCard()}><FileText />添加文本</button><button onClick={onToggleRecording}><Mic />开始录音</button></>}</div></div>}
       </div>
     </section>
     {confirmDeleteTask && <ConfirmDialog
-      title="删除这个需求？"
-      description="该需求的全部文本、录音、转写和 AI 总结都会被删除，无法恢复。"
+      title="删除这个任务？"
+      description="全部文本、录音和 AI 总结将被删除，无法恢复。"
       confirmLabel="删除"
       danger
       onConfirm={() => { setConfirmDeleteTask(false); void api.deleteCompletedTask(task.id).then((next) => { setSnapshot(next); onDeleted(); }).catch((reason) => notify(String(reason))); }}
@@ -313,7 +313,7 @@ function LinkPopover({ task, readOnly, setSnapshot, onClose, notify }: { task: T
     void updateTitleFromLink(link);
   }
   return <div className="popover link-popover">
-    <div><strong>需求链接</strong><button onClick={onClose}><X /></button></div>
+    <div><strong>任务链接</strong><button onClick={onClose}><X /></button></div>
     <input value={value} disabled={readOnly || resolving} placeholder="https://figma.com/..." onPaste={pasteLink} onChange={(event) => setValue(event.target.value)} />
     <div className="popover-actions">
       <button disabled={!task.url} onClick={() => void api.setCurrentTask(task.id, true).then(setSnapshot).then(onClose).catch((reason) => notify(String(reason)))}><ExternalLink />打开</button>
@@ -344,7 +344,7 @@ function TextCardView({ card, readOnly, editing, onEditing, onRefresh, notify }:
   }, [content, editing, card.id, notify]);
   return <article className="content-card text-card">
     <header><span>{formatDate(card.createdAt)}</span><div>{!readOnly && <IconButton label="编辑文本" onClick={() => onEditing(editing ? null : card.id)}><Pencil /></IconButton>}{!readOnly && <IconButton danger label="删除文本" onClick={() => setConfirmDelete(true)}><Trash2 /></IconButton>}</div></header>
-    {editing && !readOnly ? <textarea autoFocus value={content} placeholder="输入本次需求对接的补充信息…" onChange={(event) => setContent(event.target.value)} onBlur={() => onEditing(null)} /> : <p className={content ? "" : "placeholder"}>{content || "空文本卡"}</p>}
+    {editing && !readOnly ? <textarea autoFocus value={content} placeholder="输入补充信息…" onChange={(event) => setContent(event.target.value)} onBlur={() => onEditing(null)} /> : <p className={content ? "" : "placeholder"}>{content || "点击编辑按钮添加文本内容"}</p>}
     {confirmDelete && <ConfirmDialog
       title="删除这张文本卡？"
       description="删除后无法恢复。"
@@ -422,7 +422,7 @@ function SummaryView({ summary }: { summary: RecordingSummary | null }) {
     <div className="summary-overview"><small>对接结论</small><strong>{summary.overview || "暂无明确结论"}</strong></div>
     <SummaryList title="待处理" items={summary.pendingItems} />
     <SummaryList title="已确认" items={summary.confirmedDecisions} />
-    <SummaryList title="需求变化" items={summary.requestedChanges} />
+    <SummaryList title="任务变化" items={summary.requestedChanges} />
     <SummaryList title="未解决问题" items={summary.openQuestions} />
     {summary.actionItems.length > 0 && <div className="summary-section"><h4>行动项</h4><ul>{summary.actionItems.map((item, index) => <li key={`${item.text}-${index}`}>{item.text}{item.owner && <span>{item.owner}</span>}{item.due && <time>{item.due}</time>}</li>)}</ul></div>}
   </section>;
@@ -437,7 +437,7 @@ function SummaryEditor({ summary, onClose, onSave }: { summary: RecordingSummary
   const [changes, setChanges] = useState(summary.requestedChanges.join("\n"));
   const [questions, setQuestions] = useState(summary.openQuestions.join("\n"));
   const lines = (value: string) => value.split("\n").map((item) => item.trim()).filter(Boolean);
-  return <div className="modal-backdrop"><section className="modal summary-editor"><header><strong>编辑录音总结</strong><IconButton label="关闭" onClick={onClose}><X /></IconButton></header><label>对接结论<textarea value={overview} onChange={(event) => setOverview(event.target.value)} /></label><label>待处理事项<textarea value={pending} onChange={(event) => setPending(event.target.value)} /></label><label>已确认事项<textarea value={decisions} onChange={(event) => setDecisions(event.target.value)} /></label><label>需求变化<textarea value={changes} onChange={(event) => setChanges(event.target.value)} /></label><label>未解决问题<textarea value={questions} onChange={(event) => setQuestions(event.target.value)} /></label><footer><button onClick={onClose}>取消</button><button className="primary" onClick={() => onSave({ ...summary, overview: overview.trim(), pendingItems: lines(pending), confirmedDecisions: lines(decisions), requestedChanges: lines(changes), openQuestions: lines(questions) })}>保存</button></footer></section></div>;
+  return <div className="modal-backdrop"><section className="modal summary-editor"><header><strong>编辑录音总结</strong><IconButton label="关闭" onClick={onClose}><X /></IconButton></header><label>对接结论<textarea value={overview} onChange={(event) => setOverview(event.target.value)} /></label><label>待处理事项<textarea value={pending} onChange={(event) => setPending(event.target.value)} /></label><label>已确认事项<textarea value={decisions} onChange={(event) => setDecisions(event.target.value)} /></label><label>任务变化<textarea value={changes} onChange={(event) => setChanges(event.target.value)} /></label><label>未解决问题<textarea value={questions} onChange={(event) => setQuestions(event.target.value)} /></label><footer><button onClick={onClose}>取消</button><button className="primary" onClick={() => onSave({ ...summary, overview: overview.trim(), pendingItems: lines(pending), confirmedDecisions: lines(decisions), requestedChanges: lines(changes), openQuestions: lines(questions) })}>保存</button></footer></section></div>;
 }
 
 function TranscriptTimeline({ detail, fallback }: { detail: RecordingDetail | null; fallback: string }) {
@@ -543,11 +543,11 @@ function TaskOverflowDialog({ tasks, onResolved, notify }: { tasks: Task[]; onRe
     try { onResolved(await api.resolveTaskOverflow(tasks.filter((task) => selected.has(task.id)).map((task) => task.id))); }
     catch (reason) { notify(String(reason)); setSaving(false); }
   }
-  return <div className="modal-backdrop migration-backdrop"><section className="modal overflow-dialog"><header><div><small>升级整理</small><strong>选择 10 个进行中需求</strong></div><span>{selected.size}/10</span></header><p>旧版本的颜色分组允许超过 10 个进行中需求。请选择要保留在数字键工作区的 10 个，其余需求会移动到“已完成”，内容不会删除。</p><div className="overflow-list">{tasks.map((task) => <label key={task.id} className={selected.has(task.id) ? "selected" : ""}><input type="checkbox" checked={selected.has(task.id)} disabled={!selected.has(task.id) && selected.size >= 10} onChange={() => toggle(task.id)} /><kbd>{slotLabel(task.slot)}</kbd><span><strong>{task.title}</strong><small>{task.contactName || "未指定联系人"} · {formatShortDate(task.lastOpenedAt)}</small></span></label>)}</div><footer><button className="primary" disabled={saving || selected.size !== 10} onClick={() => void resolve()}>{saving ? "整理中" : "完成整理"}</button></footer></section></div>;
+  return <div className="modal-backdrop migration-backdrop"><section className="modal overflow-dialog"><header><div><small>整理</small><strong>选择 10 个进行中任务</strong></div><span>{selected.size}/10</span></header><p>请选择保留在数字键工作区的 10 个任务，其余移至"已完成"。</p><div className="overflow-list">{tasks.map((task) => <label key={task.id} className={selected.has(task.id) ? "selected" : ""}><input type="checkbox" checked={selected.has(task.id)} disabled={!selected.has(task.id) && selected.size >= 10} onChange={() => toggle(task.id)} /><kbd>{slotLabel(task.slot)}</kbd><span><strong>{task.title}</strong><small>{task.contactName || "未指定联系人"} · {formatShortDate(task.lastOpenedAt)}</small></span></label>)}</div><footer><button className="primary" disabled={saving || selected.size !== 10} onClick={() => void resolve()}>{saving ? "整理中" : "完成整理"}</button></footer></section></div>;
 }
 
 function SettingsView({ snapshot, setSnapshot, notify }: { snapshot: Snapshot; setSnapshot: (value: Snapshot) => void; notify: (message: string) => void }) {
-  return <div className="settings-page"><header><small>应用设置</small><h1>设置</h1></header><section className="settings-section"><h2>通用</h2><SettingToggle label="开机启动" description="登录系统后在后台启动 RedKey" checked={snapshot.settings.autostart} onChange={(value) => void api.setAutostart(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><SettingToggle label="宠物悬浮窗" description="显示悬浮按键和快速任务列表" checked={snapshot.settings.petVisible} onChange={(value) => void api.setPetVisible(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><ShortcutPrefix value={snapshot.settings.shortcuts.taskPrefix} onSaved={setSnapshot} notify={notify} /></section><SnapshotTools setSnapshot={setSnapshot} notify={notify} /><DeepSeekPanel notify={notify} /><LocalModels notify={notify} /></div>;
+  return <div className="settings-page"><header><small>偏好</small><h1>设置</h1></header><section className="settings-section"><h2>通用</h2><SettingToggle label="开机启动" description="登录后自动启动" checked={snapshot.settings.autostart} onChange={(value) => void api.setAutostart(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><SettingToggle label="宠物悬浮窗" description="桌面悬浮按键与任务列表" checked={snapshot.settings.petVisible} onChange={(value) => void api.setPetVisible(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><ShortcutPrefix value={snapshot.settings.shortcuts.taskPrefix} onSaved={setSnapshot} notify={notify} /></section><SnapshotTools setSnapshot={setSnapshot} notify={notify} /><DeepSeekPanel notify={notify} /><LocalModels notify={notify} /></div>;
 }
 
 function ShortcutPrefix({ value, onSaved, notify }: { value: string; onSaved: (value: Snapshot) => void; notify: (message: string) => void }) {
@@ -564,7 +564,7 @@ function ShortcutPrefix({ value, onSaved, notify }: { value: string; onSaved: (v
     if (timer.current != null) window.clearTimeout(timer.current);
     timer.current = window.setTimeout(() => { void api.saveShortcuts({ taskPrefix: next }).then(onSaved).then(() => notify(`快捷键前缀已设为 ${next}`)).catch((reason) => notify(String(reason))); setCapturing(false); }, 250);
   }
-  return <div className="shortcut-prefix"><span><strong>数字键快捷前缀</strong><small>点击右侧控件后按下修饰键；只注册 1–9、0 数字键。</small></span><button className={`shortcut-capture ${capturing ? "capturing" : ""}`} onKeyDown={capture} onKeyUp={() => setCapturing(false)} onClick={(event) => (event.currentTarget as HTMLButtonElement).focus()}>{capturing ? "按下修饰键…" : draft || "Control"}</button></div>;
+  return <div className="shortcut-prefix"><span><strong>快捷键前缀</strong><small>点击后按下修饰键，仅注册数字键</small></span><button className={`shortcut-capture ${capturing ? "capturing" : ""}`} onKeyDown={capture} onKeyUp={() => setCapturing(false)} onClick={(event) => (event.currentTarget as HTMLButtonElement).focus()}>{capturing ? "按下修饰键…" : draft || "Control"}</button></div>;
 }
 
 function SnapshotTools({ setSnapshot, notify }: { setSnapshot: (value: Snapshot) => void; notify: (message: string) => void }) {
@@ -573,9 +573,9 @@ function SnapshotTools({ setSnapshot, notify }: { setSnapshot: (value: Snapshot)
   async function pasteSnapshot() { setBusy(true); try { const payload = await readText(); if (!payload.trim()) throw new Error("剪贴板没有快照内容"); setSnapshot(await api.importData(payload)); notify("快照已粘贴并恢复"); } catch (reason) { notify(String(reason)); } finally { setBusy(false); } }
   async function clearAll() { setBusy(true); try { setSnapshot(await api.clearAllData()); notify("数据已清除，本地模型保留"); } catch (reason) { notify(String(reason)); } finally { setBusy(false); } }
   const [confirmClear, setConfirmClear] = useState(false);
-  return <section className="settings-section data-tools"><div className="section-heading"><div><h2>数据</h2><p>快照只通过剪贴板传递；清除数据不会删除本地模型。</p></div></div><div className="data-tool-actions"><button disabled={busy} onClick={() => void copySnapshot()}><Clipboard />复制快照</button><button disabled={busy} onClick={() => void pasteSnapshot()}><ClipboardPaste />粘贴快照</button><button className="danger-action" disabled={busy} onClick={() => setConfirmClear(true)}><Trash2 />清除全部数据</button></div>{confirmClear && <ConfirmDialog
+  return <section className="settings-section data-tools"><div className="section-heading"><div><h2>数据</h2><p>通过剪贴板备份与恢复；清除不影响本地模型。</p></div></div><div className="data-tool-actions"><button disabled={busy} onClick={() => void copySnapshot()}><Clipboard />复制快照</button><button disabled={busy} onClick={() => void pasteSnapshot()}><ClipboardPaste />粘贴快照</button><button className="danger-action" disabled={busy} onClick={() => setConfirmClear(true)}><Trash2 />清除全部数据</button></div>{confirmClear && <ConfirmDialog
     title="清除全部数据？"
-    description="所有需求、联系人、录音、文本卡和 AI 总结都会被删除。本地模型文件会保留。"
+    description="所有任务、录音和文本将被删除，本地模型不受影响。"
     confirmLabel="清除全部"
     danger
     onConfirm={() => { setConfirmClear(false); void clearAll(); }}
@@ -588,12 +588,12 @@ function DeepSeekPanel({ notify }: { notify: (message: string) => void }) {
   useEffect(() => { void api.deepSeekSettings().then(setSettings).catch(() => setSettings({ configured: false, model: "deepseek-v4-flash" })); }, []);
   async function save() { setBusy(true); try { setSettings(await api.saveDeepSeekApiKey(key)); setKey(""); notify("API Key 已保存到系统钥匙串"); } catch (reason) { notify(String(reason)); } finally { setBusy(false); } }
   async function test() { setBusy(true); try { await api.testDeepSeekConnection(); notify("DeepSeek 连接正常"); } catch (reason) { notify(String(reason)); } finally { setBusy(false); } }
-  return <section className="settings-section"><div className="section-heading"><div><h2>云端 AI</h2><p>录音处理完成后自动梳理对接结论和待处理事项。</p></div><span className={`status-badge ${settings?.configured ? "success" : "warning"}`}>{settings?.configured ? "已配置" : "未配置"}</span></div><div className="api-row"><KeyRound /><div><strong>DeepSeek</strong><small>{settings?.model ?? "deepseek-v4-flash"} · Key 保存在系统钥匙串</small></div><input type="password" value={key} placeholder={settings?.configured ? "输入新 Key 以替换" : "sk-..."} onChange={(event) => setKey(event.target.value)} /><button className="primary" disabled={!key.trim() || busy} onClick={() => void save()}>保存</button>{settings?.configured && <button disabled={busy} onClick={() => void test()}>测试</button>}{settings?.configured && <IconButton danger label="删除 API Key" onClick={() => void api.deleteDeepSeekApiKey().then(setSettings).then(() => notify("API Key 已删除")).catch((reason) => notify(String(reason)))}><Trash2 /></IconButton>}</div></section>;
+  return <section className="settings-section"><div className="section-heading"><div><h2>云端 AI</h2><p>录音完成后自动梳理结论和待办。</p></div><span className={`status-badge ${settings?.configured ? "success" : "warning"}`}>{settings?.configured ? "已配置" : "未配置"}</span></div><div className="api-row"><KeyRound /><div><strong>DeepSeek</strong><small>{settings?.model ?? "deepseek-v4-flash"}</small></div><input type="password" value={key} placeholder={settings?.configured ? "输入新 Key 替换" : "sk-..."} onChange={(event) => setKey(event.target.value)} /><button className="primary" disabled={!key.trim() || busy} onClick={() => void save()}>保存</button>{settings?.configured && <button disabled={busy} onClick={() => void test()}>测试</button>}{settings?.configured && <IconButton danger label="删除 API Key" onClick={() => void api.deleteDeepSeekApiKey().then(setSettings).then(() => notify("API Key 已删除")).catch((reason) => notify(String(reason)))}><Trash2 /></IconButton>}</div></section>;
 }
 
 function LocalModels({ notify }: { notify: (message: string) => void }) {
   const models = [{ id: "Qwen3-ASR-1.7B", note: "本地录音转写" }, { id: "Qwen3-ForcedAligner-0.6B", note: "文字时间对齐" }, { id: "3D-Speaker-CAM++", note: "发言人分离" }];
-  return <section className="settings-section"><div className="section-heading"><div><h2>本地模型</h2><p>录音与转写保留在本机，云端 AI 只接收最终文本。</p></div></div>{models.map((model) => <ModelRow key={model.id} id={model.id} note={model.note} notify={notify} />)}</section>;
+  return <section className="settings-section"><div className="section-heading"><div><h2>本地模型</h2><p>录音与转写保留在本机，云端只接收文本。</p></div></div>{models.map((model) => <ModelRow key={model.id} id={model.id} note={model.note} notify={notify} />)}</section>;
 }
 
 function ModelRow({ id, note, notify }: { id: string; note: string; notify: (message: string) => void }) {
@@ -612,7 +612,7 @@ function ModelRow({ id, note, notify }: { id: string; note: string; notify: (mes
 
 function SettingToggle({ label, description, checked, onChange }: { label: string; description: string; checked: boolean; onChange: (value: boolean) => void }) { return <label className="setting-toggle"><span><strong>{label}</strong><small>{description}</small></span><input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} /></label>; }
 
-function EmptyDocument({ completed, onNew }: { completed: boolean; onNew: () => void }) { return <div className="empty-document"><div><FileText /><h1>{completed ? "还没有已完成需求" : "创建第一份需求文档"}</h1><p>{completed ? "完成的需求会保留全部文本、录音和总结。" : "将需求绑定到数字键，随时切换并记录对接内容。"}</p>{!completed && <button className="primary" onClick={onNew}><Plus />新建需求</button>}</div></div>; }
+function EmptyDocument({ completed, onNew }: { completed: boolean; onNew: () => void }) { return <div className="empty-document"><div><FileText /><h1>{completed ? "还没有已完成任务" : "创建第一个任务"}</h1><p>{completed ? "完成的任务会保留全部文本、录音和总结。" : "将任务绑定到数字键，随时切换并记录。"}</p>{!completed && <button className="primary" onClick={onNew}><Plus />新建任务</button>}</div></div>; }
 
 function TaskHudWindow() {
   const [payload, setPayload] = useState<TaskHudPayload | null>(null);
@@ -626,11 +626,12 @@ function QuickPanel() {
   useEffect(() => { const prefill = () => void readText().then((value) => { const url = extractHttpUrl(value); if (url) setLink(url); }); let a: (() => void) | undefined; let b: (() => void) | undefined; let c: (() => void) | undefined; prefill(); void onLinkDrop((url) => setLink(url)).then((stop) => { a = stop; }); void onQuickPanelShown(prefill).then((stop) => { b = stop; }); void onPartialTranscript((value) => setPartial(value.text)).then((stop) => { c = stop; }); return () => { a?.(); b?.(); c?.(); }; }, []);
   async function useLink() { const url = extractHttpUrl(link); if (!url) { setMessage("没有识别到有效链接"); return; } try { await api.openConsoleNewTask(url); setLink(""); } catch (reason) { setMessage(String(reason)); } }
   if (!snapshot) return <LoadingState />;
-  return <div className="quick-shell"><div className="quick-top"><strong>RedKey</strong><button onClick={() => void api.showConsole()}>打开控制台</button></div><div className="quick-link"><Link2 /><input value={link} placeholder="粘贴需求链接" onChange={(event) => setLink(event.target.value)} /><button onClick={() => void useLink()}><Plus /></button></div>{message && <p className="quick-message">{message}</p>}{snapshot.recordings.some((recording) => recording.status === "recording") && <div className="quick-live"><span /><strong>录音中</strong><p>{partial || "正在聆听…"}</p></div>}<section className="quick-active"><header><strong>进行中</strong><span>{activeTasks.length}</span></header>{activeTasks.map((task) => <button key={task.id} className={task.id === snapshot.currentTaskId ? "active" : ""} onClick={() => void api.setCurrentTask(task.id, false).then(setSnapshot)}><kbd>{slotLabel(task.slot)}</kbd><span><strong>{task.contactName || "未指定"}</strong><small>{task.title}</small></span></button>)}</section></div>;
+  return <div className="quick-shell"><div className="quick-top"><strong>RedKey</strong><button onClick={() => void api.showConsole()}>打开控制台</button></div><div className="quick-link"><Link2 /><input value={link} placeholder="粘贴任务链接" onChange={(event) => setLink(event.target.value)} /><button onClick={() => void useLink()}><Plus /></button></div>{message && <p className="quick-message">{message}</p>}{snapshot.recordings.some((recording) => recording.status === "recording") && <div className="quick-live"><span /><strong>录音中</strong><p>{partial || "正在聆听…"}</p></div>}<section className="quick-active"><header><strong>进行中</strong><span>{activeTasks.length}</span></header>{activeTasks.map((task) => <button key={task.id} className={task.id === snapshot.currentTaskId ? "active" : ""} onClick={() => void api.setCurrentTask(task.id, false).then(setSnapshot)}><kbd>{slotLabel(task.slot)}</kbd><span><strong>{task.contactName || "未指定"}</strong><small>{task.title}</small></span></button>)}</section></div>;
 }
 
 function Pet() {
   const { currentTask } = useSnapshot(); const [pressed, setPressed] = useState(false);
+  useEffect(() => { document.documentElement.classList.add("hud-document"); return () => { document.documentElement.classList.remove("hud-document"); }; }, []);
   useEffect(() => { const timer = window.setInterval(() => void api.syncHoverState(), 80); return () => window.clearInterval(timer); }, []);
   async function drag() { setPressed(true); try { await api.setPetDragging(true); await getCurrentWindow().startDragging(); } finally { setPressed(false); void api.setPetDragging(false); } }
   return <div className={`pet-shell ${petState(currentTask)} ${pressed ? "pressed" : ""}`} onPointerDown={() => void drag()} onContextMenu={(event) => { event.preventDefault(); void api.showConsole(); }}><button className="keycap" title={currentTask?.title ?? "RedKey"}><span><b>{currentTask ? slotLabel(currentTask.slot) : "R"}</b><i>{currentTask ? "ACTIVE" : "READY"}</i></span></button></div>;
@@ -650,7 +651,7 @@ function ConfirmDialog({ title, description, confirmLabel = "确认", cancelLabe
     </div>
   </div>;
 }
-function NavButton({ active, icon, label, onClick }: { active: boolean; icon: React.ReactElement; label: string; onClick: () => void }) { return <button className={`nav-button ${active ? "active" : ""}`} onClick={onClick}>{icon}<span>{label}</span></button>; }
+function NavButton({ active, icon, label, count, onClick }: { active: boolean; icon: React.ReactElement; label: string; count?: number; onClick: () => void }) { return <button className={`nav-button ${active ? "active" : ""}`} onClick={onClick}>{icon}<span>{label}</span>{count != null && <b className="nav-badge">{count}</b>}</button>; }
 function AudioMeter({ level }: { level: number }) { return <span className="audio-meter">{Array.from({ length: 16 }, (_, index) => <i key={index} style={{ height: `${Math.max(12, Math.min(100, 12 + level * 160 * (0.4 + ((index * 7) % 9) / 14)))}%` }} />)}</span>; }
 function LoadingState({ error }: { error?: string | null }) { return <div className="loading-state"><span>R</span><p>{error ?? "正在加载 RedKey…"}</p></div>; }
 function sortRecent(tasks: Task[]) { return [...tasks].sort((a, b) => (b.lastOpenedAt ?? b.startedAt).localeCompare(a.lastOpenedAt ?? a.startedAt)); }
@@ -659,12 +660,53 @@ function formatShortDate(value: string | null) { if (!value) return "未打开";
 function formatDuration(seconds: number) { return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`; }
 function formatTimestamp(milliseconds: number) { return formatDuration(Math.floor(milliseconds / 1000)); }
 
+const PARTIAL_WINDOW_SECONDS = 20;
+
+function downsampleToWav(chunks: Float32Array[], sourceSampleRate: number) {
+  const length = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const input = new Float32Array(length);
+  let offset = 0;
+  for (const chunk of chunks) { input.set(chunk, offset); offset += chunk.length; }
+  const ratio = sourceSampleRate / 16000;
+  const samples = new Int16Array(Math.floor(input.length / ratio));
+  for (let index = 0; index < samples.length; index++) {
+    const start = Math.floor(index * ratio);
+    const end = Math.min(Math.floor((index + 1) * ratio), input.length);
+    let sum = 0;
+    for (let sourceIndex = start; sourceIndex < end; sourceIndex++) sum += input[sourceIndex];
+    const value = Math.max(-1, Math.min(1, sum / Math.max(1, end - start)));
+    samples[index] = value < 0 ? value * 0x8000 : value * 0x7fff;
+  }
+  return encodeWav(samples, 16000);
+}
+
 async function startPcmRecorder(stream: MediaStream, onLevel: (level: number) => void): Promise<RecorderHandle> {
-  const context = new AudioContext(); const source = context.createMediaStreamSource(stream); const processor = context.createScriptProcessor(4096, 1, 1); const chunks: Float32Array[] = [];
-  processor.onaudioprocess = (event) => { const input = event.inputBuffer.getChannelData(0); chunks.push(new Float32Array(input)); let sum = 0; for (let index = 0; index < input.length; index++) sum += input[index] * input[index]; onLevel(Math.min(1, Math.sqrt(sum / input.length) * 5)); };
+  const context = new AudioContext();
+  const source = context.createMediaStreamSource(stream);
+  const processor = context.createScriptProcessor(4096, 1, 1);
+  // Full history is only encoded once, when the recording stops.
+  const chunks: Float32Array[] = [];
+  // Partial transcription only needs a bounded trailing window, so its cost
+  // stays constant instead of growing with the meeting length.
+  const windowChunks: Float32Array[] = [];
+  let windowSamples = 0;
+  const maxWindowSamples = PARTIAL_WINDOW_SECONDS * context.sampleRate;
+  processor.onaudioprocess = (event) => {
+    const input = event.inputBuffer.getChannelData(0);
+    const copy = new Float32Array(input);
+    chunks.push(copy);
+    windowChunks.push(copy);
+    windowSamples += copy.length;
+    while (windowSamples > maxWindowSamples && windowChunks.length > 1) {
+      windowSamples -= windowChunks.shift()!.length;
+    }
+    let sum = 0;
+    for (let index = 0; index < input.length; index++) sum += input[index] * input[index];
+    onLevel(Math.min(1, Math.sqrt(sum / input.length) * 5));
+  };
   source.connect(processor); processor.connect(context.destination);
-  const snapshot = () => { const length = chunks.reduce((sum, chunk) => sum + chunk.length, 0); const input = new Float32Array(length); let offset = 0; for (const chunk of chunks) { input.set(chunk, offset); offset += chunk.length; } const ratio = context.sampleRate / 16000; const samples = new Int16Array(Math.floor(input.length / ratio)); for (let index = 0; index < samples.length; index++) { const start = Math.floor(index * ratio); const end = Math.min(Math.floor((index + 1) * ratio), input.length); let sum = 0; for (let sourceIndex = start; sourceIndex < end; sourceIndex++) sum += input[sourceIndex]; const value = Math.max(-1, Math.min(1, sum / Math.max(1, end - start))); samples[index] = value < 0 ? value * 0x8000 : value * 0x7fff; } return encodeWav(samples, 16000); };
-  return { snapshot, stop: async () => { processor.disconnect(); source.disconnect(); stream.getTracks().forEach((track) => track.stop()); const bytes = snapshot(); await context.close(); onLevel(0); return bytes; } };
+  const snapshot = () => downsampleToWav(windowChunks, context.sampleRate);
+  return { snapshot, stop: async () => { processor.disconnect(); source.disconnect(); stream.getTracks().forEach((track) => track.stop()); const bytes = downsampleToWav(chunks, context.sampleRate); await context.close(); onLevel(0); return bytes; } };
 }
 
 function encodeWav(samples: Int16Array, sampleRate: number) { const buffer = new ArrayBuffer(44 + samples.byteLength); const view = new DataView(buffer); const write = (offset: number, value: string) => Array.from(value).forEach((char, index) => view.setUint8(offset + index, char.charCodeAt(0))); write(0, "RIFF"); view.setUint32(4, 36 + samples.byteLength, true); write(8, "WAVE"); write(12, "fmt "); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true); view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true); write(36, "data"); view.setUint32(40, samples.byteLength, true); new Int16Array(buffer, 44).set(samples); return new Uint8Array(buffer); }

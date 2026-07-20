@@ -181,7 +181,6 @@ impl Database {
         Self::initialize(conn)
     }
 
-    #[cfg(test)]
     pub fn memory() -> Result<Self> {
         Self::initialize(Connection::open_in_memory()?)
     }
@@ -371,7 +370,7 @@ impl Database {
             current_group: self.current_group()?,
             groups: self.list_groups()?,
             settings: self.settings()?,
-            recordings: self.list_recordings()?,
+            recordings: self.list_recordings_light()?,
         })
     }
 
@@ -508,6 +507,18 @@ impl Database {
     fn list_recordings(&self) -> Result<Vec<Recording>> {
         query_all(&self.conn, "SELECT r.id,r.task_id,t.title,r.filename,r.duration,r.status,r.created_at,COALESCE(NULLIF(r.final_transcript,''),r.transcript),r.raw_transcript,r.error_message,r.processing_status,r.audio_path,r.updated_at,r.alignment_status,r.diarization_status,r.speaker_count,r.processing_error FROM recordings r LEFT JOIN tasks t ON t.id=r.task_id ORDER BY r.created_at DESC", |row| Ok(Recording {
             id: row.get(0)?, task_id: row.get(1)?, task_title: row.get(2)?, filename: row.get(3)?, duration: row.get(4)?, status: row.get(5)?, created_at: row.get(6)?, transcript: row.get(7)?, raw_transcript: row.get(8)?, error_message: row.get(9)?, processing_status: row.get(10)?, audio_path: row.get(11)?, updated_at: row.get(12)?, alignment_status: row.get(13)?, diarization_status: row.get(14)?, speaker_count: row.get(15)?, processing_error: row.get(16)?,
+        }))
+    }
+
+    // Snapshot is broadcast to the frontend on nearly every state change, but
+    // the UI only reads recording status/metadata from it (full transcripts
+    // are fetched on demand via task_document). Skipping the transcript
+    // columns here avoids re-reading and re-serializing every recording's
+    // full text on every snapshot, which otherwise grows with meeting length
+    // and history size.
+    fn list_recordings_light(&self) -> Result<Vec<Recording>> {
+        query_all(&self.conn, "SELECT r.id,r.task_id,t.title,r.filename,r.duration,r.status,r.created_at,r.error_message,r.processing_status,r.audio_path,r.updated_at,r.alignment_status,r.diarization_status,r.speaker_count,r.processing_error FROM recordings r LEFT JOIN tasks t ON t.id=r.task_id ORDER BY r.created_at DESC", |row| Ok(Recording {
+            id: row.get(0)?, task_id: row.get(1)?, task_title: row.get(2)?, filename: row.get(3)?, duration: row.get(4)?, status: row.get(5)?, created_at: row.get(6)?, transcript: String::new(), raw_transcript: String::new(), error_message: row.get(7)?, processing_status: row.get(8)?, audio_path: row.get(9)?, updated_at: row.get(10)?, alignment_status: row.get(11)?, diarization_status: row.get(12)?, speaker_count: row.get(13)?, processing_error: row.get(14)?,
         }))
     }
 

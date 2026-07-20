@@ -1,11 +1,20 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc};
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use hound::{SampleFormat, WavSpec, WavWriter};
 use std::io::BufWriter;
 use std::fs::File;
+
+// The audio callback runs on a realtime-ish thread owned by the OS/driver;
+// blocking it on a mutex or per-sample file I/O risks dropped/glitched audio
+// under system load. Samples are handed off through a channel instead, and a
+// dedicated writer thread owns the WavWriter and does all the file I/O.
+enum WriterMessage {
+    Samples(Vec<i16>),
+    Stop,
+}
 
 pub struct NativeRecording {
     pub id: String,
@@ -13,7 +22,8 @@ pub struct NativeRecording {
     pub started: std::time::Instant,
     _stop_sender: mpsc::Sender<()>,
     stream: Option<cpal::Stream>,
-    writer_arc: Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>,
+    writer_tx: mpsc::Sender<WriterMessage>,
+    writer_thread: Option<std::thread::JoinHandle<Result<()>>>,
     running: Arc<AtomicBool>,
 }
 
@@ -26,8 +36,11 @@ impl NativeRecording {
             if let Some(stream) = self.stream.take() {
                 drop(stream);
             }
-            if let Some(writer) = self.writer_arc.lock().unwrap().take() {
-                writer.finalize()?;
+            let _ = self.writer_tx.send(WriterMessage::Stop);
+            if let Some(handle) = self.writer_thread.take() {
+                if let Ok(result) = handle.join() {
+                    result?;
+                }
             }
         }
         Ok(())
@@ -56,9 +69,25 @@ pub fn start_recording(id: String, path: PathBuf) -> Result<NativeRecording> {
     let file = File::create(&path)?;
     let buf_writer = BufWriter::new(file);
     let writer = WavWriter::new(buf_writer, spec)?;
-    let writer_arc = Arc::new(Mutex::new(Some(writer)));
     let running = Arc::new(AtomicBool::new(true));
     let (_stop_sender, _stop_receiver) = mpsc::channel::<()>();
+
+    let (writer_tx, writer_rx) = mpsc::channel::<WriterMessage>();
+    let writer_thread = std::thread::spawn(move || -> Result<()> {
+        let mut writer = writer;
+        for message in writer_rx {
+            match message {
+                WriterMessage::Samples(samples) => {
+                    for sample in samples {
+                        let _ = writer.write_sample(sample);
+                    }
+                }
+                WriterMessage::Stop => break,
+            }
+        }
+        writer.finalize()?;
+        Ok(())
+    });
 
     let err_fn = |err| eprintln!("音频流错误: {}", err);
     let sample_format = supported_config.sample_format();
@@ -66,59 +95,41 @@ pub fn start_recording(id: String, path: PathBuf) -> Result<NativeRecording> {
 
     let stream = match sample_format {
         cpal::SampleFormat::I16 => {
-            let w = writer_arc.clone();
+            let tx = writer_tx.clone();
             let r = running.clone();
             device.build_input_stream(
                 &config,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
                     if !r.load(Ordering::Acquire) { return; }
-                    if let Ok(mut guard) = w.lock() {
-                        if let Some(writer) = guard.as_mut() {
-                            for &sample in data {
-                                let _ = writer.write_sample(sample);
-                            }
-                        }
-                    }
+                    let _ = tx.send(WriterMessage::Samples(data.to_vec()));
                 },
                 err_fn,
                 None,
             )?
         }
         cpal::SampleFormat::F32 => {
-            let w = writer_arc.clone();
+            let tx = writer_tx.clone();
             let r = running.clone();
             device.build_input_stream(
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     if !r.load(Ordering::Acquire) { return; }
-                    if let Ok(mut guard) = w.lock() {
-                        if let Some(writer) = guard.as_mut() {
-                            for &sample in data {
-                                let s = (sample * i16::MAX as f32) as i16;
-                                let _ = writer.write_sample(s);
-                            }
-                        }
-                    }
+                    let samples = data.iter().map(|&sample| (sample * i16::MAX as f32) as i16).collect();
+                    let _ = tx.send(WriterMessage::Samples(samples));
                 },
                 err_fn,
                 None,
             )?
         }
         cpal::SampleFormat::U16 => {
-            let w = writer_arc.clone();
+            let tx = writer_tx.clone();
             let r = running.clone();
             device.build_input_stream(
                 &config,
                 move |data: &[u16], _: &cpal::InputCallbackInfo| {
                     if !r.load(Ordering::Acquire) { return; }
-                    if let Ok(mut guard) = w.lock() {
-                        if let Some(writer) = guard.as_mut() {
-                            for &sample in data {
-                                let s = (sample as i32 - i16::MAX as i32) as i16;
-                                let _ = writer.write_sample(s);
-                            }
-                        }
-                    }
+                    let samples = data.iter().map(|&sample| (sample as i32 - i16::MAX as i32) as i16).collect();
+                    let _ = tx.send(WriterMessage::Samples(samples));
                 },
                 err_fn,
                 None,
@@ -135,7 +146,8 @@ pub fn start_recording(id: String, path: PathBuf) -> Result<NativeRecording> {
         started: std::time::Instant::now(),
         _stop_sender,
         stream: Some(stream),
-        writer_arc,
+        writer_tx,
+        writer_thread: Some(writer_thread),
         running,
     })
 }

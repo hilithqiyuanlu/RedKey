@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
 use windows_sys::Win32::Foundation::*;
@@ -19,7 +19,7 @@ pub struct PrefixConfig {
 
 impl Default for PrefixConfig {
     fn default() -> Self {
-        Self { control: true, alt: false, shift: false, win: false }
+        Self { control: false, alt: true, shift: false, win: false }
     }
 }
 
@@ -45,8 +45,13 @@ pub enum KeyboardEvent {
 }
 
 struct SharedState {
-    config: Mutex<PrefixConfig>,
-    sender: Mutex<Option<mpsc::Sender<KeyboardEvent>>>,
+    // Read on every keystroke system-wide, written only when the user changes
+    // the shortcut prefix in settings: an RwLock lets the hot path take a
+    // cheap read lock instead of contending on a plain Mutex.
+    config: RwLock<PrefixConfig>,
+    // Never replaced after the monitor starts, so it doesn't need a Mutex —
+    // mpsc::Sender is already Clone + Send + Sync.
+    sender: mpsc::Sender<KeyboardEvent>,
 }
 
 static mut SHARED_STATE: Option<Arc<SharedState>> = None;
@@ -111,19 +116,13 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
     let is_down = matches!(w_param as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
 
     if let Some(state) = &SHARED_STATE {
-        let config = *state.config.lock();
+        let config = *state.config.read();
         if is_modifier_vk(vk) {
             let active = exact_prefix_match(&config);
-            if let Some(sender) = state.sender.lock().clone() {
-                let _ = sender.send(KeyboardEvent::Prefix(active));
-            }
+            let _ = state.sender.send(KeyboardEvent::Prefix(active));
         } else if is_down && exact_prefix_match(&config) {
-            if vk_to_action(vk).is_some() {
-                if let Some(sender) = state.sender.lock().clone() {
-                    if let Some(action) = vk_to_action(vk) {
-                        let _ = sender.send(KeyboardEvent::Action(action));
-                    }
-                }
+            if let Some(action) = vk_to_action(vk) {
+                let _ = state.sender.send(KeyboardEvent::Action(action));
                 return 1;
             }
         }
@@ -188,8 +187,8 @@ pub fn start_keyboard_monitor(app: &AppHandle, settings: &crate::models::Shortcu
     let app_handle = app.clone();
 
     let shared_state = Arc::new(SharedState {
-        config: Mutex::new(PrefixConfig::from_string(&settings.task_prefix)),
-        sender: Mutex::new(Some(sender.clone())),
+        config: RwLock::new(PrefixConfig::from_string(&settings.task_prefix)),
+        sender: sender.clone(),
     });
 
     std::thread::spawn(move || {
@@ -231,7 +230,7 @@ impl KeyboardMonitor {
     pub fn update_config(&self, new_config: PrefixConfig) {
         *self.config.lock() = new_config;
         if let Some(state) = unsafe { &SHARED_STATE } {
-            *state.config.lock() = new_config;
+            *state.config.write() = new_config;
         }
     }
 }
