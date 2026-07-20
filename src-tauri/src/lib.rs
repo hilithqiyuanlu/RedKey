@@ -4,13 +4,18 @@ mod llm;
 mod models;
 mod speech;
 
+#[cfg(windows)]
+mod keyboard_windows;
+#[cfg(windows)]
+mod recording_windows;
+
 use crate::db::Database;
 use crate::models::*;
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use std::sync::mpsc;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
@@ -42,17 +47,20 @@ struct RuntimeState {
     hud_state: Mutex<HudState>,
 }
 
+#[cfg(target_os = "macos")]
 struct NativeRecording { id: String, path: std::path::PathBuf, started: std::time::Instant, child: Child, input: ChildStdin }
+#[cfg(windows)]
+type NativeRecording = recording_windows::NativeRecording;
+#[cfg(target_os = "macos")]
 struct KeyboardMonitor {
-    #[cfg(target_os = "macos")]
     config: std::sync::Arc<Mutex<PrefixConfig>>,
-    #[cfg(target_os = "macos")]
     error: std::sync::Arc<Mutex<Option<String>>>,
-    #[cfg(target_os = "macos")]
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    #[cfg(target_os = "macos")]
     sender: mpsc::Sender<KeyboardEvent>,
 }
+
+#[cfg(windows)]
+type KeyboardMonitor = keyboard_windows::KeyboardMonitor;
 
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy)]
@@ -409,7 +417,7 @@ fn open_link(url: &str) -> Result<()> {
     Ok(())
 }
 
-fn dispatch_internal(app: &AppHandle, action: AppAction) -> Result<Snapshot> {
+pub fn dispatch_internal(app: &AppHandle, action: AppAction) -> Result<Snapshot> {
     if action == AppAction::OpenConsole {
         show_console_window(app)?;
         return emit_snapshot(app);
@@ -550,18 +558,35 @@ fn start_keyboard_monitor(app: &AppHandle, settings: &ShortcutSettings) -> Keybo
     monitor
 }
 
+#[cfg(windows)]
+fn start_keyboard_monitor(app: &AppHandle, settings: &ShortcutSettings) -> KeyboardMonitor {
+    keyboard_windows::start_keyboard_monitor(app, settings)
+}
+
+#[cfg(windows)]
+fn install_keyboard_tap(app: &AppHandle, monitor: &KeyboardMonitor) {
+    keyboard_windows::install_keyboard_tap(app, monitor)
+}
+
 fn update_keyboard_listener(app: &AppHandle, settings: &ShortcutSettings) -> Result<()> {
     settings.validate()?;
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     { let _ = (app, settings); return Ok(()); }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
         let state = app.state::<RuntimeState>();
         let mut monitor = state.keyboard_monitor.lock();
         if let Some(monitor) = monitor.as_ref() {
-            *monitor.config.lock() = prefix_config(&settings.task_prefix);
-            *monitor.error.lock() = None;
-            install_keyboard_tap(app, monitor);
+            #[cfg(target_os = "macos")]
+            {
+                *monitor.config.lock() = prefix_config(&settings.task_prefix);
+                *monitor.error.lock() = None;
+                install_keyboard_tap(app, monitor);
+            }
+            #[cfg(windows)]
+            {
+                monitor.update_config(keyboard_windows::PrefixConfig::from_string(&settings.task_prefix));
+            }
         } else {
             *monitor = Some(start_keyboard_monitor(app, settings));
         }
@@ -887,7 +912,9 @@ fn keyboard_listener_status(app: AppHandle) -> Option<String> {
     app.state::<RuntimeState>().keyboard_monitor.lock().as_ref().and_then(|monitor| {
         #[cfg(target_os = "macos")]
         { monitor.error.lock().clone() }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(windows)]
+        { monitor.error.lock().clone() }
+        #[cfg(not(any(target_os = "macos", windows)))]
         { None }
     })
 }
@@ -1121,8 +1148,8 @@ async fn request_microphone_permission() -> Result<bool, String> {
 
 #[tauri::command]
 fn start_native_recording(app: AppHandle) -> Result<String, String> {
-    #[cfg(not(target_os = "macos"))]
-    { return Err("当前版本的原生录音暂只支持 macOS".into()); }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    { return Err("当前版本的原生录音暂只支持 macOS 和 Windows".into()); }
     #[cfg(target_os = "macos")]
     {
         if app.state::<RuntimeState>().native_recording.lock().is_some() { return Err("已经在录音".into()); }
@@ -1144,17 +1171,35 @@ fn start_native_recording(app: AppHandle) -> Result<String, String> {
         *app.state::<RuntimeState>().native_recording.lock() = Some(NativeRecording { id: id.clone(), path, started: std::time::Instant::now(), child, input });
         Ok(id)
     }
+    #[cfg(windows)]
+    {
+        if app.state::<RuntimeState>().native_recording.lock().is_some() { return Err("已经在录音".into()); }
+        let id = uuid::Uuid::new_v4().to_string();
+        let dir = app.path().app_data_dir().map_err(err)?.join("recordings");
+        std::fs::create_dir_all(&dir).map_err(err)?;
+        let path = dir.join(format!("{id}.wav"));
+        let recording = recording_windows::start_recording(id.clone(), path.clone()).map_err(err)?;
+        *app.state::<RuntimeState>().native_recording.lock() = Some(recording);
+        Ok(id)
+    }
 }
 
 #[tauri::command]
 fn stop_native_recording(app: AppHandle) -> Result<Snapshot, String> {
     let mut recording = app.state::<RuntimeState>().native_recording.lock().take().ok_or("当前没有录音")?;
-    writeln!(recording.input, "stop").map_err(err)?;
-    recording.input.flush().map_err(err)?;
-    let status = recording.child.wait().map_err(err)?;
-    if !status.success() {
-        app.state::<RuntimeState>().db.lock().fail_recording(&recording.id, "原生录音进程异常退出").map_err(err)?;
-        return Err("录音保存失败".into());
+    #[cfg(target_os = "macos")]
+    {
+        writeln!(recording.input, "stop").map_err(err)?;
+        recording.input.flush().map_err(err)?;
+        let status = recording.child.wait().map_err(err)?;
+        if !status.success() {
+            app.state::<RuntimeState>().db.lock().fail_recording(&recording.id, "原生录音进程异常退出").map_err(err)?;
+            return Err("录音保存失败".into());
+        }
+    }
+    #[cfg(windows)]
+    {
+        recording.stop().map_err(err)?;
     }
     let duration = recording.started.elapsed().as_secs_f64();
     app.state::<RuntimeState>().db.lock().finish_recording(&recording.id, duration, &recording.path.to_string_lossy()).map_err(err)?;
@@ -1420,10 +1465,9 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
-        .plugin(tauri_plugin_autostart::init(
-            MacosLauncher::LaunchAgent,
-            Some(vec!["--background"]),
-        ))
+        .plugin({
+            tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec!["--background"]))
+        })
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             let database = Database::open(&data_dir.join("redkey.sqlite3"))?;

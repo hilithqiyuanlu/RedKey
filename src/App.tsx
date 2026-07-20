@@ -617,7 +617,7 @@ function EmptyDocument({ completed, onNew }: { completed: boolean; onNew: () => 
 function TaskHudWindow() {
   const [payload, setPayload] = useState<TaskHudPayload | null>(null);
   useEffect(() => { document.documentElement.classList.add("hud-document"); let stop: (() => void) | undefined; void onTaskHud(setPayload).then((cleanup) => { stop = cleanup; }); return () => { stop?.(); document.documentElement.classList.remove("hud-document"); }; }, []);
-  return <div className="task-hud-window">{payload && <section className="task-hud">{payload.slots.map(({ slot, name, title }) => <div className={title ? "bound" : ""} key={slot}><kbd>{slotLabel(slot)}</kbd><span><strong>{name || "未指定"}</strong><small>{title || "空"}</small></span></div>)}</section>}</div>;
+  return <div className="task-hud-window">{payload && <section className="task-hud">{payload.slots.map(({ slot, name, title }) => <div className={`task-hud-key${title ? " bound" : ""}`} key={slot}><kbd>{slotLabel(slot)}</kbd><span className="task-hud-labels"><strong className="task-hud-contact">{name || "未指定"}</strong><small className="task-hud-title">{title || "空"}</small></span></div>)}</section>}</div>;
 }
 
 function QuickPanel() {

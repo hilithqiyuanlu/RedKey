@@ -77,7 +77,7 @@
       "../workers/qwen_asr_worker.py": "workers/qwen_asr_worker.py",
       "../workers/diarization_worker.py": "workers/diarization_worker.py"
     },
-    "targets": "all",
+    "targets": ["nsis"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
