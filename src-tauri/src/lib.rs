@@ -1265,9 +1265,8 @@ fn save_shortcuts(app: AppHandle, shortcuts: ShortcutSettings) -> Result<Snapsho
 #[tauri::command]
 fn start_recording(app: AppHandle) -> Result<String, String> {
     let snapshot = app.state::<RuntimeState>().db().snapshot().map_err(err)?;
-    // 优先使用当前任务；若当前任务无 slot 或不存在，回退到最近打开的有 slot 的活动任务。
     let current = snapshot.current_task_id.as_deref()
-        .and_then(|id| snapshot.tasks.iter().find(|task| task.id == id && task.status == "active" && task.slot.is_some()));
+        .and_then(|id| snapshot.tasks.iter().find(|task| task.id == id && task.status == "active"));
     let task = current.or_else(|| {
         let mut candidates: Vec<&Task> = snapshot.tasks.iter()
             .filter(|task| task.status == "active" && task.slot.is_some())
@@ -1656,7 +1655,10 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir().context("无法获取应用数据目录")?;
             let database = match Database::open(&data_dir.join("redkey.sqlite3")) {
-                Ok(db) => db,
+                Ok(db) => {
+                    eprintln!("Database opened successfully from {:?}", data_dir.join("redkey.sqlite3"));
+                    db
+                }
                 Err(e) => {
                     eprintln!("Failed to open database: {e}");
                     Database::memory().context("无法创建内存数据库")?
@@ -1665,7 +1667,9 @@ pub fn run() {
             let settings = database.settings().unwrap_or_default();
             if settings.autostart { let _ = app.autolaunch().enable(); }
             *app.state::<RuntimeState>().db.lock() = Some(database);
+            eprintln!("Database initialized, emitting snapshot");
             let _ = emit_snapshot(app.handle());
+            eprintln!("Snapshot emitted successfully");
             if let Err(e) = update_keyboard_listener(app.handle(), &settings.shortcuts) {
                 eprintln!("Failed to start keyboard listener: {e}");
             }

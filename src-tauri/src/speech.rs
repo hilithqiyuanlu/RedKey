@@ -2,7 +2,7 @@ use crate::models::ModelStatus;
 use crate::no_window;
 use anyhow::{bail, Context, Result};
 use serde_json::json;
-use std::{collections::{HashMap, HashSet}, fs, fs::OpenOptions, io::{BufRead, BufReader, Write}, path::{Path, PathBuf}, process::{Child, ChildStdin, ChildStdout, Command, Stdio}, sync::{Arc, Mutex, OnceLock}, thread, time::Duration};
+use std::{collections::HashSet, fs, fs::OpenOptions, io::{BufRead, BufReader, Write}, path::{Path, PathBuf}, process::{Child, ChildStdin, ChildStdout, Command, Stdio}, sync::{Arc, Mutex, OnceLock}, thread, time::Duration};
 use tauri::{AppHandle, Emitter, Manager};
 
 pub const ASR_ID: &str = "Qwen3-ASR-1.7B";
@@ -13,17 +13,8 @@ const CAMPP_MODEL: &str = "iic/speech_campplus_sv_zh_en_16k-common_advanced";
 const VAD_MODEL: &str = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch";
 const DIARIZATION_READY_VERSION: &str = "redkey-diarization-runtime-v2";
 static ACTIVE_DOWNLOADS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-// status() is called on every recording's processing pipeline (to check the
-// aligner/diarization models are installed) as well as on settings UI mounts.
-// Once a model is installed its directory is immutable, so the recursive
-// installed-check + directory_size walk is cached instead of re-walking the
-// whole model tree (which can hold thousands of files) on every call.
-// Cache is bypassed while a download is active, since the directory is
-// legitimately changing then, and is invalidated on delete().
-static STATUS_CACHE: OnceLock<Mutex<HashMap<String, (bool, u64)>>> = OnceLock::new();
 
 fn active_downloads() -> &'static Mutex<HashSet<String>> { ACTIVE_DOWNLOADS.get_or_init(|| Mutex::new(HashSet::new())) }
-fn status_cache() -> &'static Mutex<HashMap<String, (bool, u64)>> { STATUS_CACHE.get_or_init(|| Mutex::new(HashMap::new())) }
 
 fn models_dir(app: &AppHandle) -> Result<PathBuf> { Ok(app.path().app_data_dir()?.join("models")) }
 fn runtime_dir(app: &AppHandle) -> Result<PathBuf> { Ok(app.path().app_data_dir()?.join("speech-runtime")) }
@@ -63,28 +54,25 @@ fn is_model_installed(id: &str, dir: &Path) -> bool {
 pub fn status(app: &AppHandle, id: &str) -> Result<ModelStatus> {
     if ![ASR_ID, ALIGNER_ID, DIARIZATION_ID, OCR_ID].contains(&id) { bail!("未知模型：{id}") }
     let dir = models_dir(app)?.join(id);
+    let downloading_now = active_downloads().lock().unwrap().contains(id);
     let mut value = fs::read_to_string(state_path(app, id)?).ok()
         .and_then(|text| serde_json::from_str::<ModelStatus>(&text).ok())
         .unwrap_or(ModelStatus { id: id.into(), installed: false, downloading: false, progress: 0, stage: "未安装".into(), error: None, size_bytes: 0, downloaded_bytes: 0, total_bytes: None, progress_kind: "idle".into(), detail: "尚未下载".into(), verified: false });
-    let downloading_now = active_downloads().lock().unwrap().contains(id);
-    let cached = if downloading_now { None } else { status_cache().lock().unwrap().get(id).copied() };
-    if let Some((installed, size_bytes)) = cached {
-        value.installed = installed;
-        value.size_bytes = size_bytes;
-    } else {
-        value.installed = is_model_installed(id, &dir);
-        value.size_bytes = directory_size(&dir);
-        if !downloading_now {
-            status_cache().lock().unwrap().insert(id.to_string(), (value.installed, value.size_bytes));
-        }
-    }
-    value.verified = value.installed;
-    if value.installed { value.downloading = false; value.progress = 100; value.downloaded_bytes = value.total_bytes.unwrap_or(value.size_bytes); value.progress_kind = "idle".into(); value.stage = "已安装".into(); value.detail = "模型文件已校验，可离线使用".into(); }
-    else if value.downloading && !active_downloads().lock().unwrap().contains(id) {
+    let installed = is_model_installed(id, &dir);
+    value.installed = installed;
+    value.verified = installed;
+    if installed {
+        value.downloading = false;
+        value.progress = 100;
+        value.downloaded_bytes = value.total_bytes.unwrap_or(value.size_bytes);
+        value.progress_kind = "idle".into();
+        value.stage = "已安装".into();
+        value.detail = "模型文件已校验，可离线使用".into();
+        value.error = None;
+    } else if value.downloading && !downloading_now {
         value.downloading = false;
         value.stage = "下载已中断，可继续".into();
         value.error = None;
-        fs::write(state_path(app, id)?, serde_json::to_vec(&value)?)?;
     }
     Ok(value)
 }
@@ -141,7 +129,6 @@ pub fn delete(app: &AppHandle, id: &str) -> Result<()> {
     let dir = models_dir(app)?.join(id);
     if dir.exists() { fs::remove_dir_all(&dir).with_context(|| format!("删除模型目录失败：{}", dir.display()))?; }
     let _ = fs::remove_file(state_path(app, id)?);
-    status_cache().lock().unwrap().remove(id);
     save_status(app, &ModelStatus {
         id: id.into(),
         installed: false,
@@ -342,6 +329,7 @@ fn run_cancelable(app: &AppHandle, id: &str, command: &mut Command, context: &st
     command.stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log));
     no_window(command);
     let mut child = command.spawn().with_context(|| context.to_string())?;
+    let mut last_update = std::time::Instant::now();
     loop {
         if cancel_path(app, id)?.exists() {
             let _ = child.kill(); let _ = child.wait();
@@ -360,11 +348,15 @@ fn run_cancelable(app: &AppHandle, id: &str, command: &mut Command, context: &st
             return Ok(())
         }
         if let Some(dir) = download_dir {
-            let downloaded = directory_size(dir);
-            let total = read_total(total_path);
-            let progress = total.filter(|total| *total > 0).map(|total| ((downloaded.min(total) * 100) / total) as u8).unwrap_or(base_progress);
-            let detail = total.map(|total| format!("{} / {}", format_bytes(downloaded.min(total)), format_bytes(total))).unwrap_or_else(|| format!("已下载 {}", format_bytes(downloaded)));
-            let _ = save_status(app, &ModelStatus { id: id.into(), installed: false, downloading: true, progress, stage: "下载模型文件".into(), error: None, size_bytes: downloaded, downloaded_bytes: downloaded, total_bytes: total, progress_kind: if total.is_some() { "download".into() } else { "indeterminate".into() }, detail, verified: false });
+            let now = std::time::Instant::now();
+            if now.duration_since(last_update) >= Duration::from_secs(2) {
+                let downloaded = directory_size(dir);
+                let total = read_total(total_path);
+                let progress = total.filter(|total| *total > 0).map(|total| ((downloaded.min(total) * 100) / total) as u8).unwrap_or(base_progress);
+                let detail = total.map(|total| format!("{} / {}", format_bytes(downloaded.min(total)), format_bytes(total))).unwrap_or_else(|| format!("已下载 {}", format_bytes(downloaded)));
+                let _ = save_status(app, &ModelStatus { id: id.into(), installed: false, downloading: true, progress, stage: "下载模型文件".into(), error: None, size_bytes: downloaded, downloaded_bytes: downloaded, total_bytes: total, progress_kind: if total.is_some() { "download".into() } else { "indeterminate".into() }, detail, verified: false });
+                last_update = now;
+            }
         }
         thread::sleep(Duration::from_millis(500));
     }
@@ -450,7 +442,7 @@ fn format_bytes(bytes: u64) -> String { if bytes >= 1_073_741_824 { format!("{:.
 
 fn install_ocr(app: &AppHandle, id: &str, python: &Path) -> Result<()> {
     run_cancelable(app, id, Command::new(python).args([
-        "-m", "pip", "install", "--only-binary", ":all:", "--upgrade", "pip", "rapidocr-onnxruntime",
+        "-m", "pip", "install", "--only-binary", ":all:", "--upgrade", "pip", "rapidocr-onnxruntime", "modelscope",
     ]), "安装 RapidOCR 失败", 8, None, None)?;
     save_status(app, &ModelStatus { id: id.into(), installed: false, downloading: true, progress: 0, stage: "下载识别模型".into(), error: None, size_bytes: directory_size(&models_dir(app)?.join(id)), downloaded_bytes: 0, total_bytes: None, progress_kind: "indeterminate".into(), detail: "正在从 ModelScope 下载 OCR 模型文件".into(), verified: false })?;
     let model_dir = models_dir(app)?.join(id);

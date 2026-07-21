@@ -1,4 +1,4 @@
-﻿/* ============================================================
+/* ============================================================
    AlphaKey — 21th Design System (Dark Theme)
    ============================================================ */
 
@@ -731,8 +731,8 @@ select:focus-visible {
   min-height: 80px;
   padding: 6px 8px;
   resize: vertical;
-  border: 1px solid var(--border);
-  border-radius: 6px;
+  border: 0;
+  border-radius: 0;
   background: var(--surface-alt);
   outline: none;
   font-family: inherit;
@@ -2746,7 +2746,7 @@ button.primary:hover,
 }
 .task-hud-title {
   color: var(--muted);
-  font-size: 10px;
+  font-size: 13px;
   font-weight: 400;
   overflow: hidden;
   text-overflow: ellipsis;

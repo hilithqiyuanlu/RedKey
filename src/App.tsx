@@ -325,34 +325,24 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
 
   useEffect(() => { setTitle(task.title); }, [task.title]);
   useEffect(() => { setEditingTitle(false); setContactOpen(false); setLinkOpen(false); }, [task.id]);
-  // Ctrl+V 粘贴文本（仅进行中任务界面，非输入框时生效）
-  useEffect(() => {
-    if (readOnly) return;
-    function onKeyDown(event: KeyboardEvent) {
-      if (event.key !== "v" || (!event.ctrlKey && !event.metaKey)) return;
-      const target = window.document.activeElement;
-      if (target && (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || (target as HTMLElement).isContentEditable)) return;
-      event.preventDefault();
-      void api.pasteFromClipboard(task.id).then(() => onRefresh()).catch((reason) => notify(String(reason)));
-    }
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [task.id, readOnly, onRefresh, notify]);
-  // Ctrl+V 粘贴图片（仅进行中任务界面，非输入框时生效）
+  // Ctrl+V 粘贴（图片优先，否则粘贴文本；仅进行中任务界面，非输入框时生效）
   useEffect(() => {
     if (readOnly) return;
     function onPaste(event: ClipboardEvent) {
       const target = window.document.activeElement;
       if (target && (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || (target as HTMLElement).isContentEditable)) return;
       const file = event.clipboardData?.files?.[0];
-      if (!file || !file.type.startsWith("image/")) return;
-      event.preventDefault();
-      const reader = new FileReader();
-      reader.onload = () => {
-        const base64 = (reader.result as string).split(",")[1];
-        void api.createImageCard(task.id, file.name || "paste.png", file.type, base64, "").then(() => onRefresh()).catch((reason) => notify(String(reason)));
-      };
-      reader.readAsDataURL(file);
+      if (file && file.type.startsWith("image/")) {
+        event.preventDefault();
+        const reader = new FileReader();
+        reader.onload = () => {
+          const base64 = (reader.result as string).split(",")[1];
+          void api.createImageCard(task.id, file.name || "paste.png", file.type, base64, "").then(() => onRefresh()).catch((reason) => notify(String(reason)));
+        };
+        reader.readAsDataURL(file);
+        return;
+      }
+      void api.pasteFromClipboard(task.id).then(() => onRefresh()).catch((reason) => notify(String(reason)));
     }
     window.addEventListener("paste", onPaste);
     return () => window.removeEventListener("paste", onPaste);
@@ -611,7 +601,8 @@ function ImageCardView({ card, readOnly, onRefresh, notify }: { card: ImageCard;
     const reader = new FileReader();
     reader.onload = () => {
       const base64 = (reader.result as string).split(",")[1];
-      void api.updateImageCard(card.id, file.name, file.type, base64, card.content).then(() => onRefresh()).catch((reason) => notify(String(reason)));
+      const isDefault = !card.content || card.content.includes("点击插入图片") || card.content.includes("CTRL");
+      void api.updateImageCard(card.id, file.name, file.type, base64, isDefault ? "" : card.content).then(() => onRefresh()).catch((reason) => notify(String(reason)));
     };
     reader.readAsDataURL(file);
   }
