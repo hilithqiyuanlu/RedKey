@@ -164,15 +164,16 @@ fn install(app: &AppHandle, id: &str) -> Result<()> {
     // separate venv prevents its scientific packages from breaking ASR.
     let runtime = if id == DIARIZATION_ID { diarization_runtime_dir(app)? } else { runtime_dir(app)? };
     let python = runtime.join(if cfg!(windows) { "Scripts/python.exe" } else { "bin/python" });
-    if !python.exists() {
-        let bootstrap = find_python().context("未找到可用于初始化内置运行环境的 Python 3，请先安装 Python 3.10 或 3.11")?;
+    if !python.exists() || !venv_python_compatible(&python) {
+        if python.exists() { let _ = fs::remove_dir_all(&runtime); }
+        let bootstrap = find_python().context("未找到可用于初始化内置运行环境的 Python 3.10~3.12，请安装 Python 3.11")?;
         fs::create_dir_all(&runtime)?;
-        run_cancelable(app, id, Command::new(bootstrap).args(["-m", "venv"]).arg(&runtime), "创建语音运行环境失败", 3, None, None)?;
+        run_cancelable(app, id, Command::new(&bootstrap).args(["-m", "venv"]).arg(&runtime), "创建语音运行环境失败", 3, None, None)?;
     }
     save_status(app, &ModelStatus { id: id.into(), installed: false, downloading: true, progress: 0, stage: "安装运行组件".into(), error: None, size_bytes: 0, downloaded_bytes: 0, total_bytes: None, progress_kind: "indeterminate".into(), detail: if id == DIARIZATION_ID { "正在安装 3D-Speaker、VAD 与聚类依赖".into() } else if id == OCR_ID { "正在安装 RapidOCR ONNX Runtime".into() } else { "正在安装 Qwen ASR、ModelScope 和推理依赖".into() }, verified: false })?;
     if id == DIARIZATION_ID { return install_diarization(app, id, &python); }
     if id == OCR_ID { return install_ocr(app, id, &python); }
-    run_cancelable(app, id, Command::new(&python).args(["-m", "pip", "install", "--upgrade", "pip", "modelscope", "qwen-asr", "soundfile"]), "安装 Qwen 运行组件失败", 8, None, None)?;
+    run_cancelable(app, id, Command::new(&python).args(["-m", "pip", "install", "--only-binary", ":all:", "--upgrade", "pip", "modelscope", "qwen-asr", "soundfile"]), "安装 Qwen 运行组件失败", 8, None, None)?;
     save_status(app, &ModelStatus { id: id.into(), installed: false, downloading: true, progress: 0, stage: "获取模型清单".into(), error: None, size_bytes: directory_size(&models_dir(app)?.join(id)), downloaded_bytes: 0, total_bytes: None, progress_kind: "indeterminate".into(), detail: "正在连接 ModelScope 并读取模型文件".into(), verified: false })?;
     let model_dir = models_dir(app)?.join(id);
     fs::create_dir_all(&model_dir)?;
@@ -213,13 +214,13 @@ fn install_diarization(app: &AppHandle, id: &str, python: &Path) -> Result<()> {
     run_cancelable(app, id, Command::new(python).args([
         "-m", "pip", "install", "--only-binary", ":all:",
         "modelscope", "soundfile", "tqdm", "pyyaml", "kaldiio", "addict",
-        "fastcluster", "simplejson", "sortedcontainers",
+        "simplejson", "sortedcontainers",
     ]), "安装 3D-Speaker 工具依赖失败", 0, None, None)?;
-    // 聚类相关依赖（umap-learn 和 hdbscan 在 Windows 上常需从源码构建，
+    // 聚类相关依赖（fastcluster、umap-learn 和 hdbscan 在 Windows 上常需从源码构建，
     // 单独安装并用 --only-binary 优先预编译；失败则跳过，不影响核心分离功能）
     let _ = run_cancelable(app, id, Command::new(python).args([
         "-m", "pip", "install", "--only-binary", ":all:",
-        "umap-learn", "hdbscan",
+        "fastcluster", "umap-learn", "hdbscan",
     ]), "聚类依赖安装失败（可选）", 0, None, None);
     let cache = dir.join("model-cache");
     fs::create_dir_all(&cache)?;
@@ -232,7 +233,7 @@ fn install_diarization(app: &AppHandle, id: &str, python: &Path) -> Result<()> {
     run_cancelable(app, id, Command::new(python).args(["-c", &script]), "下载 CAM++ 或 VAD 模型失败", 0, Some(&cache), Some(&total_path))?;
     if !contains_weight(&cache) { bail!("CAM++ 或 VAD 模型文件不完整，请重试") }
     save_status(app, &ModelStatus { id: id.into(), installed: false, downloading: true, progress: 0, stage: "验证分离组件".into(), error: None, size_bytes: directory_size(&dir), downloaded_bytes: 0, total_bytes: None, progress_kind: "indeterminate".into(), detail: "正在检查 ModelScope、CAM++、VAD 与聚类组件".into(), verified: false })?;
-    let health_script = "import torch, torchaudio, numpy, scipy, sklearn, fastcluster\nfrom modelscope.pipelines import pipeline\nfrom speakerlab.models.campplus.DTDNN import CAMPPlus\nfrom speakerlab.process.cluster import CommonClustering\nfrom speakerlab.process.processor import FBank\nprint('redkey-diarization-ready')";
+    let health_script = "import torch, torchaudio, numpy, scipy, sklearn\nfrom modelscope.pipelines import pipeline\nfrom speakerlab.models.campplus.DTDNN import CAMPPlus\nfrom speakerlab.process.cluster import CommonClustering\nfrom speakerlab.process.processor import FBank\nprint('redkey-diarization-ready')";
     let mut health_command = Command::new(python);
     health_command.args(["-c", health_script]).current_dir(&repo);
     run_cancelable(app, id, &mut health_command, "3D-Speaker 健康检查失败", 0, None, None)?;
@@ -248,13 +249,17 @@ fn worker_path(app: &AppHandle) -> Result<PathBuf> {
     Ok(Path::new(env!("CARGO_MANIFEST_DIR")).join("../workers/qwen_asr_worker.py"))
 }
 
-fn health_check(app: &AppHandle, python: &Path) -> Result<()> {
-    let output = no_window(&mut Command::new(python).arg(worker_path(app)?).stdin(Stdio::piped()).stdout(Stdio::piped())).spawn().and_then(|mut child| {
+fn health_check_worker(python: &Path, worker: &Path, error_msg: &str) -> Result<()> {
+    let output = no_window(&mut Command::new(python).arg(worker).stdin(Stdio::piped()).stdout(Stdio::piped())).spawn().and_then(|mut child| {
         child.stdin.as_mut().unwrap().write_all(b"{\"action\":\"health\",\"requestId\":\"install\"}\n{\"action\":\"shutdown\"}\n")?;
         child.wait_with_output()
     })?;
-    if !output.status.success() { bail!("语音 worker 健康检查失败") }
+    if !output.status.success() { bail!("{}", error_msg) }
     Ok(())
+}
+
+fn health_check(app: &AppHandle, python: &Path) -> Result<()> {
+    health_check_worker(python, &worker_path(app)?, "语音 worker 健康检查失败")
 }
 
 pub struct SpeechWorker { child: Arc<parking_lot::Mutex<Child>>, input: ChildStdin, output: BufReader<ChildStdout> }
@@ -370,24 +375,93 @@ fn tail_text(value: &str, max_chars: usize) -> String {
     chars.reverse();
     chars.into_iter().collect::<String>().trim().to_string()
 }
-fn find_python() -> Option<&'static str> { ["python3", "python"].into_iter().find(|name| no_window(&mut Command::new(name).arg("--version")).output().is_ok_and(|o| o.status.success())) }
+fn find_python() -> Option<String> {
+    // 优先搜索兼容版本（Python 3.10-3.12），避免 3.13+ 的包兼容问题
+    for name in ["python3.11", "python3.10", "python3.12", "python3", "python"] {
+        if let Ok(output) = no_window(&mut Command::new(name).arg("-c").arg("import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")).output() {
+            if output.status.success() {
+                let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if is_compatible_python(&version) {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    // PATH 中找不到兼容版本时，扫描 Windows 常见安装目录
+    #[cfg(windows)]
+    {
+        let fallback = dirs_fallback();
+        let base_dirs = [
+            std::path::Path::new("C:\\Program Files"),
+            fallback.as_path(),
+        ];
+        for base in &base_dirs {
+            let py_dir = base.join("Python");
+            if let Ok(entries) = std::fs::read_dir(&py_dir) {
+                for entry in entries.flatten() {
+                    let exe = entry.path().join("python.exe");
+                    if exe.exists() {
+                        if let Ok(out) = no_window(&mut Command::new(&exe).arg("-c").arg("import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")).output() {
+                            if out.status.success() {
+                                let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                                if is_compatible_python(&version) {
+                                    return Some(exe.to_string_lossy().to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn is_compatible_python(version: &str) -> bool {
+    if let Some((major, minor)) = version.split_once('.') {
+        if let (Ok(major), Ok(minor)) = (major.parse::<u32>(), minor.parse::<u32>()) {
+            return major == 3 && (10..=12).contains(&minor);
+        }
+    }
+    false
+}
+
+fn dirs_fallback() -> std::path::PathBuf {
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        std::path::PathBuf::from(local).join("Programs")
+    } else if let Ok(home) = std::env::var("USERPROFILE") {
+        std::path::PathBuf::from(home).join("AppData").join("Local").join("Programs")
+    } else {
+        std::path::PathBuf::from("C:\\Users")
+    }
+}
+
+fn venv_python_compatible(python: &std::path::Path) -> bool {
+    if let Ok(out) = no_window(&mut std::process::Command::new(python).arg("-c").arg("import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")).output() {
+        if out.status.success() {
+            return is_compatible_python(&String::from_utf8_lossy(&out.stdout).trim());
+        }
+    }
+    false
+}
 fn contains_weight(path: &Path) -> bool { fs::read_dir(path).ok().into_iter().flatten().flatten().any(|entry| { let path = entry.path(); if path.is_dir() { contains_weight(&path) } else { matches!(path.extension().and_then(|x| x.to_str()), Some("safetensors" | "bin" | "pt" | "onnx")) } }) }
 fn directory_size(path: &Path) -> u64 { fs::read_dir(path).ok().into_iter().flatten().flatten().map(|entry| { let path = entry.path(); if path.is_dir() { directory_size(&path) } else { entry.metadata().map(|m| m.len()).unwrap_or(0) } }).sum() }
 fn format_bytes(bytes: u64) -> String { if bytes >= 1_073_741_824 { format!("{:.2} GB", bytes as f64 / 1_073_741_824.0) } else { format!("{:.1} MB", bytes as f64 / 1_048_576.0) } }
 
 fn install_ocr(app: &AppHandle, id: &str, python: &Path) -> Result<()> {
     run_cancelable(app, id, Command::new(python).args([
-        "-m", "pip", "install", "--upgrade", "pip", "rapidocr-onnxruntime",
+        "-m", "pip", "install", "--only-binary", ":all:", "--upgrade", "pip", "rapidocr-onnxruntime",
     ]), "安装 RapidOCR 失败", 8, None, None)?;
-    save_status(app, &ModelStatus { id: id.into(), installed: false, downloading: true, progress: 0, stage: "下载识别模型".into(), error: None, size_bytes: directory_size(&models_dir(app)?.join(id)), downloaded_bytes: 0, total_bytes: None, progress_kind: "indeterminate".into(), detail: "首次加载 RapidOCR，正在下载 ONNX 识别模型".into(), verified: false })?;
+    save_status(app, &ModelStatus { id: id.into(), installed: false, downloading: true, progress: 0, stage: "下载识别模型".into(), error: None, size_bytes: directory_size(&models_dir(app)?.join(id)), downloaded_bytes: 0, total_bytes: None, progress_kind: "indeterminate".into(), detail: "正在从 ModelScope 下载 OCR 模型文件".into(), verified: false })?;
     let model_dir = models_dir(app)?.join(id);
     fs::create_dir_all(&model_dir)?;
-    let warmup_script = format!(
-        "import os\nos.environ['RAPIDOCR_HOME'] = r'''{}'''\nfrom rapidocr_onnxruntime import RapidOCR\nengine = RapidOCR()\nprint('redkey-ocr-ready')",
-        model_dir.to_string_lossy()
+    let total_path = models_dir(app)?.join(format!(".{id}.total"));
+    let script = format!(
+        "from modelscope import snapshot_download\nfrom modelscope.hub.api import HubApi\nfiles=HubApi().get_model_files('RapidAI/RapidOCR', recursive=True)\ntotal=sum(int(f.get('Size') or f.get('size') or f.get('FileSize') or f.get('fileSize') or 0) for f in files)\nopen(r'''{}''','w').write(str(total))\nsnapshot_download('RapidAI/RapidOCR', local_dir=r'''{}''')",
+        total_path.to_string_lossy(), model_dir.to_string_lossy()
     );
-    run_cancelable(app, id, Command::new(python).args(["-c", &warmup_script]), "RapidOCR 模型下载失败", 3, Some(&model_dir), None)?;
-    if !contains_weight(&model_dir) { bail!("OCR 模型文件不完整，请重试下载") }
+    run_cancelable(app, id, Command::new(python).args(["-c", &script]), "ModelScope OCR 模型下载失败", 3, Some(&model_dir), Some(&total_path))?;
+    if !contains_weight(&model_dir) { bail!("OCR 模型文件不完整，请检查网络连接后重试下载") }
     health_check_ocr(app, python)?;
     let installed_bytes = directory_size(&model_dir);
     save_status(app, &ModelStatus { id: id.into(), installed: true, downloading: false, progress: 100, stage: "已安装".into(), error: None, size_bytes: installed_bytes, downloaded_bytes: installed_bytes, total_bytes: Some(installed_bytes), progress_kind: "idle".into(), detail: "RapidOCR 识别模型已准备，可离线使用".into(), verified: true })?;
@@ -396,12 +470,7 @@ fn install_ocr(app: &AppHandle, id: &str, python: &Path) -> Result<()> {
 
 fn health_check_ocr(app: &AppHandle, python: &Path) -> Result<()> {
     let worker = crate::ocr::ocr_worker_path(app)?;
-    let output = no_window(&mut Command::new(python).arg(&worker).stdin(Stdio::piped()).stdout(Stdio::piped())).spawn().and_then(|mut child| {
-        child.stdin.as_mut().unwrap().write_all(b"{\"action\":\"health\",\"requestId\":\"install\"}\n{\"action\":\"shutdown\"}\n")?;
-        child.wait_with_output()
-    })?;
-    if !output.status.success() { bail!("OCR worker 健康检查失败") }
-    Ok(())
+    health_check_worker(python, &worker, "OCR worker 健康检查失败")
 }
 
 #[cfg(test)]

@@ -74,7 +74,7 @@ export interface TranscriptSegment { id: string; seq: number; speakerId: string 
 export interface RecordingSpeaker { speakerId: string; displayName: string; sortOrder: number; }
 export interface RecordingDetail { recording: Recording; words: TranscriptWord[]; segments: TranscriptSegment[]; speakers: RecordingSpeaker[]; }
 
-export interface TextCard { id: string; taskId: string; content: string; createdAt: string; updatedAt: string; }
+export interface TextCard { id: string; taskId: string; content: string; source: string; createdAt: string; updatedAt: string; }
 export interface ImageCard { id: string; taskId: string; filename: string; mimeType: string; data: string; content: string; createdAt: string; updatedAt: string; }
 export interface ActionItem { text: string; owner: string | null; due: string | null; }
 export type RecordingSummaryStatus = "pending" | "summarizing" | "completed" | "error" | "stale";

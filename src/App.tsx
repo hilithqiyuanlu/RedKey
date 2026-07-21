@@ -4,7 +4,7 @@ import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import {
   Check, ChevronDown, ChevronRight, CircleAlert, CircleCheck, Clipboard, ClipboardPaste, Download, ExternalLink,
   FileImage, FileText, KeyRound, Link2, ListTodo, LoaderCircle, Mic, MicOff, Pencil,
-  Plus, RefreshCw, RotateCcw, Settings as SettingsIcon, Trash2, UserRound, X,
+  Plus, RefreshCw, RotateCcw, Settings as SettingsIcon, Sparkles, Trash2, UserRound, X,
 } from "lucide-react";
 import { api, onLinkDrop, onModelStatus, onNewTask, onPartialTranscript, onQuickPanelShown, onRecordingToggle, onTaskHud } from "./api";
 import { extractHttpUrl, petState, slotLabel } from "./domain";
@@ -315,6 +315,7 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
   const [linkOpen, setLinkOpen] = useState(false);
   const [editingCardId, setEditingCardId] = useState<string | null>(null);
   const [confirmDeleteTask, setConfirmDeleteTask] = useState(false);
+  const [summarizing, setSummarizing] = useState(false);
   const cards = useMemo(() => [
     ...document.textCards.map((card) => ({ type: "text" as const, createdAt: card.createdAt, card })),
     ...document.imageCards.map((card) => ({ type: "image" as const, createdAt: card.createdAt, card })),
@@ -374,6 +375,16 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
     catch (reason) { notify(String(reason)); }
   }
 
+  async function doSummarize() {
+    setSummarizing(true);
+    try {
+      await api.summarizeTask(task.id);
+      onRefresh();
+      notify("AI 总结已生成");
+    } catch (reason) { notify(String(reason)); }
+    finally { setSummarizing(false); }
+  }
+
   async function completeOrRework() {
     try {
       setSnapshot(await api.setCurrentTask(task.id, false));
@@ -392,7 +403,8 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
       <div className="toolbar-center">
         <IconButton label={activeRecording ? "停止录音" : "创建录音卡"} active={Boolean(activeRecording)} disabled={readOnly} onClick={onToggleRecording}>{activeRecording ? <MicOff /> : <Mic />}</IconButton>
         <IconButton label="创建文本卡" disabled={readOnly} onClick={() => void addTextCard()}><FileText /></IconButton>
-        <IconButton label="创建图片卡" disabled={readOnly} onClick={() => void addImageCard()}><FileImage /></IconButton></div>
+        <IconButton label="创建图片卡" disabled={readOnly} onClick={() => void addImageCard()}><FileImage /></IconButton>
+        <IconButton label="AI 总结" disabled={readOnly || summarizing} onClick={() => void doSummarize()}>{summarizing ? <LoaderCircle /> : <Sparkles />}</IconButton></div>
       <div className="toolbar-side toolbar-right">
         <IconButton label={readOnly ? "返工" : "完成"} onClick={() => void completeOrRework()}>{readOnly ? <RotateCcw /> : <Check />}</IconButton>
         {readOnly && <IconButton danger label="删除任务" onClick={() => setConfirmDeleteTask(true)}><Trash2 /></IconButton>}
@@ -502,7 +514,6 @@ function ContactMenu({ contacts, task, setSnapshot, onClose, notify }: { contact
     <div className="contact-add"><input value={newName} placeholder="新增联系人" onChange={(event) => setNewName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && newName.trim()) void api.addContact(newName).then(setSnapshot).then(() => setNewName("")).catch((reason) => notify(String(reason))); }} /><button type="button" disabled={!newName.trim()} onClick={() => void api.addContact(newName).then(setSnapshot).then(() => setNewName("")).catch((reason) => notify(String(reason)))}><Plus /></button></div>
   </div>;
 }
-
 function CreateContactMenu({ contacts, selectedId, onSelect, setSnapshot, notify }: { contacts: Snapshot["contacts"]; selectedId: string; onSelect: (id: string) => void; setSnapshot: (value: Snapshot) => void; notify: (message: string) => void }) {
   const [open, setOpen] = useState(false);
   const [newName, setNewName] = useState("");
@@ -560,7 +571,7 @@ function TextCardView({ card, readOnly, editing, onEditing, onRefresh, notify }:
     draggable={!editing}
     onDragStart={(event) => { if (editing) { event.preventDefault(); return; } event.dataTransfer.setData("application/redkey-card", JSON.stringify({ type: "text", id: card.id })); event.dataTransfer.effectAllowed = "move"; }}
   >
-    <header onClick={() => !editing && setExpanded((v) => !v)} style={{ cursor: editing ? undefined : "pointer" }}><span>{formatDate(card.createdAt)}</span><div onClick={(e) => e.stopPropagation()}>{!readOnly && <IconButton label="编辑文本" onClick={() => onEditing(editing ? null : card.id)}><Pencil /></IconButton>}{!readOnly && <IconButton danger label="删除文本" onClick={() => setConfirmDelete(true)}><Trash2 /></IconButton>}<IconButton label={expanded ? "收起" : "展开"} onClick={() => setExpanded((v) => !v)}>{expanded ? <ChevronDown /> : <ChevronRight />}</IconButton></div></header>
+    <header onClick={() => !editing && setExpanded((v) => !v)} style={{ cursor: editing ? undefined : "pointer" }}><span>{formatDate(card.createdAt)}</span>{card.source === "ai" && <span className="ai-badge">AI</span>}<div onClick={(e) => e.stopPropagation()}>{!readOnly && <IconButton label="编辑文本" onClick={() => onEditing(editing ? null : card.id)}><Pencil /></IconButton>}{!readOnly && <IconButton danger label="删除文本" onClick={() => setConfirmDelete(true)}><Trash2 /></IconButton>}<IconButton label={expanded ? "收起" : "展开"} onClick={() => setExpanded((v) => !v)}>{expanded ? <ChevronDown /> : <ChevronRight />}</IconButton></div></header>
     {editing && !readOnly ? <textarea autoFocus value={content} placeholder="输入补充信息…" onChange={(event) => setContent(event.target.value)} onBlur={() => onEditing(null)} /> : <p className={content ? "" : "placeholder"} onDoubleClick={() => !readOnly && onEditing(card.id)}>{content || "点击编辑按钮添加文本内容"}</p>}
     {confirmDelete && <ConfirmDialog
       title="删除这张文本卡？"
@@ -577,9 +588,24 @@ function ImageCardView({ card, readOnly, onRefresh, notify }: { card: ImageCard;
   const [expanded, setExpanded] = useState(true);
   const [lightbox, setLightbox] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [content, setContent] = useState(card.content);
+  const [ocrLoading, setOcrLoading] = useState(false);
+  const [ocrModelOk, setOcrModelOk] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const savedRef = useRef(card.content);
   const hasImage = card.data.length > 0;
   const src = hasImage ? `data:${card.mimeType};base64,${card.data}` : "";
+
+  useEffect(() => { setContent(card.content); savedRef.current = card.content; }, [card.id, card.content]);
+  useEffect(() => { void api.modelStatus("RapidOCR").then((status) => setOcrModelOk(status.installed)).catch(() => setOcrModelOk(false)); }, [card.id]);
+
+  // auto-save on edit
+  useEffect(() => {
+    if (!editing || content === savedRef.current) return;
+    const timer = window.setTimeout(() => { void api.updateImageCard(card.id, card.filename, card.mimeType, card.data, content).then(() => { savedRef.current = content; }).catch((reason) => notify(String(reason))); }, 600);
+    return () => window.clearTimeout(timer);
+  }, [content, editing, card.id, card.filename, card.mimeType, card.data, notify]);
 
   function handleFile(file: File) {
     const reader = new FileReader();
@@ -590,15 +616,25 @@ function ImageCardView({ card, readOnly, onRefresh, notify }: { card: ImageCard;
     reader.readAsDataURL(file);
   }
 
+  async function doOcr() {
+    setOcrLoading(true);
+    try { const text = await api.ocrImageCard(card.id); setContent(text); onRefresh(); notify("OCR 识别完成"); }
+    catch (reason) { notify(String(reason)); }
+    finally { setOcrLoading(false); }
+  }
+
+  function startEditing() { if (!readOnly) { setEditing(true); } }
+  function stopEditing() { setEditing(false); }
+
   return <article
     className={`content-card image-card${expanded ? " expanded" : ""}`}
-    draggable
-    onDragStart={(event) => { event.dataTransfer.setData("application/redkey-card", JSON.stringify({ type: "image", id: card.id })); event.dataTransfer.effectAllowed = "move"; }}
+    draggable={!editing}
+    onDragStart={(event) => { if (editing) { event.preventDefault(); return; } event.dataTransfer.setData("application/redkey-card", JSON.stringify({ type: "image", id: card.id })); event.dataTransfer.effectAllowed = "move"; }}
   >
-    <header onClick={() => setExpanded((v) => !v)} style={{ cursor: "pointer" }}><span><FileImage />{hasImage ? card.filename : "图片卡"} · {formatDate(card.createdAt)}</span><div onClick={(e) => e.stopPropagation()}>{!readOnly && <IconButton danger label="删除图片" onClick={() => setConfirmDelete(true)}><Trash2 /></IconButton>}<IconButton label={expanded ? "收起" : "展开"} onClick={() => setExpanded((v) => !v)}>{expanded ? <ChevronDown /> : <ChevronRight />}</IconButton></div></header>
+    <header onClick={() => !editing && setExpanded((v) => !v)} style={{ cursor: editing ? undefined : "pointer" }}><span>{formatDate(card.createdAt)}</span><div onClick={(e) => e.stopPropagation()}>{hasImage && !readOnly && <IconButton label="重新识别文字" disabled={ocrLoading} onClick={() => void doOcr()}>{ocrLoading ? <LoaderCircle /> : <RefreshCw />}</IconButton>}{!readOnly && <IconButton label="编辑文本" onClick={() => editing ? stopEditing() : startEditing()}><Pencil /></IconButton>}{!readOnly && <IconButton danger label="删除图片" onClick={() => setConfirmDelete(true)}><Trash2 /></IconButton>}<IconButton label={expanded ? "收起" : "展开"} onClick={() => !editing && setExpanded((v) => !v)}>{expanded ? <ChevronDown /> : <ChevronRight />}</IconButton></div></header>
     {expanded && (hasImage ? <div className="image-card-body">
       <div className="image-card-thumb" onClick={() => setLightbox(true)}><img src={src} alt={card.filename} /></div>
-      <div className="image-card-text">{card.content || <span className="placeholder">OCR 识别结果将在模型就绪后显示</span>}</div>
+      {editing ? <textarea className="image-card-textarea" autoFocus value={content} placeholder="输入补充信息…" onChange={(event) => setContent(event.target.value)} onBlur={stopEditing} /> : <div className="image-card-text" onDoubleClick={startEditing}>{content || (ocrModelOk ? <span className="placeholder">点击上方刷新按钮进行 OCR 识别</span> : <span className="placeholder">请先安装本地 OCR 模型再点击上方刷新按钮来重新识别</span>)}</div>}
     </div> : <div className="image-card-empty" onClick={() => !readOnly && fileInputRef.current?.click()}>
       <FileImage />
       <p>{card.content || "点击插入图片或用 CTRL + V 直接粘贴图片"}</p>
@@ -644,7 +680,7 @@ function RecordingCard({ recording, summary, activeElapsed, activeLevel, readOnl
     onDragStart={(event) => { event.dataTransfer.setData("application/redkey-card", JSON.stringify({ type: "recording", id: recording.id })); event.dataTransfer.effectAllowed = "move"; }}
   >
     <header onClick={() => setExpanded((value) => !value)}>
-      <div className="recording-meta">{status.tone === "success" ? <><time>{formatDate(recording.createdAt)}</time><span className={`status-badge ${status.tone}`}>{status.loading && <LoaderCircle />}{status.label}</span></> : <><span className={`status-badge ${status.tone}`}>{status.loading && <LoaderCircle />}{status.label}</span><time>{formatDate(recording.createdAt)}</time></>}</div>
+      <div className="recording-meta"><time>{formatDate(recording.createdAt)}</time>{status.tone === "success" ? <span className={`status-badge ${status.tone}`}>{status.loading && <LoaderCircle />}{status.label}</span> : <span className={`status-badge ${status.tone}`}>{status.loading && <LoaderCircle />}{status.label}</span>}</div>
       <div className="recording-actions" onClick={(event) => event.stopPropagation()}>
         {!readOnly && summary && <IconButton label="编辑 AI 总结" onClick={() => setEditing(true)}><Pencil /></IconButton>}
         {!readOnly && <IconButton danger label="删除录音" onClick={() => setConfirmDelete(true)}><Trash2 /></IconButton>}
@@ -701,7 +737,7 @@ function SummaryEditor({ summary, onClose, onSave }: { summary: RecordingSummary
   const [changes, setChanges] = useState(summary.requestedChanges.join("\n"));
   const [questions, setQuestions] = useState(summary.openQuestions.join("\n"));
   const lines = (value: string) => value.split("\n").map((item) => item.trim()).filter(Boolean);
-  return <div className="modal-backdrop"><section className="modal summary-editor"><header><strong>编辑录音总结</strong><IconButton label="关闭" onClick={onClose}><X /></IconButton></header><label>对接结论<textarea value={overview} onChange={(event) => setOverview(event.target.value)} /></label><label>待处理事项<textarea value={pending} onChange={(event) => setPending(event.target.value)} /></label><label>已确认事项<textarea value={decisions} onChange={(event) => setDecisions(event.target.value)} /></label><label>任务变化<textarea value={changes} onChange={(event) => setChanges(event.target.value)} /></label><label>未解决问题<textarea value={questions} onChange={(event) => setQuestions(event.target.value)} /></label><footer><button onClick={onClose}>取消</button><button className="primary" onClick={() => onSave({ ...summary, overview: overview.trim(), pendingItems: lines(pending), confirmedDecisions: lines(decisions), requestedChanges: lines(changes), openQuestions: lines(questions) })}>保存</button></footer></section></div>;
+  return <div className="modal-backdrop" onClick={onClose}><section className="modal summary-editor" onClick={(event) => event.stopPropagation()}><header><strong>编辑录音总结</strong><IconButton label="关闭" onClick={onClose}><X /></IconButton></header><label>对接结论<textarea value={overview} onChange={(event) => setOverview(event.target.value)} /></label><label>待处理事项<textarea value={pending} onChange={(event) => setPending(event.target.value)} /></label><label>已确认事项<textarea value={decisions} onChange={(event) => setDecisions(event.target.value)} /></label><label>任务变化<textarea value={changes} onChange={(event) => setChanges(event.target.value)} /></label><label>未解决问题<textarea value={questions} onChange={(event) => setQuestions(event.target.value)} /></label><footer><button onClick={onClose}>取消</button><button className="primary" onClick={() => onSave({ ...summary, overview: overview.trim(), pendingItems: lines(pending), confirmedDecisions: lines(decisions), requestedChanges: lines(changes), openQuestions: lines(questions) })}>保存</button></footer></section></div>;
 }
 
 function TranscriptTimeline({ detail, fallback }: { detail: RecordingDetail | null; fallback: string }) {
@@ -767,10 +803,10 @@ function CreateTaskDialog({ snapshot, setSnapshot, initialUrl, initialSlot, onCl
     try { onCreated(await api.createTask({ title: title.trim(), titleMode: "title", sourceTitle: sourceTitle ?? title.trim(), url: url.trim(), group: "red", contactId: contactId || null, slot: slot! })); }
     catch (reason) { notify(String(reason)); setSaving(false); }
   }
-  return <div className="modal-backdrop"><form className="modal create-dialog" onSubmit={submit}>
+  return <div className="modal-backdrop" onClick={onClose}><form className="modal create-dialog" onSubmit={(event) => { event.stopPropagation(); submit(event); }} onClick={(event) => event.stopPropagation()}>
     <header><strong>新建</strong><IconButton label="关闭" onClick={onClose}><X /></IconButton></header>
     <label>链接<input autoFocus required value={url} disabled={resolving} onPaste={pasteLink} onChange={(event) => setUrl(event.target.value)} placeholder="https://figma.com/..." /></label>
-    <label>标题<input required maxLength={80} value={title} onChange={(event) => { setTitle(event.target.value); setSourceTitle(null); }} placeholder={resolving ? "正在根据链接生成标题…" : "例如：会员续费改版"} /></label>
+    <label>标题<input required maxLength={80} value={title} onChange={(event) => { setTitle(event.target.value); setSourceTitle(null); }} placeholder={resolving ? "正在根据链接生成标题…" : "根据链接自动生成"} /></label>
     <label>联系人<CreateContactMenu contacts={snapshot.contacts} selectedId={contactId} onSelect={setContactId} setSnapshot={setSnapshot} notify={notify} /></label>
     <div className="slot-blocks">
       <span className="slot-blocks-label">数字键</span>
@@ -808,7 +844,7 @@ function TaskOverflowDialog({ tasks, onResolved, notify }: { tasks: Task[]; onRe
     try { onResolved(await api.resolveTaskOverflow(tasks.filter((task) => selected.has(task.id)).map((task) => task.id))); }
     catch (reason) { notify(String(reason)); setSaving(false); }
   }
-  return <div className="modal-backdrop migration-backdrop"><section className="modal overflow-dialog"><header><div><small>整理</small><strong>选择 10 个进行中任务</strong></div><span>{selected.size}/10</span></header><p>请选择保留在数字键工作区的 10 个任务，其余移至"已完成"。</p><div className="overflow-list">{tasks.map((task) => <label key={task.id} className={selected.has(task.id) ? "selected" : ""}><input type="checkbox" checked={selected.has(task.id)} disabled={!selected.has(task.id) && selected.size >= 10} onChange={() => toggle(task.id)} /><kbd>{slotLabel(task.slot)}</kbd><span><strong>{task.title}</strong><small>{task.contactName || "未指定联系人"} · {formatShortDate(task.lastOpenedAt)}</small></span></label>)}</div><footer><button className="primary" disabled={saving || selected.size !== 10} onClick={() => void resolve()}>{saving ? "整理中" : "完成整理"}</button></footer></section></div>;
+  return <div className="modal-backdrop migration-backdrop"><section className="modal overflow-dialog" onClick={(event) => event.stopPropagation()}><header><div><small>整理</small><strong>选择 10 个进行中任务</strong></div><span>{selected.size}/10</span></header><p>请选择保留在数字键工作区的 10 个任务，其余移至"已完成"。</p><div className="overflow-list">{tasks.map((task) => <label key={task.id} className={selected.has(task.id) ? "selected" : ""}><input type="checkbox" checked={selected.has(task.id)} disabled={!selected.has(task.id) && selected.size >= 10} onChange={() => toggle(task.id)} /><kbd>{slotLabel(task.slot)}</kbd><span><strong>{task.title}</strong><small>{task.contactName || "未指定联系人"} · {formatShortDate(task.lastOpenedAt)}</small></span></label>)}</div><footer><button className="primary" disabled={saving || selected.size !== 10} onClick={() => void resolve()}>{saving ? "整理中" : "完成整理"}</button></footer></section></div>;
 }
 
 function SettingsView({ snapshot, setSnapshot, notify }: { snapshot: Snapshot; setSnapshot: (value: Snapshot) => void; notify: (message: string) => void }) {

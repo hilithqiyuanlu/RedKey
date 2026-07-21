@@ -144,6 +144,7 @@ CREATE TABLE IF NOT EXISTS task_text_cards (
   id TEXT PRIMARY KEY,
   task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
   content TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT 'manual',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -226,6 +227,7 @@ impl Database {
                id TEXT PRIMARY KEY,
                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
                content TEXT NOT NULL DEFAULT '',
+               source TEXT NOT NULL DEFAULT 'manual',
                created_at TEXT NOT NULL,
                updated_at TEXT NOT NULL
              );
@@ -307,6 +309,10 @@ impl Database {
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('task_image_cards') WHERE name='content')", [], |row| row.get(0),
         )?;
         if !image_content_exists { self.conn.execute("ALTER TABLE task_image_cards ADD COLUMN content TEXT NOT NULL DEFAULT ''", [])?; }
+        let text_card_source: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('task_text_cards') WHERE name='source')", [], |row| row.get(0),
+        )?;
+        if !text_card_source { self.conn.execute("ALTER TABLE task_text_cards ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'", [])?; }
         self.conn.execute(
             "UPDATE tasks SET color='blue' WHERE color IS NULL OR color NOT IN ('blue','green','purple','amber','red')",
             [],
@@ -550,8 +556,8 @@ impl Database {
     pub fn task_document(&self, task_id: &str) -> Result<TaskDocument> {
         let task = self.list_tasks()?.into_iter().find(|task| task.id == task_id).context("任务不存在")?;
         let text_cards = {
-            let mut statement = self.conn.prepare("SELECT id,task_id,content,created_at,updated_at FROM task_text_cards WHERE task_id=?1 ORDER BY created_at DESC")?;
-            let cards = statement.query_map([task_id], |row| Ok(TextCard { id: row.get(0)?, task_id: row.get(1)?, content: row.get(2)?, created_at: row.get(3)?, updated_at: row.get(4)? }))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut statement = self.conn.prepare("SELECT id,task_id,content,source,created_at,updated_at FROM task_text_cards WHERE task_id=?1 ORDER BY created_at DESC")?;
+            let cards = statement.query_map([task_id], |row| Ok(TextCard { id: row.get(0)?, task_id: row.get(1)?, content: row.get(2)?, source: row.get(3)?, created_at: row.get(4)?, updated_at: row.get(5)? }))?.collect::<rusqlite::Result<Vec<_>>>()?;
             cards
         };
         let image_cards = {
@@ -579,12 +585,12 @@ impl Database {
         Ok(())
     }
 
-    pub fn create_text_card(&self, task_id: &str) -> Result<TextCard> {
+    pub fn create_text_card(&self, task_id: &str, source: &str) -> Result<TextCard> {
         self.ensure_active_task(task_id)?;
         let id = Uuid::new_v4().to_string();
         let timestamp = now();
-        self.conn.execute("INSERT INTO task_text_cards(id,task_id,content,created_at,updated_at) VALUES(?1,?2,'',?3,?3)", params![id, task_id, timestamp])?;
-        Ok(TextCard { id, task_id: task_id.into(), content: String::new(), created_at: timestamp.clone(), updated_at: timestamp })
+        self.conn.execute("INSERT INTO task_text_cards(id,task_id,content,source,created_at,updated_at) VALUES(?1,?2,'',?3,?4,?4)", params![id, task_id, source, timestamp])?;
+        Ok(TextCard { id, task_id: task_id.into(), content: String::new(), source: source.into(), created_at: timestamp.clone(), updated_at: timestamp })
     }
 
     pub fn update_text_card(&self, card_id: &str, content: &str) -> Result<()> {
@@ -630,6 +636,17 @@ impl Database {
         self.ensure_active_task(&task_id)?;
         self.conn.execute("UPDATE task_image_cards SET filename=?2,mime_type=?3,data=?4,content=?5,updated_at=?6 WHERE id=?1", params![card_id, filename, mime_type, data, content, now()])?;
         Ok(())
+    }
+
+    pub fn get_image_card(&self, card_id: &str) -> Result<ImageCard> {
+        self.conn.query_row(
+            "SELECT id,task_id,filename,mime_type,data,content,created_at,updated_at FROM task_image_cards WHERE id=?1",
+            [card_id],
+            |row| Ok(ImageCard {
+                id: row.get(0)?, task_id: row.get(1)?, filename: row.get(2)?, mime_type: row.get(3)?,
+                data: row.get(4)?, content: row.get(5)?, created_at: row.get(6)?, updated_at: row.get(7)?,
+            }),
+        ).context("图片卡不存在")
     }
 
     pub fn delete_image_card(&self, card_id: &str) -> Result<()> {
@@ -735,9 +752,7 @@ impl Database {
             "INSERT INTO settings(key, value) VALUES('app_settings', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             [serde_json::to_string(settings)?],
         )?;
-        if previous.multi_group_enabled != settings.multi_group_enabled {
-            Self::set_current_group_tx(&tx, "red")?;
-        } else if !settings.multi_group_enabled {
+        if previous.multi_group_enabled != settings.multi_group_enabled || !settings.multi_group_enabled {
             Self::set_current_group_tx(&tx, "red")?;
         }
         tx.commit()?;
@@ -1411,7 +1426,7 @@ fn now() -> String {
     Utc::now().to_rfc3339()
 }
 
-fn transcript_hash(text: &str) -> String {
+pub fn transcript_hash(text: &str) -> String {
     let mut hasher = DefaultHasher::new();
     text.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
@@ -1811,7 +1826,7 @@ mod tests {
         let mut db = Database::memory().unwrap();
         db.create_task(sample_task(0)).unwrap();
         let task_id = db.snapshot().unwrap().tasks[0].id.clone();
-        let card = db.create_text_card(&task_id).unwrap();
+        let card = db.create_text_card(&task_id, "manual").unwrap();
         db.update_text_card(&card.id, "补充异常状态").unwrap();
         let recording_id = db.start_recording(Some(&task_id)).unwrap();
         db.finish_recording(&recording_id, 2.0, "/tmp/test.wav").unwrap();
@@ -1830,7 +1845,7 @@ mod tests {
         db.create_task(sample_task(0)).unwrap();
         let task_id = db.snapshot().unwrap().tasks[0].id.clone();
         db.dispatch(&AppAction::CompleteCurrent).unwrap();
-        assert!(db.create_text_card(&task_id).is_err());
+        assert!(db.create_text_card(&task_id, "manual").is_err());
     }
 
     #[test]

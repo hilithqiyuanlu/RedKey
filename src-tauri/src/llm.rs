@@ -1,3 +1,4 @@
+use crate::db::transcript_hash;
 use crate::models::{ActionItem, DeepSeekSettings, RecordingSummary, TaskDocument};
 use crate::no_window;
 use anyhow::{anyhow, Context, Result};
@@ -5,7 +6,6 @@ use chrono::Utc;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::process::Command;
 use std::time::Duration;
 
@@ -101,19 +101,30 @@ fn client() -> Result<Client> {
 }
 
 async fn chat(system: &str, user: &str) -> Result<String> {
+    chat_with_format(system, user, Some(json!({"type": "json_object"}))).await
+}
+
+async fn chat_text(system: &str, user: &str) -> Result<String> {
+    chat_with_format(system, user, None).await
+}
+
+async fn chat_with_format(system: &str, user: &str, response_format: Option<Value>) -> Result<String> {
+    let mut body = json!({
+        "model": MODEL,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        "temperature": 0.2,
+    });
+    if let Some(format) = response_format {
+        body["response_format"] = format;
+    }
     let response = client()?.post("https://api.deepseek.com/chat/completions")
         .bearer_auth(api_key()?)
-        .json(&json!({
-            "model": MODEL,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            "temperature": 0.2,
-            "response_format": {"type": "json_object"}
-        }))
+        .json(&body)
         .send().await.context("DeepSeek 请求失败")?;
     let status = response.status();
-    let body = response.text().await.context("读取 DeepSeek 响应失败")?;
-    anyhow::ensure!(status.is_success(), "DeepSeek 返回 HTTP {}：{}", status.as_u16(), body.chars().take(500).collect::<String>());
-    let value: ChatResponse = serde_json::from_str(&body).context("DeepSeek 返回格式无效")?;
+    let body_text = response.text().await.context("读取 DeepSeek 响应失败")?;
+    anyhow::ensure!(status.is_success(), "DeepSeek 返回 HTTP {}：{}", status.as_u16(), body_text.chars().take(500).collect::<String>());
+    let value: ChatResponse = serde_json::from_str(&body_text).context("DeepSeek 返回格式无效")?;
     value.choices.into_iter().next().map(|choice| choice.message.content).filter(|content| !content.trim().is_empty()).ok_or_else(|| anyhow!("DeepSeek 没有返回内容"))
 }
 
@@ -134,12 +145,6 @@ fn action_items(value: Option<&Value>) -> Vec<ActionItem> {
         if text.is_empty() { return None; }
         Some(ActionItem { text, owner: item.get("owner").and_then(Value::as_str).map(str::to_owned), due: item.get("due").and_then(Value::as_str).map(str::to_owned) })
     }).take(20).collect()).unwrap_or_default()
-}
-
-fn transcript_hash(text: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    text.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
 }
 
 pub async fn summarize(document: &TaskDocument, recording_id: &str) -> Result<RecordingSummary> {
@@ -168,6 +173,83 @@ pub async fn summarize(document: &TaskDocument, recording_id: &str) -> Result<Re
         user_edited: false,
         updated_at: now,
     })
+}
+
+pub async fn summarize_task(document: &TaskDocument) -> Result<String> {
+    let contact = document.task.contact_name.as_deref().unwrap_or("未指定");
+    let mut context = String::new();
+
+    // 录音总结
+    for summary in &document.summaries {
+        if summary.status != "completed" || summary.overview.trim().is_empty() { continue; }
+        context.push_str("--- 对接结论 ---\n");
+        context.push_str(&summary.overview);
+        context.push('\n');
+        if !summary.pending_items.is_empty() {
+            context.push_str("待处理：\n");
+            for item in &summary.pending_items { context.push_str(&format!("- {}\n", item)); }
+        }
+        if !summary.confirmed_decisions.is_empty() {
+            context.push_str("已确认：\n");
+            for item in &summary.confirmed_decisions { context.push_str(&format!("- {}\n", item)); }
+        }
+        if !summary.open_questions.is_empty() {
+            context.push_str("未解决：\n");
+            for item in &summary.open_questions { context.push_str(&format!("- {}\n", item)); }
+        }
+        if !summary.action_items.is_empty() {
+            context.push_str("行动项：\n");
+            for item in &summary.action_items {
+                let owner = item.owner.as_deref().map(|o| format!(" ({})", o)).unwrap_or_default();
+                let due = item.due.as_deref().map(|d| format!(" 截止 {}", d)).unwrap_or_default();
+                context.push_str(&format!("- {}{}{}\n", item.text, owner, due));
+            }
+        }
+        context.push('\n');
+    }
+
+    // 文本卡
+    let text_contents: Vec<&str> = document.text_cards.iter()
+        .map(|card| card.content.as_str())
+        .filter(|content| !content.trim().is_empty())
+        .collect();
+    if !text_contents.is_empty() {
+        context.push_str("--- 文本笔记 ---\n");
+        for (i, content) in text_contents.iter().enumerate() {
+            context.push_str(&format!("笔记{}：{}\n", i + 1, content));
+        }
+        context.push('\n');
+    }
+
+    // 图片卡 OCR
+    let ocr_contents: Vec<&str> = document.image_cards.iter()
+        .filter(|card| !card.data.is_empty())
+        .map(|card| card.content.as_str())
+        .filter(|content| !content.trim().is_empty() && !content.contains("点击插入图片") && !content.contains("CTRL"))
+        .collect();
+    if !ocr_contents.is_empty() {
+        context.push_str("--- OCR 图片文字 ---\n");
+        for (i, content) in ocr_contents.iter().enumerate() {
+            context.push_str(&format!("图片{}：{}\n", i + 1, content));
+        }
+        context.push('\n');
+    }
+
+    let system = r#"你是一个需求对接整理助手。根据提供的任务上下文，生成一份简洁的任务状态总结。
+规则：
+1. 只根据提供的材料总结，不猜测或编造信息
+2. 哪些方面有信息就写哪些，没有信息的方面完全不提（不要写"无"或"暂无"）
+3. 用自然语言段落，不要用 JSON
+4. 建议的结构（按需选用，跳过没有内容的板块）：
+   - 当前状态：一句话概括任务进展
+   - 对接结论：最近确认了什么
+   - 待处理事项：还有什么事要做
+   - 未解决问题：有哪些悬而未决的问题
+   - 备注/补充：从笔记或图片中提取的关键补充信息
+5. 保持简洁，避免重复"#;
+
+    let user = format!("需求标题：{}\n联系人：{}\n\n上下文信息：\n{}", document.task.title, contact, context);
+    chat_text(system, &user).await
 }
 
 pub async fn test_connection() -> Result<()> {

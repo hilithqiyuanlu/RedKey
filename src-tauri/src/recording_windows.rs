@@ -20,7 +20,6 @@ pub struct NativeRecording {
     pub id: String,
     pub path: PathBuf,
     pub started: std::time::Instant,
-    _stop_sender: mpsc::Sender<()>,
     stream: Option<cpal::Stream>,
     writer_tx: mpsc::Sender<WriterMessage>,
     writer_thread: Option<std::thread::JoinHandle<Result<()>>>,
@@ -70,7 +69,6 @@ pub fn start_recording(id: String, path: PathBuf) -> Result<NativeRecording> {
     let buf_writer = BufWriter::new(file);
     let writer = WavWriter::new(buf_writer, spec)?;
     let running = Arc::new(AtomicBool::new(true));
-    let (_stop_sender, _stop_receiver) = mpsc::channel::<()>();
 
     let (writer_tx, writer_rx) = mpsc::channel::<WriterMessage>();
     let writer_thread = std::thread::spawn(move || -> Result<()> {
@@ -144,7 +142,6 @@ pub fn start_recording(id: String, path: PathBuf) -> Result<NativeRecording> {
         id,
         path,
         started: std::time::Instant::now(),
-        _stop_sender,
         stream: Some(stream),
         writer_tx,
         writer_thread: Some(writer_thread),

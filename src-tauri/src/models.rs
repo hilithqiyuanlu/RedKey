@@ -130,9 +130,13 @@ pub struct TextCard {
     pub id: String,
     pub task_id: String,
     pub content: String,
+    #[serde(default = "default_text_card_source")]
+    pub source: String,
     pub created_at: String,
     pub updated_at: String,
 }
+
+fn default_text_card_source() -> String { "manual".into() }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]

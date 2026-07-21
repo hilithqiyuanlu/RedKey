@@ -437,26 +437,26 @@ fn smooth_short_speaker_fragments(mut segments: Vec<TranscriptSegment>) -> Vec<T
     segments
 }
 
-fn show_console_window(app: &AppHandle) -> Result<()> {
+fn show_and_focus_window(app: &AppHandle, label: &str) -> Result<tauri::WebviewWindow> {
     let window = app
-        .get_webview_window("console")
-        .context("控制台窗口不存在")?;
+        .get_webview_window(label)
+        .context(format!("{label} 窗口不存在"))?;
     window.show()?;
     window.unminimize()?;
     window.set_focus()?;
+    Ok(window)
+}
+
+fn show_console_window(app: &AppHandle) -> Result<()> {
+    show_and_focus_window(app, "console")?;
     Ok(())
 }
 
 fn show_settings_window(app: &AppHandle) -> Result<()> {
-    let window = app
-        .get_webview_window("console")
-        .context("控制台窗口不存在")?;
+    let window = show_and_focus_window(app, "console")?;
     let mut url = window.url()?;
     url.set_query(Some("view=settings"));
     window.navigate(url)?;
-    window.show()?;
-    window.unminimize()?;
-    window.set_focus()?;
     Ok(())
 }
 
@@ -878,7 +878,7 @@ fn get_task_document(app: AppHandle, task_id: String) -> Result<TaskDocument, St
 
 #[tauri::command]
 fn create_text_card(app: AppHandle, task_id: String) -> Result<TextCard, String> {
-    let card = app.state::<RuntimeState>().db().create_text_card(&task_id).map_err(err)?;
+    let card = app.state::<RuntimeState>().db().create_text_card(&task_id, "manual").map_err(err)?;
     let _ = emit_snapshot(&app);
     Ok(card)
 }
@@ -906,10 +906,10 @@ fn paste_text_card(app: AppHandle, task_id: String) -> Result<TextCard, String> 
     let text = app.clipboard().read_text().map_err(err)?.trim().to_string();
     if text.is_empty() { return Err("剪切板为空".into()); }
     if text.chars().count() > 50_000 { return Err("剪切板文本过长".into()); }
-    let card = app.state::<RuntimeState>().db().create_text_card(&task_id).map_err(err)?;
+    let card = app.state::<RuntimeState>().db().create_text_card(&task_id, "manual").map_err(err)?;
     app.state::<RuntimeState>().db().update_text_card(&card.id, &text).map_err(err)?;
     let timestamp = chrono::Utc::now().to_rfc3339();
-    let card = TextCard { id: card.id, task_id: card.task_id, content: text, created_at: timestamp.clone(), updated_at: timestamp };
+    let card = TextCard { id: card.id, task_id: card.task_id, content: text, source: "manual".into(), created_at: timestamp.clone(), updated_at: timestamp };
     let _ = emit_snapshot(&app);
     Ok(card)
 }
@@ -926,6 +926,22 @@ fn update_image_card(app: AppHandle, card_id: String, filename: String, mime_typ
     app.state::<RuntimeState>().db().update_image_card(&card_id, &filename, &mime_type, &data, &content).map_err(err)?;
     let _ = emit_snapshot(&app);
     Ok(())
+}
+
+#[tauri::command]
+fn ocr_image_card(app: AppHandle, card_id: String) -> Result<String, String> {
+    use base64::Engine;
+    let card = app.state::<RuntimeState>().db().get_image_card(&card_id).map_err(err)?;
+    if card.data.is_empty() { return Err("图片卡还没有图片".into()); }
+    let bytes = base64::engine::general_purpose::STANDARD.decode(&card.data).map_err(|e| format!("图片数据解码失败：{e}"))?;
+    let ext = if card.mime_type == "image/png" { "png" } else { "jpg" };
+    let tmp = std::env::temp_dir().join(format!("redkey_ocr_{}.{}", card.id, ext));
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("写入临时文件失败：{e}"))?;
+    let text = crate::ocr::OcrWorker::start(&app).and_then(|mut worker| worker.ocr(&tmp)).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&tmp);
+    app.state::<RuntimeState>().db().update_image_card(&card.id, &card.filename, &card.mime_type, &card.data, &text).map_err(err)?;
+    let _ = emit_snapshot(&app);
+    Ok(text)
 }
 
 #[tauri::command]
@@ -1001,6 +1017,16 @@ fn delete_deepseek_api_key() -> Result<DeepSeekSettings, String> {
 
 #[tauri::command]
 async fn test_deepseek_connection() -> Result<(), String> { llm::test_connection().await.map_err(err) }
+
+#[tauri::command]
+async fn summarize_task(app: AppHandle, task_id: String) -> Result<TextCard, String> {
+    let document = app.state::<RuntimeState>().db().task_document(&task_id).map_err(err)?;
+    let summary = llm::summarize_task(&document).await.map_err(err)?;
+    let card = app.state::<RuntimeState>().db().create_text_card(&task_id, "ai").map_err(err)?;
+    app.state::<RuntimeState>().db().update_text_card(&card.id, &summary).map_err(err)?;
+    let _ = emit_snapshot(&app);
+    Ok(TextCard { content: summary, ..card })
+}
 
 #[tauri::command]
 fn summarize_recording(app: AppHandle, recording_id: String) -> Result<(), String> {
@@ -1279,17 +1305,29 @@ async fn request_microphone_permission() -> Result<bool, String> {
     Ok(true)
 }
 
+fn prepare_native_recording(app: &AppHandle) -> Result<(String, std::path::PathBuf), String> {
+    if app.state::<RuntimeState>().native_recording.lock().is_some() { return Err("已经在录音".into()); }
+    let id = start_recording(app.clone())?;
+    let dir = app.path().app_data_dir().map_err(err)?.join("recordings");
+    std::fs::create_dir_all(&dir).map_err(err)?;
+    let path = dir.join(format!("{id}.wav"));
+    Ok((id, path))
+}
+
+fn finalize_native_recording(app: &AppHandle, recording: NativeRecording) -> String {
+    let id = recording.id.clone();
+    *app.state::<RuntimeState>().native_recording.lock() = Some(recording);
+    update_tray_recording_text(app);
+    id
+}
+
 #[tauri::command]
 fn start_native_recording(app: AppHandle) -> Result<String, String> {
     #[cfg(not(any(target_os = "macos", windows)))]
     { return Err("当前版本的原生录音暂只支持 macOS 和 Windows".into()); }
     #[cfg(target_os = "macos")]
     {
-        if app.state::<RuntimeState>().native_recording.lock().is_some() { return Err("已经在录音".into()); }
-        let id = start_recording(app.clone())?;
-        let dir = app.path().app_data_dir().map_err(err)?.join("recordings");
-        std::fs::create_dir_all(&dir).map_err(err)?;
-        let path = dir.join(format!("{id}.wav"));
+        let (id, path) = prepare_native_recording(&app)?;
         let mut child = match Command::new(env!("REDKEY_AUDIO_HELPER")).arg(&path).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -1307,17 +1345,11 @@ fn start_native_recording(app: AppHandle) -> Result<String, String> {
             app.state::<RuntimeState>().db().fail_recording(&id, "无法启动系统麦克风").map_err(err)?;
             return Err("无法启动系统麦克风，请检查麦克风权限".into());
         }
-        *app.state::<RuntimeState>().native_recording.lock() = Some(NativeRecording { id: id.clone(), path, started: std::time::Instant::now(), child, input });
-        update_tray_recording_text(&app);
-        Ok(id)
+        Ok(finalize_native_recording(&app, NativeRecording { id: id.clone(), path, started: std::time::Instant::now(), child, input }))
     }
     #[cfg(windows)]
     {
-        if app.state::<RuntimeState>().native_recording.lock().is_some() { return Err("已经在录音".into()); }
-        let id = start_recording(app.clone())?;
-        let dir = app.path().app_data_dir().map_err(err)?.join("recordings");
-        std::fs::create_dir_all(&dir).map_err(err)?;
-        let path = dir.join(format!("{id}.wav"));
+        let (id, path) = prepare_native_recording(&app)?;
         let recording = match recording_windows::start_recording(id.clone(), path.clone()) {
             Ok(r) => r,
             Err(e) => {
@@ -1325,9 +1357,7 @@ fn start_native_recording(app: AppHandle) -> Result<String, String> {
                 return Err(format!("麦克风启动失败：{e}"));
             }
         };
-        *app.state::<RuntimeState>().native_recording.lock() = Some(recording);
-        update_tray_recording_text(&app);
-        Ok(id)
+        Ok(finalize_native_recording(&app, recording))
     }
 }
 
@@ -1465,8 +1495,7 @@ fn reveal_model_dir(app: AppHandle, model_id: String) -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        std::process::Command::new("explorer").arg(&dir).creation_flags(0x08000000).spawn().map_err(|e| e.to_string())?;
+        no_window(&mut std::process::Command::new("explorer").arg(&dir)).spawn().map_err(|e| e.to_string())?;
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -1680,6 +1709,7 @@ pub fn run() {
             paste_text_card,
             create_image_card,
             update_image_card,
+            ocr_image_card,
             delete_image_card,
             reassign_image_card,
             update_task_title,
@@ -1692,6 +1722,7 @@ pub fn run() {
             save_deepseek_api_key,
             delete_deepseek_api_key,
             test_deepseek_connection,
+            summarize_task,
             summarize_recording,
             retry_recording_summary,
             update_recording_summary,

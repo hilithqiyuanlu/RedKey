@@ -61,7 +61,7 @@
         "transparent": true,
         "backgroundColor": "#00000000",
         "alwaysOnTop": true,
-        "focusable": true,
+        "focusable": false,
         "skipTaskbar": true,
         "resizable": false,
         "shadow": false
