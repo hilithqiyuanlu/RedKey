@@ -36,6 +36,7 @@ export interface Settings {
   autostart: boolean;
   petVisible: boolean;
   multiGroupEnabled: boolean;
+  cloudApiEnabled: boolean;
   shortcuts: ShortcutSettings;
 }
 

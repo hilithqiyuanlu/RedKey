@@ -147,6 +147,16 @@ fn action_items(value: Option<&Value>) -> Vec<ActionItem> {
     }).take(20).collect()).unwrap_or_default()
 }
 
+pub fn recording_summary_prompt(document: &TaskDocument, recording_id: &str) -> Result<String> {
+    let recording = document.recordings.iter().find(|recording| recording.id == recording_id).context("录音记录不存在")?;
+    let transcript = if !recording.transcript.trim().is_empty() { recording.transcript.as_str() } else { recording.raw_transcript.as_str() };
+    anyhow::ensure!(!transcript.trim().is_empty(), "没有可用于梳理的转写内容");
+    let contact = document.task.contact_name.as_deref().unwrap_or("未指定");
+    let system = r#"你是一个需求对接记录整理助手。你只能根据提供的对话转写提取明确事实，不能分析或猜测 Figma、策划案或未提供的文档内容。把不确定的信息放入 openQuestions。只返回 JSON，不要 Markdown，不要额外解释。字段必须为：overview(string)、pendingItems(string[])、confirmedDecisions(string[])、requestedChanges(string[])、actionItems(array of {text:string,owner:string|null,due:string|null})、openQuestions(string[])。pendingItems 只保留简短、可执行或需要确认的事项，用于卡片收起状态。没有内容时返回空数组。"#;
+    let user = format!("需求标题：{}\n联系人：{}\n录音 ID：{}\n\n最终转写：\n{}", document.task.title, contact, recording_id, transcript);
+    Ok(format!("系统提示：{}\n\n用户输入：{}", system, user))
+}
+
 pub async fn summarize(document: &TaskDocument, recording_id: &str) -> Result<RecordingSummary> {
     let recording = document.recordings.iter().find(|recording| recording.id == recording_id).context("录音记录不存在")?;
     let transcript = if !recording.transcript.trim().is_empty() { recording.transcript.as_str() } else { recording.raw_transcript.as_str() };
@@ -173,6 +183,80 @@ pub async fn summarize(document: &TaskDocument, recording_id: &str) -> Result<Re
         user_edited: false,
         updated_at: now,
     })
+}
+
+pub fn task_summary_prompt(document: &TaskDocument) -> Result<String> {
+    let contact = document.task.contact_name.as_deref().unwrap_or("未指定");
+    let mut context = String::new();
+
+    for summary in &document.summaries {
+        if summary.status != "completed" || summary.overview.trim().is_empty() { continue; }
+        context.push_str("--- 对接结论 ---\n");
+        context.push_str(&summary.overview);
+        context.push('\n');
+        if !summary.pending_items.is_empty() {
+            context.push_str("待处理：\n");
+            for item in &summary.pending_items { context.push_str(&format!("- {}\n", item)); }
+        }
+        if !summary.confirmed_decisions.is_empty() {
+            context.push_str("已确认：\n");
+            for item in &summary.confirmed_decisions { context.push_str(&format!("- {}\n", item)); }
+        }
+        if !summary.open_questions.is_empty() {
+            context.push_str("未解决：\n");
+            for item in &summary.open_questions { context.push_str(&format!("- {}\n", item)); }
+        }
+        if !summary.action_items.is_empty() {
+            context.push_str("行动项：\n");
+            for item in &summary.action_items {
+                let owner = item.owner.as_deref().map(|o| format!(" ({})", o)).unwrap_or_default();
+                let due = item.due.as_deref().map(|d| format!(" 截止 {}", d)).unwrap_or_default();
+                context.push_str(&format!("- {}{}{}\n", item.text, owner, due));
+            }
+        }
+        context.push('\n');
+    }
+
+    let text_contents: Vec<&str> = document.text_cards.iter()
+        .map(|card| card.content.as_str())
+        .filter(|content| !content.trim().is_empty())
+        .collect();
+    if !text_contents.is_empty() {
+        context.push_str("--- 文本笔记 ---\n");
+        for (i, content) in text_contents.iter().enumerate() {
+            context.push_str(&format!("笔记{}：{}\n", i + 1, content));
+        }
+        context.push('\n');
+    }
+
+    let ocr_contents: Vec<&str> = document.image_cards.iter()
+        .filter(|card| !card.data.is_empty())
+        .map(|card| card.content.as_str())
+        .filter(|content| !content.trim().is_empty() && !content.contains("点击插入图片") && !content.contains("CTRL"))
+        .collect();
+    if !ocr_contents.is_empty() {
+        context.push_str("--- OCR 图片文字 ---\n");
+        for (i, content) in ocr_contents.iter().enumerate() {
+            context.push_str(&format!("图片{}：{}\n", i + 1, content));
+        }
+        context.push('\n');
+    }
+
+    let system = r#"你是一个需求对接整理助手。根据提供的任务上下文，生成一份简洁的任务状态总结。
+规则：
+1. 只根据提供的材料总结，不猜测或编造信息
+2. 哪些方面有信息就写哪些，没有信息的方面完全不提（不要写"无"或"暂无"）
+3. 用自然语言段落，不要用 JSON
+4. 建议的结构（按需选用，跳过没有内容的板块）：
+   - 当前状态：一句话概括任务进展
+   - 对接结论：最近确认了什么
+   - 待处理事项：还有什么事要做
+   - 未解决问题：有哪些悬而未决的问题
+   - 备注/补充：从笔记或图片中提取的关键补充信息
+5. 保持简洁，避免重复"#;
+
+    let user = format!("需求标题：{}\n联系人：{}\n\n上下文信息：\n{}", document.task.title, contact, context);
+    Ok(format!("系统提示：{}\n\n用户输入：{}", system, user))
 }
 
 pub async fn summarize_task(document: &TaskDocument) -> Result<String> {

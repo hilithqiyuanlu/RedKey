@@ -1038,6 +1038,18 @@ fn summarize_recording(app: AppHandle, recording_id: String) -> Result<(), Strin
 }
 
 #[tauri::command]
+fn get_task_summary_prompt(app: AppHandle, task_id: String) -> Result<String, String> {
+    let document = app.state::<RuntimeState>().db().task_document(&task_id).map_err(err)?;
+    llm::task_summary_prompt(&document).map_err(err)
+}
+
+#[tauri::command]
+fn get_recording_summary_prompt(app: AppHandle, recording_id: String) -> Result<String, String> {
+    let document = app.state::<RuntimeState>().db().task_document_for_recording(&recording_id).map_err(err)?;
+    llm::recording_summary_prompt(&document, &recording_id).map_err(err)
+}
+
+#[tauri::command]
 fn retry_recording_summary(app: AppHandle, recording_id: String) -> Result<(), String> { summarize_recording(app, recording_id) }
 
 #[tauri::command]
@@ -1730,6 +1742,8 @@ pub fn run() {
             summarize_recording,
             retry_recording_summary,
             update_recording_summary,
+            get_task_summary_prompt,
+            get_recording_summary_prompt,
             keyboard_listener_status,
             create_task,
             update_task,

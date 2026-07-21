@@ -30,6 +30,7 @@ const EMPTY: Snapshot = {
     autostart: true,
     petVisible: true,
     multiGroupEnabled: false,
+    cloudApiEnabled: true,
     shortcuts: {
       taskPrefix: "Control+Alt",
     },
@@ -100,6 +101,8 @@ export const api = {
   summarizeRecording: (recordingId: string) => invoke<void>("summarize_recording", { recordingId }),
   summarizeTask: (taskId: string) => invoke<TextCard>("summarize_task", { taskId }),
   retryRecordingSummary: (recordingId: string) => invoke<void>("retry_recording_summary", { recordingId }),
+  getTaskSummaryPrompt: (taskId: string) => invoke<string>("get_task_summary_prompt", { taskId }),
+  getRecordingSummaryPrompt: (recordingId: string) => invoke<string>("get_recording_summary_prompt", { recordingId }),
   updateRecordingSummary: (recordingId: string, summary: RecordingSummary) => invoke<void>("update_recording_summary", { recordingId, summary }),
   modelStatus: (modelId: string) => invoke<ModelStatus>("model_status", { modelId }),
   downloadModel: (modelId: string) => invoke<void>("download_model", { modelId }),

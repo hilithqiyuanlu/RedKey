@@ -366,6 +366,14 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
   }
 
   async function doSummarize() {
+    if (!snapshot.settings.cloudApiEnabled) {
+      try {
+        const prompt = await api.getTaskSummaryPrompt(task.id);
+        await writeText(prompt);
+        notify("Prompt 已复制到剪贴板");
+      } catch (reason) { notify(String(reason)); }
+      return;
+    }
     setSummarizing(true);
     try {
       await api.summarizeTask(task.id);
@@ -410,7 +418,7 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
       </div>
       <div className="document-rule" />
       <div className="document-stream">
-        {cards.length ? cards.map((item) => item.type === "text" ? <TextCardView key={item.card.id} card={item.card} readOnly={readOnly} editing={editingCardId === item.card.id} onEditing={setEditingCardId} onRefresh={onRefresh} notify={notify} /> : item.type === "image" ? <ImageCardView key={item.card.id} card={item.card} readOnly={readOnly} onRefresh={onRefresh} notify={notify} /> : <RecordingCard key={item.recording.id} recording={item.recording} summary={document.summaries.find((summary) => summary.recordingId === item.recording.id) ?? null} activeElapsed={recordingElapsed} activeLevel={recordingLevel} readOnly={readOnly} onStop={onToggleRecording} onRefresh={onRefresh} notify={notify} />) : <div className="empty-stream"><FileText /><strong>还没有内容</strong><span>通过工具栏添加文本或开始录音。</span><div className="empty-stream-actions">{!readOnly && <><button className="primary" onClick={() => void addTextCard()}><FileText />添加文本</button><button onClick={onToggleRecording}><Mic />开始录音</button></>}</div></div>}
+        {cards.length ? cards.map((item) => item.type === "text" ? <TextCardView key={item.card.id} card={item.card} readOnly={readOnly} editing={editingCardId === item.card.id} onEditing={setEditingCardId} onRefresh={onRefresh} notify={notify} /> : item.type === "image" ? <ImageCardView key={item.card.id} card={item.card} readOnly={readOnly} onRefresh={onRefresh} notify={notify} /> : <RecordingCard key={item.recording.id} recording={item.recording} summary={document.summaries.find((summary) => summary.recordingId === item.recording.id) ?? null} activeElapsed={recordingElapsed} activeLevel={recordingLevel} readOnly={readOnly} onStop={onToggleRecording} onRefresh={onRefresh} notify={notify} snapshot={snapshot} />) : <div className="empty-stream"><FileText /><strong>还没有内容</strong><span>通过工具栏添加文本或开始录音。</span><div className="empty-stream-actions">{!readOnly && <><button className="primary" onClick={() => void addTextCard()}><FileText />添加文本</button><button onClick={onToggleRecording}><Mic />开始录音</button></>}</div></div>}
       </div>
     </section>
     {confirmDeleteTask && <ConfirmDialog
@@ -643,7 +651,7 @@ function ImageCardView({ card, readOnly, onRefresh, notify }: { card: ImageCard;
   </article>;
 }
 
-function RecordingCard({ recording, summary, activeElapsed, activeLevel, readOnly, onStop, onRefresh, notify }: { recording: Recording; summary: RecordingSummary | null; activeElapsed: number; activeLevel: number; readOnly: boolean; onStop: () => void; onRefresh: () => void; notify: (message: string) => void }) {
+function RecordingCard({ recording, summary, activeElapsed, activeLevel, readOnly, onStop, onRefresh, notify, snapshot }: { recording: Recording; summary: RecordingSummary | null; activeElapsed: number; activeLevel: number; readOnly: boolean; onStop: () => void; onRefresh: () => void; notify: (message: string) => void; snapshot: Snapshot }) {
   const [expanded, setExpanded] = useState(recording.status === "recording");
   const [detail, setDetail] = useState<RecordingDetail | null>(null);
   const [editing, setEditing] = useState(false);
@@ -681,7 +689,17 @@ function RecordingCard({ recording, summary, activeElapsed, activeLevel, readOnl
     {!expanded && <div className="recording-collapsed" onDoubleClick={() => !readOnly && summary && setEditing(true)}><strong>{summary?.overview || recording.transcript || recording.processingError || "等待生成对接结论"}</strong>{summary?.pendingItems.length ? <ul>{summary.pendingItems.slice(0, 3).map((item) => <li key={item}>{item}</li>)}</ul> : <span>暂无待处理事项</span>}</div>}
     {expanded && <div className="recording-expanded">
       <SummaryView summary={summary} />
-      {(summary?.status === "error" || summary?.status === "stale" || !summary) && recording.transcript && <button className="summary-trigger" onClick={() => { if (summary?.userEdited) { setConfirmResummarize(true); return; } void api.retryRecordingSummary(recording.id).then(() => { notify("正在梳理录音"); onRefresh(); }).catch((reason) => notify(String(reason))); }}><RefreshCw />{summary?.status === "stale" ? "重新梳理" : "梳理总结"}</button>}
+      {(summary?.status === "error" || summary?.status === "stale" || !summary) && recording.transcript && <button className="summary-trigger" onClick={() => {
+        if (summary?.userEdited) { setConfirmResummarize(true); return; }
+        if (!snapshot.settings.cloudApiEnabled) {
+          void api.getRecordingSummaryPrompt(recording.id).then(async (prompt) => {
+            await writeText(prompt);
+            notify("Prompt 已复制到剪贴板");
+          }).catch((reason) => notify(String(reason)));
+          return;
+        }
+        void api.retryRecordingSummary(recording.id).then(() => { notify("正在梳理录音"); onRefresh(); }).catch((reason) => notify(String(reason)));
+      }}><RefreshCw />{summary?.status === "stale" ? "重新梳理" : "梳理总结"}</button>}
       {recording.processingError && <p className="error-message"><CircleAlert />{recording.processingError}</p>}
       <TranscriptTimeline detail={detail} fallback={recording.transcript} />
       {audioUrl && <audio className="audio-player-native" controls src={audioUrl} />}
@@ -839,7 +857,7 @@ function TaskOverflowDialog({ tasks, onResolved, notify }: { tasks: Task[]; onRe
 }
 
 function SettingsView({ snapshot, setSnapshot, notify }: { snapshot: Snapshot; setSnapshot: (value: Snapshot) => void; notify: (message: string) => void }) {
-  return <div className="settings-page"><header><small>偏好</small><h1>设置</h1></header><section className="settings-section"><h2>通用</h2><SettingToggle label="开机启动" description="登录后自动启动" checked={snapshot.settings.autostart} onChange={(value) => void api.setAutostart(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><SettingToggle label="宠物悬浮窗" description="桌面悬浮按键与任务列表" checked={snapshot.settings.petVisible} onChange={(value) => void api.setPetVisible(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><ShortcutPrefix value={snapshot.settings.shortcuts.taskPrefix} onSaved={setSnapshot} notify={notify} /></section><DeepSeekPanel notify={notify} /><LocalModels notify={notify} /><SnapshotTools setSnapshot={setSnapshot} notify={notify} /></div>;
+  return <div className="settings-page"><header><small>偏好</small><h1>设置</h1></header><section className="settings-section"><h2>通用</h2><SettingToggle label="开机启动" description="登录后自动启动" checked={snapshot.settings.autostart} onChange={(value) => void api.setAutostart(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><SettingToggle label="宠物悬浮窗" description="桌面悬浮按键与任务列表" checked={snapshot.settings.petVisible} onChange={(value) => void api.setPetVisible(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><SettingToggle label="使用云端API" description="关闭后点击AI总结入口会复制prompt到剪贴板" checked={snapshot.settings.cloudApiEnabled} onChange={(value) => void api.updateSettings({ ...snapshot.settings, cloudApiEnabled: value }).then(setSnapshot).catch((reason) => notify(String(reason)))} /><ShortcutPrefix value={snapshot.settings.shortcuts.taskPrefix} onSaved={setSnapshot} notify={notify} /></section><DeepSeekPanel notify={notify} /><LocalModels notify={notify} /><SnapshotTools setSnapshot={setSnapshot} notify={notify} /></div>;
 }
 
 function ShortcutPrefix({ value, onSaved, notify }: { value: string; onSaved: (value: Snapshot) => void; notify: (message: string) => void }) {

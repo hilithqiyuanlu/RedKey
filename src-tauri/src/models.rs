@@ -67,11 +67,14 @@ pub struct Settings {
     pub pet_visible: bool,
     #[serde(default = "default_multi_group_enabled")]
     pub multi_group_enabled: bool,
+    #[serde(default = "default_cloud_api_enabled")]
+    pub cloud_api_enabled: bool,
     pub shortcuts: ShortcutSettings,
 }
 
 fn default_multi_group_enabled() -> bool { true }
 fn default_pet_visible() -> bool { true }
+fn default_cloud_api_enabled() -> bool { true }
 
 impl Default for Settings {
     fn default() -> Self {
@@ -79,6 +82,7 @@ impl Default for Settings {
             autostart: true,
             pet_visible: true,
             multi_group_enabled: true,
+            cloud_api_enabled: true,
             shortcuts: ShortcutSettings::default(),
         }
     }
