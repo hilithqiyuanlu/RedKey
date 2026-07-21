@@ -1,6 +1,6 @@
-a's'kask# RedKey
+# RedKey
 
-RedKey 是一个跨平台的桌面工作台，用键盘快捷键将需求任务绑定到数字键上，支持录音、转写、发言人分离和 AI 梳理，适用于设计评审、需求对接等协作场景。
+RedKey 是一个跨平台的桌面工作台，用键盘快捷键将需求任务绑定到数字键上，支持录音、转写、发言人分离、AI 梳理和图片 OCR，适用于设计评审、需求对接等协作场景。
 
 ## 技术栈
 
@@ -16,6 +16,7 @@ RedKey 是一个跨平台的桌面工作台，用键盘快捷键将需求任务�
 | 全局快捷键 (Windows) | SetWindowsHookExW + WH_KEYBOARD_LL |
 | 实时转写 | SenseVoice-Small (Python worker) |
 | 发言人分离 | 3D-Speaker / CAM++ (Python worker) |
+| OCR 图片识别 | RapidOCR (Python worker) |
 | AI 总结 | DeepSeek API |
 
 ## 功能
@@ -33,6 +34,11 @@ RedKey 是一个跨平台的桌面工作台，用键盘快捷键将需求任务�
 - 转写时间对齐，支持点击分段回放对应音频区间
 - 可修改 Speaker A/B 名称，修正转写文本
 
+### OCR 图片识别
+- 本地 RapidOCR 引擎，无需联网
+- 支持截图或拖入图片进行文字识别
+- 识别结果直接作为文本卡保存到当前任务
+
 ### AI 梳理
 - DeepSeek 根据完整对话生成需求对齐总结
 - 输出需求、决策、待办和风险
@@ -40,7 +46,7 @@ RedKey 是一个跨平台的桌面工作台，用键盘快捷键将需求任务�
 - 总结可追溯到原始转写版本
 
 ### 桌面交互
-- 全局快捷键：按下修饰键 （默认 Control）显示 HUD 悬浮提示条，松开隐藏
+- 全局快捷键：按下修饰键（默认 Control）显示 HUD 悬浮提示条，松开隐藏
 - 透明置顶键帽宠物，可拖拽，悬浮显示快捷面板
 - 快捷面板支持快速切换任务、拖入链接创建新任务
 - 系统托盘：打开控制台、休眠/唤醒宠物、设置、退出
@@ -104,11 +110,12 @@ npm run tauri build -- --bundles nsis
 │   │   ├── llm.rs          # DeepSeek API 调用
 │   │   ├── keyboard_windows.rs   # Windows 全局键盘钩子
 │   │   ├── recording_windows.rs  # Windows 原生录音 (cpal)
-│   │   └── hardware.rs     # 硬件接口模型
+│   │   └── ocr.rs          # OCR 图片识别 (RapidOCR worker 管理)
 │   └── tauri.conf.json     # Tauri 配置（窗口、打包、权限）
-├── workers/                # Python 语音处理 worker
+├── workers/                # Python 语音与图像 worker
 │   ├── qwen_asr_worker.py          # SenseVoice 实时转写
-│   └── diarization_worker.py       # 3D-Speaker 发言人分离
+│   ├── diarization_worker.py       # 3D-Speaker 发言人分离
+│   └── ocr_worker.py               # RapidOCR 图片文字识别
 └── docs/
     └── MEETING_COPILOT_ARCHITECTURE.md  # 录音与会议副驾架构设计
 ```
@@ -137,10 +144,7 @@ SQLite 数据库位于系统应用数据目录下的 `com.hilith.redkey/redkey.s
 ## 暂未实现
 
 - Figma Desktop 深链接
-- OCR 图片卡
-- 任务级 AI 快照
+- 多群组管理
 - 自然语言 Shortcut workflow
 - 实体硬件串口连接
 - 应用签名与正式分发
-
-未来硬件协议见 [docs/HARDWARE_PROTOCOL.md](docs/HARDWARE_PROTOCOL.md)。
