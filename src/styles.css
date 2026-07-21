@@ -662,6 +662,7 @@ select:focus-visible {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 .text-card > p.placeholder { color: var(--muted-2); }
 .text-card.expanded > p {
@@ -721,6 +722,9 @@ select:focus-visible {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   min-height: 60px;
+  max-height: 200px;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
 .image-card-textarea {

@@ -206,9 +206,6 @@ pub fn start_keyboard_monitor(app: &AppHandle, settings: &crate::models::Shortcu
                 }
                 KeyboardEvent::Action(AppAction::ActivateSlot { slot }) => {
                     let _ = crate::dispatch_internal(&app_handle, AppAction::ActivateSlot { slot });
-                    if app_handle.state::<crate::RuntimeState>().hud_state.lock().prefix_held {
-                        let _ = crate::emit_task_hud(&app_handle);
-                    }
                 }
                 KeyboardEvent::Action(action) => {
                     let _ = crate::dispatch_internal(&app_handle, action);

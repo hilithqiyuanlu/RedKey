@@ -493,19 +493,11 @@ fn position_hud(app: &AppHandle) -> Result<tauri::WebviewWindow> {
     let height = ((work_area.size.height as i32) / 7).clamp(140, 300) as u32;
     let desired = Size::Physical(PhysicalSize::new(width, height));
     hud.set_size(desired)?;
-    // 先记录当前焦点窗口（控制台），显示 HUD 后立即归还焦点
-    let console_visible = app.get_webview_window("console").and_then(|w| w.is_visible().ok()).unwrap_or(false);
-    hud.show()?;
-    hud.set_always_on_top(true)?;
-    if console_visible {
-        if let Some(console) = app.get_webview_window("console") {
-            let _ = console.set_focus();
-        }
-    }
     let size = hud.outer_size()?;
     let x = work_area.position.x + (work_area.size.width as i32 - size.width as i32) / 2;
     let y = work_area.position.y + ((work_area.size.height as i32 - size.height as i32) as f32 * 0.74) as i32;
     hud.set_position(Position::Physical(PhysicalPosition::new(x, y)))?;
+    hud.set_always_on_top(true)?;
     #[cfg(target_os = "macos")]
     hud.set_visible_on_all_workspaces(true)?;
     hud.set_ignore_cursor_events(true)?;
@@ -523,21 +515,26 @@ pub fn emit_task_hud(app: &AppHandle) -> Result<()> {
         })
     }).collect::<Vec<_>>();
     let hud = position_hud(app)?;
+    let console_visible = app.get_webview_window("console").and_then(|w| w.is_visible().ok()).unwrap_or(false);
+    hud.show()?;
+    if console_visible {
+        if let Some(console) = app.get_webview_window("console") {
+            let _ = console.set_focus();
+        }
+    }
     hud.emit("redkey://task-hud", serde_json::json!({ "slots": slots }))?;
     Ok(())
 }
 
 pub fn set_task_hud_visible(app: &AppHandle, visible: bool) -> Result<()> {
-    let show = {
-        let runtime = app.state::<RuntimeState>();
-        let mut state = runtime.hud_state.lock();
-        state.prefix_held = visible;
-        visible
-    };
-    if show { emit_task_hud(app)?; }
-    if !visible {
+    let runtime = app.state::<RuntimeState>();
+    let mut state = runtime.hud_state.lock();
+    state.prefix_held = visible;
+    drop(state);
+    if visible {
+        emit_task_hud(app)?;
+    } else {
         if let Some(hud) = app.get_webview_window("hud") {
-            // 先清空 HUD 内容，避免 hide() 在某些平台上不立即生效时残留画面
             let _ = hud.emit("redkey://task-hud", serde_json::json!({ "slots": [] }));
             hud.hide()?;
         }
@@ -609,7 +606,7 @@ fn start_keyboard_monitor(app: &AppHandle, settings: &ShortcutSettings) -> Keybo
     std::thread::spawn(move || for event in receiver {
         match event {
             KeyboardEvent::Prefix(active) => { let _ = set_task_hud_visible(&app_handle, active); }
-            KeyboardEvent::Action(AppAction::ActivateSlot { slot }) => { let _ = dispatch_internal(&app_handle, AppAction::ActivateSlot { slot }); if app_handle.state::<RuntimeState>().hud_state.lock().prefix_held { let _ = emit_task_hud(&app_handle); } }
+            KeyboardEvent::Action(AppAction::ActivateSlot { slot }) => { let _ = dispatch_internal(&app_handle, AppAction::ActivateSlot { slot }); }
             KeyboardEvent::Action(action) => { let _ = dispatch_internal(&app_handle, action); }
         }
     });
@@ -794,6 +791,9 @@ fn inside_window(app: &AppHandle, label: &str, cursor_x: f64, cursor_y: f64) -> 
     let Some(window) = app.get_webview_window(label) else {
         return Ok(false);
     };
+    if !window.is_visible().unwrap_or(false) {
+        return Ok(false);
+    }
     let position = window.outer_position()?;
     let size = window.outer_size()?;
     Ok(cursor_x >= position.x as f64

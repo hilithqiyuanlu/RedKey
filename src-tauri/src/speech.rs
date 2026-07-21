@@ -200,7 +200,7 @@ fn install_diarization(app: &AppHandle, id: &str, python: &Path) -> Result<()> {
     ]), "安装科学计算依赖失败", 0, None, None)?;
     run_cancelable(app, id, Command::new(python).args([
         "-m", "pip", "install", "--only-binary", ":all:",
-        "modelscope", "soundfile", "tqdm", "pyyaml", "kaldiio", "addict",
+        "modelscope", "datasets", "soundfile", "tqdm", "pyyaml", "kaldiio", "addict",
         "simplejson", "sortedcontainers",
     ]), "安装 3D-Speaker 工具依赖失败", 0, None, None)?;
     // 聚类相关依赖（fastcluster、umap-learn 和 hdbscan 在 Windows 上常需从源码构建，
