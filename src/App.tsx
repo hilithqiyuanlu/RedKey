@@ -9,7 +9,7 @@ import {
 import { api, onLinkDrop, onModelStatus, onNewTask, onPartialTranscript, onQuickPanelShown, onRecordingToggle, onTaskHud } from "./api";
 import { extractHttpUrl, petState, slotLabel } from "./domain";
 import type {
-  DeepSeekSettings, ModelStatus, Recording, RecordingDetail, RecordingSummary, Settings,
+  DeepSeekSettings, ImageCard, ModelStatus, Recording, RecordingDetail, RecordingSummary, Settings,
   Snapshot, Task, TaskDocument, TaskHudPayload, TextCard,
 } from "./types";
 import { useSnapshot } from "./useSnapshot";
@@ -68,7 +68,7 @@ function ConsoleApp() {
 
   useEffect(() => {
     let cleanup: (() => void) | undefined;
-    void onRecordingToggle(() => { if (selectedTask?.status === "active") void toggleRecording(selectedTask.id); }).then((stop) => { cleanup = stop; });
+    void onRecordingToggle(() => { void toggleRecording(selectedTask?.status === "active" ? selectedTask.id : undefined); }).then((stop) => { cleanup = stop; });
     return () => cleanup?.();
   }, [selectedTask?.id, selectedTask?.status]);
 
@@ -92,7 +92,7 @@ function ConsoleApp() {
     clockRef.current = window.setInterval(() => setRecordingElapsed(Math.floor((Date.now() - recordingStartedRef.current) / 1000)), 250);
   }
 
-  async function toggleRecording(taskId: string) {
+  async function toggleRecording(taskId?: string) {
     if (nativeRecordingRef.current) {
       stopClock();
       try { setSnapshot(await api.stopNativeRecording()); notify("录音已保存，正在处理"); }
@@ -109,18 +109,8 @@ function ConsoleApp() {
       recordingIdRef.current = null; setDocumentVersion((value) => value + 1); return;
     }
     try {
-      setSnapshot(await api.setCurrentTask(taskId, false));
-      if (!navigator.mediaDevices?.getUserMedia) {
-        recordingIdRef.current = await api.startNativeRecording(); nativeRecordingRef.current = true;
-      } else {
-        recordingIdRef.current = await api.startRecording();
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        const recorder = await startPcmRecorder(stream, setRecordingLevel); recorderRef.current = recorder;
-        const partialTimer = window.setInterval(() => {
-          if (recorderRef.current === recorder && recordingIdRef.current) void api.transcribePartial(recordingIdRef.current, recorder.snapshot()).catch(() => undefined);
-          else window.clearInterval(partialTimer);
-        }, 5000);
-      }
+      if (taskId) setSnapshot(await api.setCurrentTask(taskId, false));
+      recordingIdRef.current = await api.startNativeRecording(); nativeRecordingRef.current = true;
       recordingStartedRef.current = Date.now(); startClock(); notify("已开始录音"); setDocumentVersion((value) => value + 1);
     } catch (reason) {
       if (recordingIdRef.current) void api.failRecording(recordingIdRef.current, String(reason));
@@ -128,11 +118,31 @@ function ConsoleApp() {
     }
   }
 
+  async function handleDropCard(slot: number, cardData: { type: string; id: string }) {
+    const task = activeTasks.find((t) => t.slot === slot);
+    if (!task) return;
+    try {
+      if (cardData.type === "recording") setSnapshot(await api.reassignRecording(cardData.id, task.id));
+      else if (cardData.type === "text") setSnapshot(await api.reassignTextCard(cardData.id, task.id));
+      else if (cardData.type === "image") setSnapshot(await api.reassignImageCard(cardData.id, task.id));
+      setDocumentVersion((value) => value + 1);
+      notify(`已切换到「${task.title}」`);
+    } catch (reason) { notify(String(reason)); }
+  }
+
+  async function handleSwapSlots(slotA: number, slotB: number) {
+    if (slotA === slotB) return;
+    try {
+      setSnapshot(await api.swapSlots(snapshot!.currentGroup, slotA, slotB));
+      notify("按键已交换");
+    } catch (reason) { notify(String(reason)); }
+  }
+
   if (!snapshot) return <LoadingState error={error} />;
 
   return <div className="app-shell">
     <aside className="sidebar">
-      <div className="brand-mark"><span>R</span><div><strong>RedKey</strong><small>任务工作台</small></div></div>
+      <div className="brand-mark"><span>A</span><div><strong>AlphaKey</strong><small>任务工作台</small></div></div>
       <nav>
         <NavButton active={view === "active"} icon={<ListTodo />} label="进行中" count={activeTasks.length} onClick={() => setView("active")} />
         <NavButton active={view === "completed"} icon={<CircleCheck />} label="已完成" count={completedTasks.length} onClick={() => setView("completed")} />
@@ -141,22 +151,34 @@ function ConsoleApp() {
     </aside>
     <main className="main-view">
       {view === "settings" ? <SettingsView snapshot={snapshot} setSnapshot={setSnapshot} notify={notify} />
-        : view === "completed" ? <CompletedList tasks={completedTasks} onNew={() => { setPrefillUrl(""); setPrefillSlot(null); setCreating(true); }} notify={notify} />
-        : selectedTask && document ?
-        <DocumentWorkspace
-          document={document}
-          snapshot={snapshot}
-          setSnapshot={setSnapshot}
-          recordingElapsed={recordingElapsed}
-          recordingLevel={recordingLevel}
-          onToggleRecording={() => void toggleRecording(selectedTask.id)}
-          onNew={() => { setPrefillUrl(""); setPrefillSlot(null); setCreating(true); }}
-          onRefresh={() => setDocumentVersion((value) => value + 1)}
-          onDeleted={() => { setSelectedId(null); setDocumentVersion((value) => value + 1); }}
-          notify={notify}
-        /> : <EmptyDocument completed={false} onNew={() => { setPrefillUrl(""); setPrefillSlot(null); setCreating(true); }} />}
+        : view === "completed" ? <CompletedList tasks={completedTasks} setSnapshot={setSnapshot} notify={notify} />
+        : <div className="active-view">
+          <div className="active-view-content">
+            {selectedTask && document ?
+            <DocumentWorkspace
+              document={document}
+              snapshot={snapshot}
+              setSnapshot={setSnapshot}
+              recordingElapsed={recordingElapsed}
+              recordingLevel={recordingLevel}
+              onToggleRecording={() => void toggleRecording(selectedTask.id)}
+              onNew={() => { setPrefillUrl(""); setPrefillSlot(null); setCreating(true); }}
+              onRefresh={() => setDocumentVersion((value) => value + 1)}
+              onDeleted={() => { setSelectedId(null); setDocumentVersion((value) => value + 1); }}
+              notify={notify}
+            /> : <EmptyDocument completed={false} onNew={() => { setPrefillUrl(""); setPrefillSlot(null); setCreating(true); }} />}
+          </div>
+          <SlotNavBar
+            tasks={activeTasks}
+            currentId={selectedTask?.id ?? null}
+            onSelect={(id) => setSelectedId(id)}
+            onEmptySlot={(slot) => { setPrefillUrl(""); setPrefillSlot(slot); setCreating(true); }}
+            onDropCard={handleDropCard}
+            onSwapSlots={handleSwapSlots}
+          />
+        </div>}
     </main>
-    {creating && <CreateTaskDialog snapshot={snapshot} initialUrl={prefillUrl} initialSlot={prefillSlot} onClose={() => { setCreating(false); setPrefillSlot(null); }} onCreated={(next) => { setSnapshot(next); setCreating(false); setPrefillUrl(""); setPrefillSlot(null); setView("active"); setSelectedId(next.currentTaskId); }} notify={notify} />}
+    {creating && <CreateTaskDialog snapshot={snapshot} setSnapshot={setSnapshot} initialUrl={prefillUrl} initialSlot={prefillSlot} onClose={() => { setCreating(false); setPrefillSlot(null); }} onCreated={(next) => { setSnapshot(next); setCreating(false); setPrefillUrl(""); setPrefillSlot(null); setView("active"); setSelectedId(next.currentTaskId); }} notify={notify} />}
     {overflowTasks.length > 10 && <TaskOverflowDialog tasks={overflowTasks} onResolved={(next) => { setSnapshot(next); setView("active"); setSelectedId(next.currentTaskId); }} notify={notify} />}
     {notice && <div className="toast">{notice}</div>}
   </div>;
@@ -173,26 +195,112 @@ function useTaskDocument(taskId: string | null, snapshot: Snapshot | null, versi
   return document;
 }
 
-function CompletedList({ tasks, onNew, notify }: { tasks: Task[]; onNew: () => void; notify: (message: string) => void }) {
+function useClickOutside(ref: React.RefObject<HTMLElement | null>, handler: () => void, excludeRef?: React.RefObject<HTMLElement | null>) {
+  useEffect(() => {
+    function onPointer(event: MouseEvent | TouchEvent) {
+      const target = event.target as Node | null;
+      if (!target) return;
+      if (ref.current && !ref.current.contains(target) && (!excludeRef || !excludeRef.current || !excludeRef.current.contains(target))) {
+        handler();
+      }
+    }
+    document.addEventListener("mousedown", onPointer);
+    document.addEventListener("touchstart", onPointer);
+    return () => { document.removeEventListener("mousedown", onPointer); document.removeEventListener("touchstart", onPointer); };
+  }, [ref, excludeRef, handler]);
+}
+
+function CompletedList({ tasks, setSnapshot, notify }: { tasks: Task[]; setSnapshot: (value: Snapshot) => void; notify: (message: string) => void }) {
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  async function recover(taskId: string) {
+    try {
+      await api.setCurrentTask(taskId, false);
+      setSnapshot(await api.dispatch({ type: "start_rework" }));
+      notify("任务已恢复为进行中");
+    } catch (reason) {
+      notify(String(reason));
+    }
+  }
+  async function remove(taskId: string) {
+    try { setSnapshot(await api.deleteCompletedTask(taskId)); notify("任务已删除"); }
+    catch (reason) { notify(String(reason)); }
+  }
   return <div className="completed-list-page">
     <header className="completed-list-header">
       <div>
         <small>归档</small>
         <h1>已完成 <b>{tasks.length}</b></h1>
       </div>
-      <button className="primary" onClick={onNew}><Plus />新建</button>
     </header>
     {tasks.length ? <div className="completed-list">
       {tasks.map((task) => <div className="completed-list-item" key={task.id}>
-        <kbd>{slotLabel(task.slot)}</kbd>
         <div className="completed-item-body">
           <strong>{task.title}</strong>
           <small>{task.contactName || "未指定联系人"} · {formatShortDate(task.completedAt ?? task.lastOpenedAt)}</small>
         </div>
-        {task.url && <button className="completed-item-link" title="打开链接" onClick={() => void api.setCurrentTask(task.id, true).then(() => notify("已在浏览器打开")).catch((reason) => notify(String(reason)))}><ExternalLink /></button>}
+        <div className="completed-item-actions">
+          {task.url && <button className="completed-item-link" title="打开链接" onClick={() => void api.setCurrentTask(task.id, true).then(() => notify("已在浏览器打开")).catch((reason) => notify(String(reason)))}><ExternalLink /></button>}
+          <button className="completed-item-recover" title="恢复任务" onClick={() => void recover(task.id)}><RotateCcw /></button>
+          <button className="completed-item-delete" title="删除任务" onClick={() => setConfirmDelete(task.id)}><Trash2 /></button>
+        </div>
       </div>)}
-    </div> : <div className="completed-list-empty"><CircleCheck /><strong>还没有已完成任务</strong><span>完成的任务会保留全部文本、录音和总结。</span></div>}
+    </div> : <div className="completed-list-empty"><CircleCheck /><strong>还没有已完成任务</strong></div>}
+    {confirmDelete && <ConfirmDialog
+      title="删除这个已完成任务？"
+      description="全部文本、录音和 AI 总结将被永久删除，无法恢复。"
+      confirmLabel="删除"
+      danger
+      onConfirm={() => { const id = confirmDelete; setConfirmDelete(null); void remove(id); }}
+      onCancel={() => setConfirmDelete(null)}
+    />}
   </div>;
+}
+
+function SlotNavBar({ tasks, currentId, onSelect, onEmptySlot, onDropCard, onSwapSlots }: { tasks: Task[]; currentId: string | null; onSelect: (id: string) => void; onEmptySlot: (slot: number) => void; onDropCard: (slot: number, cardData: { type: string; id: string }) => void; onSwapSlots: (slotA: number, slotB: number) => void }) {
+  const slotMap = useMemo(() => {
+    const map = new Map<number, Task>();
+    for (const task of tasks) if (task.slot != null) map.set(task.slot, task);
+    return map;
+  }, [tasks]);
+  const [dragOverSlot, setDragOverSlot] = useState<number | null>(null);
+  const dragSlot = useRef<number | null>(null);
+  return <nav className="slot-nav-bar">
+    {Array.from({ length: 10 }, (_, index) => {
+      const task = slotMap.get(index);
+      const isCurrent = task && task.id === currentId;
+      return <div
+        key={index}
+        className={`slot-nav-item${task ? " bound" : ""}${isCurrent ? " current" : ""}${dragOverSlot === index ? " drag-over" : ""}`}
+        title={task ? task.title : `新建到 ${slotLabel(index)}`}
+        tabIndex={0}
+        role="button"
+        onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); task ? onSelect(task.id) : onEmptySlot(index); } }}
+        onClick={(event) => {
+          if (dragSlot.current === index) return;
+          task ? onSelect(task.id) : onEmptySlot(index);
+        }}
+        draggable={Boolean(task)}
+        onDragStart={(event) => { if (!task) { event.preventDefault(); return; } dragSlot.current = index; event.dataTransfer.setData("application/redkey-slot", String(index)); event.dataTransfer.effectAllowed = "move"; }}
+        onDragEnd={() => { dragSlot.current = null; }}
+        onDragOver={(event) => { event.preventDefault(); setDragOverSlot(index); }}
+        onDragLeave={() => setDragOverSlot((current) => current === index ? null : current)}
+        onDrop={(event) => {
+          event.preventDefault();
+          setDragOverSlot(null);
+          const slotRaw = event.dataTransfer.getData("application/redkey-slot");
+          if (slotRaw !== "") { try { onSwapSlots(parseInt(slotRaw), index); } catch { /* ignore */ } return; }
+          const cardRaw = event.dataTransfer.getData("application/redkey-card");
+          if (cardRaw && task) { try { onDropCard(index, JSON.parse(cardRaw)); } catch { /* ignore */ } }
+        }}
+      >
+        <span className="slot-nav-key">{slotLabel(index)}</span>
+        {task ? <span className="slot-nav-info">
+          <span className="slot-nav-contact">{task.contactName || "未指定"}</span>
+          <span className="slot-nav-title">{task.title}</span>
+        </span> : <span className="slot-nav-empty"><Plus /></span>}
+      </div>;
+    })}
+  </nav>;
 }
 
 function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, recordingLevel, onToggleRecording, onNew, onRefresh, onDeleted, notify }: {
@@ -209,12 +317,45 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
   const [confirmDeleteTask, setConfirmDeleteTask] = useState(false);
   const cards = useMemo(() => [
     ...document.textCards.map((card) => ({ type: "text" as const, createdAt: card.createdAt, card })),
+    ...document.imageCards.map((card) => ({ type: "image" as const, createdAt: card.createdAt, card })),
     ...document.recordings.map((recording) => ({ type: "recording" as const, createdAt: recording.createdAt, recording })),
   ].sort((a, b) => b.createdAt.localeCompare(a.createdAt)), [document]);
   const activeRecording = document.recordings.find((recording) => recording.status === "recording");
 
   useEffect(() => { setTitle(task.title); }, [task.title]);
   useEffect(() => { setEditingTitle(false); setContactOpen(false); setLinkOpen(false); }, [task.id]);
+  // Ctrl+V 粘贴文本（仅进行中任务界面，非输入框时生效）
+  useEffect(() => {
+    if (readOnly) return;
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key !== "v" || (!event.ctrlKey && !event.metaKey)) return;
+      const target = window.document.activeElement;
+      if (target && (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || (target as HTMLElement).isContentEditable)) return;
+      event.preventDefault();
+      void api.pasteFromClipboard(task.id).then(() => onRefresh()).catch((reason) => notify(String(reason)));
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [task.id, readOnly, onRefresh, notify]);
+  // Ctrl+V 粘贴图片（仅进行中任务界面，非输入框时生效）
+  useEffect(() => {
+    if (readOnly) return;
+    function onPaste(event: ClipboardEvent) {
+      const target = window.document.activeElement;
+      if (target && (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || (target as HTMLElement).isContentEditable)) return;
+      const file = event.clipboardData?.files?.[0];
+      if (!file || !file.type.startsWith("image/")) return;
+      event.preventDefault();
+      const reader = new FileReader();
+      reader.onload = () => {
+        const base64 = (reader.result as string).split(",")[1];
+        void api.createImageCard(task.id, file.name || "paste.png", file.type, base64, "").then(() => onRefresh()).catch((reason) => notify(String(reason)));
+      };
+      reader.readAsDataURL(file);
+    }
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [task.id, readOnly, onRefresh, notify]);
 
   async function saveTitle() {
     const next = title.trim();
@@ -225,6 +366,11 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
 
   async function addTextCard() {
     try { const card = await api.createTextCard(task.id); setEditingCardId(card.id); onRefresh(); }
+    catch (reason) { notify(String(reason)); }
+  }
+
+  async function addImageCard() {
+    try { await api.createImageCard(task.id, "", "image/png", "", "点击插入图片或用CTRL + V直接粘贴图片"); onRefresh(); }
     catch (reason) { notify(String(reason)); }
   }
 
@@ -240,23 +386,20 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
     <header className="document-toolbar">
       <div className="toolbar-side toolbar-left">
         <IconButton label={task.url ? "打开或修改链接" : "添加链接"} onClick={() => setLinkOpen((value) => !value)}><Link2 /></IconButton>
-        <span className="last-opened">{task.lastOpenedAt ? `最近打开 ${formatDate(task.lastOpenedAt)}` : "尚未打开链接"}</span>
+        <span className="last-opened">{task.lastOpenedAt ? `最近打开 ${formatRelative(task.lastOpenedAt)}` : "尚未打开链接"}</span>
         {linkOpen && <LinkPopover task={task} readOnly={readOnly} setSnapshot={setSnapshot} onClose={() => setLinkOpen(false)} notify={notify} />}
       </div>
       <div className="toolbar-center">
         <IconButton label={activeRecording ? "停止录音" : "创建录音卡"} active={Boolean(activeRecording)} disabled={readOnly} onClick={onToggleRecording}>{activeRecording ? <MicOff /> : <Mic />}</IconButton>
         <IconButton label="创建文本卡" disabled={readOnly} onClick={() => void addTextCard()}><FileText /></IconButton>
-        <IconButton label="图片卡后续开放" disabled><FileImage /></IconButton>
-      </div>
+        <IconButton label="创建图片卡" disabled={readOnly} onClick={() => void addImageCard()}><FileImage /></IconButton></div>
       <div className="toolbar-side toolbar-right">
         <IconButton label={readOnly ? "返工" : "完成"} onClick={() => void completeOrRework()}>{readOnly ? <RotateCcw /> : <Check />}</IconButton>
         {readOnly && <IconButton danger label="删除任务" onClick={() => setConfirmDeleteTask(true)}><Trash2 /></IconButton>}
-        <IconButton label="新建任务" onClick={onNew}><Plus /></IconButton>
       </div>
     </header>
     <section className="document-page">
       <div className="document-identity">
-        <kbd>{slotLabel(task.slot)}</kbd>
         <div className="contact-control">
           <button disabled={readOnly} onClick={() => setContactOpen((value) => !value)}><UserRound />{task.contactName || "选择联系人"}<ChevronDown /></button>
           {contactOpen && <ContactMenu contacts={snapshot.contacts} task={task} setSnapshot={setSnapshot} onClose={() => setContactOpen(false)} notify={notify} />}
@@ -265,7 +408,7 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
       </div>
       <div className="document-rule" />
       <div className="document-stream">
-        {cards.length ? cards.map((item) => item.type === "text" ? <TextCardView key={item.card.id} card={item.card} readOnly={readOnly} editing={editingCardId === item.card.id} onEditing={setEditingCardId} onRefresh={onRefresh} notify={notify} /> : <RecordingCard key={item.recording.id} recording={item.recording} summary={document.summaries.find((summary) => summary.recordingId === item.recording.id) ?? null} activeElapsed={recordingElapsed} activeLevel={recordingLevel} readOnly={readOnly} onStop={onToggleRecording} onRefresh={onRefresh} notify={notify} />) : <div className="empty-stream"><FileText /><strong>还没有内容</strong><span>通过工具栏添加文本或开始录音。</span><div className="empty-stream-actions">{!readOnly && <><button className="primary" onClick={() => void addTextCard()}><FileText />添加文本</button><button onClick={onToggleRecording}><Mic />开始录音</button></>}</div></div>}
+        {cards.length ? cards.map((item) => item.type === "text" ? <TextCardView key={item.card.id} card={item.card} readOnly={readOnly} editing={editingCardId === item.card.id} onEditing={setEditingCardId} onRefresh={onRefresh} notify={notify} /> : item.type === "image" ? <ImageCardView key={item.card.id} card={item.card} readOnly={readOnly} onRefresh={onRefresh} notify={notify} /> : <RecordingCard key={item.recording.id} recording={item.recording} summary={document.summaries.find((summary) => summary.recordingId === item.recording.id) ?? null} activeElapsed={recordingElapsed} activeLevel={recordingLevel} readOnly={readOnly} onStop={onToggleRecording} onRefresh={onRefresh} notify={notify} />) : <div className="empty-stream"><FileText /><strong>还没有内容</strong><span>通过工具栏添加文本或开始录音。</span><div className="empty-stream-actions">{!readOnly && <><button className="primary" onClick={() => void addTextCard()}><FileText />添加文本</button><button onClick={onToggleRecording}><Mic />开始录音</button></>}</div></div>}
       </div>
     </section>
     {confirmDeleteTask && <ConfirmDialog
@@ -282,6 +425,8 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
 function LinkPopover({ task, readOnly, setSnapshot, onClose, notify }: { task: Task; readOnly: boolean; setSnapshot: (value: Snapshot) => void; onClose: () => void; notify: (message: string) => void }) {
   const [value, setValue] = useState(task.url ?? "");
   const [resolving, setResolving] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useClickOutside(ref, onClose);
   async function updateTitleFromLink(url: string) {
     const link = extractHttpUrl(url) ?? url.trim();
     if (!link) return;
@@ -312,28 +457,96 @@ function LinkPopover({ task, readOnly, setSnapshot, onClose, notify }: { task: T
     setValue(link);
     void updateTitleFromLink(link);
   }
-  return <div className="popover link-popover">
-    <div><strong>任务链接</strong><button onClick={onClose}><X /></button></div>
+  return <div className="popover link-popover" ref={ref}>
+    <div><strong>任务链接</strong><button type="button" onClick={onClose}><X /></button></div>
     <input value={value} disabled={readOnly || resolving} placeholder="https://figma.com/..." onPaste={pasteLink} onChange={(event) => setValue(event.target.value)} />
     <div className="popover-actions">
-      <button disabled={!task.url} onClick={() => void api.setCurrentTask(task.id, true).then(setSnapshot).then(onClose).catch((reason) => notify(String(reason)))}><ExternalLink />打开</button>
-      {!readOnly && <button className="primary" disabled={resolving} onClick={() => void saveLink()}>{resolving ? "识别中" : "保存"}</button>}
+      <button type="button" disabled={!task.url} onClick={() => void api.setCurrentTask(task.id, true).then(setSnapshot).then(onClose).catch((reason) => notify(String(reason)))}><ExternalLink />打开</button>
+      {!readOnly && <button type="button" className="primary" disabled={resolving} onClick={() => void saveLink()}>{resolving ? "识别中" : "保存"}</button>}
     </div>
   </div>;
 }
 
 function ContactMenu({ contacts, task, setSnapshot, onClose, notify }: { contacts: Snapshot["contacts"]; task: Task; setSnapshot: (value: Snapshot) => void; onClose: () => void; notify: (message: string) => void }) {
   const [newName, setNewName] = useState("");
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editName, setEditName] = useState("");
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const ref = useRef<HTMLDivElement>(null);
+  useClickOutside(ref, onClose);
   const select = (contactId: string | null) => void api.updateTaskContact(task.id, contactId).then(setSnapshot).then(onClose).catch((reason) => notify(String(reason)));
-  return <div className="popover contact-popover">
-    <button className={!task.contactId ? "selected" : ""} onClick={() => select(null)}>未指定联系人</button>
-    {contacts.map((contact) => <button className={task.contactId === contact.id ? "selected" : ""} key={contact.id} onClick={() => select(contact.id)}>{contact.name}</button>)}
-    <div className="contact-add"><input value={newName} placeholder="新增联系人" onChange={(event) => setNewName(event.target.value)} /><button disabled={!newName.trim()} onClick={() => void api.addContact(newName).then(setSnapshot).then(() => setNewName("")).catch((reason) => notify(String(reason)))}><Plus /></button></div>
+  const commitRename = (id: string) => {
+    const next = editName.trim();
+    if (!next) { setEditingId(null); return; }
+    void api.renameContact(id, next).then(setSnapshot).then(() => setEditingId(null)).catch((reason) => notify(String(reason)));
+  };
+  return <div className="popover contact-popover" ref={ref}>
+    <button type="button" className={!task.contactId ? "selected" : ""} onClick={() => select(null)}>未指定联系人</button>
+    {contacts.map((contact) => <div className="contact-item-row" key={contact.id}>
+      {editingId === contact.id ? <div className="contact-add contact-add-inline">
+        <input autoFocus value={editName} onChange={(event) => setEditName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") commitRename(contact.id); if (event.key === "Escape") setEditingId(null); }} />
+        <button type="button" className="icon-button" disabled={!editName.trim()} onClick={() => commitRename(contact.id)}><Check /></button>
+        <button type="button" className="icon-button" onClick={() => setEditingId(null)}><X /></button>
+      </div>
+      : confirmDeleteId === contact.id ? <div className="contact-confirm-row">
+        <span>删除「{contact.name}」？</span>
+        <button type="button" className="icon-button danger" onClick={() => void api.removeContact(contact.id).then(setSnapshot).then(() => setConfirmDeleteId(null)).catch((reason) => notify(String(reason)))}><Trash2 /></button>
+        <button type="button" className="icon-button" onClick={() => setConfirmDeleteId(null)}><X /></button>
+      </div>
+      : <>
+        <button type="button" className={task.contactId === contact.id ? "selected" : ""} onClick={() => select(contact.id)}>{contact.name}</button>
+        <IconButton label="编辑" onClick={() => { setEditingId(contact.id); setEditName(contact.name); }}><Pencil /></IconButton>
+        <IconButton label="删除" danger onClick={() => setConfirmDeleteId(contact.id)}><Trash2 /></IconButton>
+      </>}
+    </div>)}
+    <div className="contact-add"><input value={newName} placeholder="新增联系人" onChange={(event) => setNewName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && newName.trim()) void api.addContact(newName).then(setSnapshot).then(() => setNewName("")).catch((reason) => notify(String(reason))); }} /><button type="button" disabled={!newName.trim()} onClick={() => void api.addContact(newName).then(setSnapshot).then(() => setNewName("")).catch((reason) => notify(String(reason)))}><Plus /></button></div>
+  </div>;
+}
+
+function CreateContactMenu({ contacts, selectedId, onSelect, setSnapshot, notify }: { contacts: Snapshot["contacts"]; selectedId: string; onSelect: (id: string) => void; setSnapshot: (value: Snapshot) => void; notify: (message: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editName, setEditName] = useState("");
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
+  const selected = contacts.find((c) => c.id === selectedId);
+  useClickOutside(popoverRef, () => { if (open) setOpen(false); }, containerRef);
+  const commitRename = (id: string) => {
+    const next = editName.trim();
+    if (!next) { setEditingId(null); return; }
+    void api.renameContact(id, next).then(setSnapshot).then(() => setEditingId(null)).catch((reason) => notify(String(reason)));
+  };
+  return <div className="contact-control" ref={containerRef}>
+    <button type="button" onClick={() => setOpen((value) => !value)}><UserRound />{selected?.name || "选择联系人"}<ChevronDown /></button>
+    {open && <div className="popover contact-popover" ref={popoverRef}>
+      <button type="button" className={!selectedId ? "selected" : ""} onClick={() => { onSelect(""); setOpen(false); }}>未指定联系人</button>
+      {contacts.map((contact) => <div className="contact-item-row" key={contact.id}>
+        {editingId === contact.id ? <div className="contact-add contact-add-inline">
+          <input autoFocus value={editName} onChange={(event) => setEditName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") commitRename(contact.id); if (event.key === "Escape") setEditingId(null); }} />
+          <button type="button" className="icon-button" disabled={!editName.trim()} onClick={() => commitRename(contact.id)}><Check /></button>
+          <button type="button" className="icon-button" onClick={() => setEditingId(null)}><X /></button>
+        </div>
+        : confirmDeleteId === contact.id ? <div className="contact-confirm-row">
+          <span>删除「{contact.name}」？</span>
+          <button type="button" className="icon-button danger" onClick={() => void api.removeContact(contact.id).then(setSnapshot).then(() => setConfirmDeleteId(null)).catch((reason) => notify(String(reason)))}><Trash2 /></button>
+          <button type="button" className="icon-button" onClick={() => setConfirmDeleteId(null)}><X /></button>
+        </div>
+        : <>
+          <button type="button" className={selectedId === contact.id ? "selected" : ""} onClick={() => { onSelect(contact.id); setOpen(false); }}>{contact.name}</button>
+          <IconButton label="编辑" onClick={() => { setEditingId(contact.id); setEditName(contact.name); }}><Pencil /></IconButton>
+          <IconButton label="删除" danger onClick={() => setConfirmDeleteId(contact.id)}><Trash2 /></IconButton>
+        </>}
+      </div>)}
+      <div className="contact-add"><input value={newName} placeholder="新增联系人" onChange={(event) => setNewName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && newName.trim()) void api.addContact(newName).then(setSnapshot).then(() => setNewName("")).catch((reason) => notify(String(reason))); }} /><button type="button" disabled={!newName.trim()} onClick={() => void api.addContact(newName).then(setSnapshot).then(() => setNewName("")).catch((reason) => notify(String(reason)))}><Plus /></button></div>
+    </div>}
   </div>;
 }
 
 function TextCardView({ card, readOnly, editing, onEditing, onRefresh, notify }: { card: TextCard; readOnly: boolean; editing: boolean; onEditing: (id: string | null) => void; onRefresh: () => void; notify: (message: string) => void }) {
   const [content, setContent] = useState(card.content);
+  const [expanded, setExpanded] = useState(false);
   const savedRef = useRef(card.content);
   const [confirmDelete, setConfirmDelete] = useState(false);
   useEffect(() => { setContent(card.content); savedRef.current = card.content; }, [card.id, card.content]);
@@ -342,15 +555,62 @@ function TextCardView({ card, readOnly, editing, onEditing, onRefresh, notify }:
     const timer = window.setTimeout(() => { void api.updateTextCard(card.id, content).then(() => { savedRef.current = content; }).catch((reason) => notify(String(reason))); }, 600);
     return () => window.clearTimeout(timer);
   }, [content, editing, card.id, notify]);
-  return <article className="content-card text-card">
-    <header><span>{formatDate(card.createdAt)}</span><div>{!readOnly && <IconButton label="编辑文本" onClick={() => onEditing(editing ? null : card.id)}><Pencil /></IconButton>}{!readOnly && <IconButton danger label="删除文本" onClick={() => setConfirmDelete(true)}><Trash2 /></IconButton>}</div></header>
-    {editing && !readOnly ? <textarea autoFocus value={content} placeholder="输入补充信息…" onChange={(event) => setContent(event.target.value)} onBlur={() => onEditing(null)} /> : <p className={content ? "" : "placeholder"}>{content || "点击编辑按钮添加文本内容"}</p>}
+  return <article
+    className={`content-card text-card${expanded ? " expanded" : ""}`}
+    draggable={!editing}
+    onDragStart={(event) => { if (editing) { event.preventDefault(); return; } event.dataTransfer.setData("application/redkey-card", JSON.stringify({ type: "text", id: card.id })); event.dataTransfer.effectAllowed = "move"; }}
+  >
+    <header onClick={() => !editing && setExpanded((v) => !v)} style={{ cursor: editing ? undefined : "pointer" }}><span>{formatDate(card.createdAt)}</span><div onClick={(e) => e.stopPropagation()}>{!readOnly && <IconButton label="编辑文本" onClick={() => onEditing(editing ? null : card.id)}><Pencil /></IconButton>}{!readOnly && <IconButton danger label="删除文本" onClick={() => setConfirmDelete(true)}><Trash2 /></IconButton>}<IconButton label={expanded ? "收起" : "展开"} onClick={() => setExpanded((v) => !v)}>{expanded ? <ChevronDown /> : <ChevronRight />}</IconButton></div></header>
+    {editing && !readOnly ? <textarea autoFocus value={content} placeholder="输入补充信息…" onChange={(event) => setContent(event.target.value)} onBlur={() => onEditing(null)} /> : <p className={content ? "" : "placeholder"} onDoubleClick={() => !readOnly && onEditing(card.id)}>{content || "点击编辑按钮添加文本内容"}</p>}
     {confirmDelete && <ConfirmDialog
       title="删除这张文本卡？"
       description="删除后无法恢复。"
       confirmLabel="删除"
       danger
       onConfirm={() => { setConfirmDelete(false); void api.deleteTextCard(card.id).then(() => { onEditing(null); onRefresh(); }).catch((reason) => notify(String(reason))); }}
+      onCancel={() => setConfirmDelete(false)}
+    />}
+  </article>;
+}
+
+function ImageCardView({ card, readOnly, onRefresh, notify }: { card: ImageCard; readOnly: boolean; onRefresh: () => void; notify: (message: string) => void }) {
+  const [expanded, setExpanded] = useState(true);
+  const [lightbox, setLightbox] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const hasImage = card.data.length > 0;
+  const src = hasImage ? `data:${card.mimeType};base64,${card.data}` : "";
+
+  function handleFile(file: File) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const base64 = (reader.result as string).split(",")[1];
+      void api.updateImageCard(card.id, file.name, file.type, base64, card.content).then(() => onRefresh()).catch((reason) => notify(String(reason)));
+    };
+    reader.readAsDataURL(file);
+  }
+
+  return <article
+    className={`content-card image-card${expanded ? " expanded" : ""}`}
+    draggable
+    onDragStart={(event) => { event.dataTransfer.setData("application/redkey-card", JSON.stringify({ type: "image", id: card.id })); event.dataTransfer.effectAllowed = "move"; }}
+  >
+    <header onClick={() => setExpanded((v) => !v)} style={{ cursor: "pointer" }}><span><FileImage />{hasImage ? card.filename : "图片卡"} · {formatDate(card.createdAt)}</span><div onClick={(e) => e.stopPropagation()}>{!readOnly && <IconButton danger label="删除图片" onClick={() => setConfirmDelete(true)}><Trash2 /></IconButton>}<IconButton label={expanded ? "收起" : "展开"} onClick={() => setExpanded((v) => !v)}>{expanded ? <ChevronDown /> : <ChevronRight />}</IconButton></div></header>
+    {expanded && (hasImage ? <div className="image-card-body">
+      <div className="image-card-thumb" onClick={() => setLightbox(true)}><img src={src} alt={card.filename} /></div>
+      <div className="image-card-text">{card.content || <span className="placeholder">OCR 识别结果将在模型就绪后显示</span>}</div>
+    </div> : <div className="image-card-empty" onClick={() => !readOnly && fileInputRef.current?.click()}>
+      <FileImage />
+      <p>{card.content || "点击插入图片或用 CTRL + V 直接粘贴图片"}</p>
+      {!readOnly && <input ref={fileInputRef} type="file" accept="image/*" style={{ display: "none" }} onChange={(event) => { const file = event.target.files?.[0]; if (file) handleFile(file); event.target.value = ""; }} />}
+    </div>)}
+    {lightbox && <div className="lightbox" onClick={() => setLightbox(false)}><img src={src} alt={card.filename} onClick={(e) => e.stopPropagation()} /></div>}
+    {confirmDelete && <ConfirmDialog
+      title="删除这张图片卡？"
+      description="删除后无法恢复。"
+      confirmLabel="删除"
+      danger
+      onConfirm={() => { setConfirmDelete(false); void api.deleteImageCard(card.id).then(() => onRefresh()).catch((reason) => notify(String(reason))); }}
       onCancel={() => setConfirmDelete(false)}
     />}
   </article>;
@@ -378,7 +638,11 @@ function RecordingCard({ recording, summary, activeElapsed, activeLevel, readOnl
   </article>;
 
   const status = displayRecordingStatus(recording, summary);
-  return <article className={`content-card recording-card ${expanded ? "expanded" : ""}`}>
+  return <article
+    className={`content-card recording-card ${expanded ? "expanded" : ""}`}
+    draggable
+    onDragStart={(event) => { event.dataTransfer.setData("application/redkey-card", JSON.stringify({ type: "recording", id: recording.id })); event.dataTransfer.effectAllowed = "move"; }}
+  >
     <header onClick={() => setExpanded((value) => !value)}>
       <div className="recording-meta">{status.tone === "success" ? <><time>{formatDate(recording.createdAt)}</time><span className={`status-badge ${status.tone}`}>{status.loading && <LoaderCircle />}{status.label}</span></> : <><span className={`status-badge ${status.tone}`}>{status.loading && <LoaderCircle />}{status.label}</span><time>{formatDate(recording.createdAt)}</time></>}</div>
       <div className="recording-actions" onClick={(event) => event.stopPropagation()}>
@@ -387,7 +651,7 @@ function RecordingCard({ recording, summary, activeElapsed, activeLevel, readOnl
         <IconButton label={expanded ? "收起" : "展开"} onClick={() => setExpanded((value) => !value)}>{expanded ? <ChevronDown /> : <ChevronRight />}</IconButton>
       </div>
     </header>
-    {!expanded && <div className="recording-collapsed"><strong>{summary?.overview || recording.transcript || recording.processingError || "等待生成对接结论"}</strong>{summary?.pendingItems.length ? <ul>{summary.pendingItems.slice(0, 3).map((item) => <li key={item}>{item}</li>)}</ul> : <span>暂无待处理事项</span>}</div>}
+    {!expanded && <div className="recording-collapsed" onDoubleClick={() => !readOnly && summary && setEditing(true)}><strong>{summary?.overview || recording.transcript || recording.processingError || "等待生成对接结论"}</strong>{summary?.pendingItems.length ? <ul>{summary.pendingItems.slice(0, 3).map((item) => <li key={item}>{item}</li>)}</ul> : <span>暂无待处理事项</span>}</div>}
     {expanded && <div className="recording-expanded">
       <SummaryView summary={summary} />
       {(summary?.status === "error" || summary?.status === "stale" || !summary) && recording.transcript && <button className="summary-trigger" onClick={() => { if (summary?.userEdited) { setConfirmResummarize(true); return; } void api.retryRecordingSummary(recording.id).then(() => { notify("正在梳理录音"); onRefresh(); }).catch((reason) => notify(String(reason))); }}><RefreshCw />{summary?.status === "stale" ? "重新梳理" : "梳理总结"}</button>}
@@ -455,12 +719,13 @@ function displayRecordingStatus(recording: Recording, summary: RecordingSummary 
   return { label: recording.processingStatus === "completed" ? "待梳理" : "处理中", tone: "working", loading: recording.processingStatus !== "completed" };
 }
 
-function CreateTaskDialog({ snapshot, initialUrl, initialSlot, onClose, onCreated, notify }: { snapshot: Snapshot; initialUrl: string; initialSlot: number | null; onClose: () => void; onCreated: (snapshot: Snapshot) => void; notify: (message: string) => void }) {
+function CreateTaskDialog({ snapshot, setSnapshot, initialUrl, initialSlot, onClose, onCreated, notify }: { snapshot: Snapshot; setSnapshot: (value: Snapshot) => void; initialUrl: string; initialSlot: number | null; onClose: () => void; onCreated: (snapshot: Snapshot) => void; notify: (message: string) => void }) {
   const occupied = snapshot.tasks.filter((task) => task.status === "active" && task.group === "red" && task.slot != null).map((task) => task.slot!);
   const [title, setTitle] = useState("");
   const [sourceTitle, setSourceTitle] = useState<string | null>(null);
   const [url, setUrl] = useState(initialUrl);
-  const [slot, setSlot] = useState<number | null>(initialSlot != null && !occupied.includes(initialSlot) ? initialSlot : null);
+  const firstAvailable = [...Array(10).keys()].find((i) => !occupied.includes(i));
+  const [slot, setSlot] = useState<number | null>(initialSlot != null && !occupied.includes(initialSlot) ? initialSlot : (firstAvailable ?? null));
   const [contactId, setContactId] = useState("");
   const [saving, setSaving] = useState(false);
   const [resolving, setResolving] = useState(false);
@@ -506,7 +771,7 @@ function CreateTaskDialog({ snapshot, initialUrl, initialSlot, onClose, onCreate
     <header><strong>新建</strong><IconButton label="关闭" onClick={onClose}><X /></IconButton></header>
     <label>链接<input autoFocus required value={url} disabled={resolving} onPaste={pasteLink} onChange={(event) => setUrl(event.target.value)} placeholder="https://figma.com/..." /></label>
     <label>标题<input required maxLength={80} value={title} onChange={(event) => { setTitle(event.target.value); setSourceTitle(null); }} placeholder={resolving ? "正在根据链接生成标题…" : "例如：会员续费改版"} /></label>
-    <label>联系人<select value={contactId} onChange={(event) => setContactId(event.target.value)}><option value="">稍后选择</option>{snapshot.contacts.map((contact) => <option value={contact.id} key={contact.id}>{contact.name}</option>)}</select></label>
+    <label>联系人<CreateContactMenu contacts={snapshot.contacts} selectedId={contactId} onSelect={setContactId} setSnapshot={setSnapshot} notify={notify} /></label>
     <div className="slot-blocks">
       <span className="slot-blocks-label">数字键</span>
       <div className="slot-blocks-grid">
@@ -547,7 +812,7 @@ function TaskOverflowDialog({ tasks, onResolved, notify }: { tasks: Task[]; onRe
 }
 
 function SettingsView({ snapshot, setSnapshot, notify }: { snapshot: Snapshot; setSnapshot: (value: Snapshot) => void; notify: (message: string) => void }) {
-  return <div className="settings-page"><header><small>偏好</small><h1>设置</h1></header><section className="settings-section"><h2>通用</h2><SettingToggle label="开机启动" description="登录后自动启动" checked={snapshot.settings.autostart} onChange={(value) => void api.setAutostart(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><SettingToggle label="宠物悬浮窗" description="桌面悬浮按键与任务列表" checked={snapshot.settings.petVisible} onChange={(value) => void api.setPetVisible(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><ShortcutPrefix value={snapshot.settings.shortcuts.taskPrefix} onSaved={setSnapshot} notify={notify} /></section><SnapshotTools setSnapshot={setSnapshot} notify={notify} /><DeepSeekPanel notify={notify} /><LocalModels notify={notify} /></div>;
+  return <div className="settings-page"><header><small>偏好</small><h1>设置</h1></header><section className="settings-section"><h2>通用</h2><SettingToggle label="开机启动" description="登录后自动启动" checked={snapshot.settings.autostart} onChange={(value) => void api.setAutostart(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><SettingToggle label="宠物悬浮窗" description="桌面悬浮按键与任务列表" checked={snapshot.settings.petVisible} onChange={(value) => void api.setPetVisible(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><ShortcutPrefix value={snapshot.settings.shortcuts.taskPrefix} onSaved={setSnapshot} notify={notify} /></section><DeepSeekPanel notify={notify} /><LocalModels notify={notify} /><SnapshotTools setSnapshot={setSnapshot} notify={notify} /></div>;
 }
 
 function ShortcutPrefix({ value, onSaved, notify }: { value: string; onSaved: (value: Snapshot) => void; notify: (message: string) => void }) {
@@ -559,12 +824,16 @@ function ShortcutPrefix({ value, onSaved, notify }: { value: string; onSaved: (v
     if (event.altKey || event.key === "Alt") names.push("Alt");
     if (event.shiftKey || event.key === "Shift") names.push("Shift");
     if (event.metaKey || event.key === "Meta") names.push("Command");
+    // 非修饰键：单键如 A、F1、/ 等直接作为前缀
+    if (event.key.length === 1 && !names.includes(event.key)) names.push(event.key);
+    else if (event.key.startsWith("F") && /^F\d+$/.test(event.key)) names.push(event.key);
+    else if (!["Control","Alt","Shift","Meta"].includes(event.key) && event.key.length > 1) names.push(event.key);
     if (!names.length) return;
     event.preventDefault(); setCapturing(true); const next = Array.from(new Set(names)).join("+"); setDraft(next);
     if (timer.current != null) window.clearTimeout(timer.current);
     timer.current = window.setTimeout(() => { void api.saveShortcuts({ taskPrefix: next }).then(onSaved).then(() => notify(`快捷键前缀已设为 ${next}`)).catch((reason) => notify(String(reason))); setCapturing(false); }, 250);
   }
-  return <div className="shortcut-prefix"><span><strong>快捷键前缀</strong><small>点击后按下修饰键，仅注册数字键</small></span><button className={`shortcut-capture ${capturing ? "capturing" : ""}`} onKeyDown={capture} onKeyUp={() => setCapturing(false)} onClick={(event) => (event.currentTarget as HTMLButtonElement).focus()}>{capturing ? "按下修饰键…" : draft || "Control"}</button></div>;
+  return <div className="shortcut-prefix"><span><strong>快捷键前缀</strong><small>点击后按下组合键，支持任意按键</small></span><button className={`shortcut-capture ${capturing ? "capturing" : ""}`} onKeyDown={capture} onKeyUp={() => setCapturing(false)} onClick={(event) => (event.currentTarget as HTMLButtonElement).focus()}>{capturing ? "按下组合键…" : draft || "Control+Alt"}</button></div>;
 }
 
 function SnapshotTools({ setSnapshot, notify }: { setSnapshot: (value: Snapshot) => void; notify: (message: string) => void }) {
@@ -592,7 +861,7 @@ function DeepSeekPanel({ notify }: { notify: (message: string) => void }) {
 }
 
 function LocalModels({ notify }: { notify: (message: string) => void }) {
-  const models = [{ id: "Qwen3-ASR-1.7B", note: "本地录音转写" }, { id: "Qwen3-ForcedAligner-0.6B", note: "文字时间对齐" }, { id: "3D-Speaker-CAM++", note: "发言人分离" }];
+  const models = [{ id: "Qwen3-ASR-1.7B", note: "本地录音转写" }, { id: "Qwen3-ForcedAligner-0.6B", note: "文字时间对齐" }, { id: "3D-Speaker-CAM++", note: "发言人分离" }, { id: "RapidOCR", note: "本地图片文字识别" }];
   return <section className="settings-section"><div className="section-heading"><div><h2>本地模型</h2><p>录音与转写保留在本机，云端只接收文本。</p></div></div>{models.map((model) => <ModelRow key={model.id} id={model.id} note={model.note} notify={notify} />)}</section>;
 }
 
@@ -600,7 +869,7 @@ function ModelRow({ id, note, notify }: { id: string; note: string; notify: (mes
   const [status, setStatus] = useState<ModelStatus | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   useEffect(() => { void api.modelStatus(id).then(setStatus); let stop: (() => void) | undefined; void onModelStatus((value) => { if (value.id === id) setStatus(value); }).then((cleanup) => { stop = cleanup; }); return () => stop?.(); }, [id]);
-  return <div className="model-row"><div><strong>{id}</strong><small>{note}</small>{status?.downloading && <progress value={status.progressKind === "download" ? status.progress : undefined} max={100} />}</div><span className={`status-badge ${status?.installed ? "success" : status?.error ? "error" : "warning"}`}>{status?.stage ?? "检查中"}</span>{status?.installed ? <IconButton danger label="删除模型" onClick={() => setConfirmDelete(true)}><Trash2 /></IconButton> : <button disabled={status?.downloading} onClick={() => void api.downloadModel(id).catch((reason) => notify(String(reason)))}><Download />{status?.error ? "重试" : "下载"}</button>}{confirmDelete && <ConfirmDialog
+  return <div className="model-row"><div><strong>{id}</strong><small>{note}</small>{status?.downloading && <div className={`model-progress-line${status.progressKind !== "download" ? " indeterminate" : ""}`}><progress value={status.progressKind === "download" ? status.progress : undefined} max={100} />{status.detail && <b>{status.detail}</b>}</div>}{status?.error && <small className="model-error-text">{status.error}</small>}</div><span className={`status-badge ${status?.installed ? "success" : status?.error ? "error" : "warning"}`}>{status?.installed ? "已安装" : status?.downloading ? "下载中" : status?.error ? "下载失败" : "未安装"}</span>{status?.installed ? <IconButton danger label="删除模型" onClick={() => setConfirmDelete(true)}><Trash2 /></IconButton> : <button disabled={status?.downloading} onClick={() => void api.downloadModel(id).catch((reason) => notify(String(reason)))}><Download />{status?.error ? "重试" : "下载"}</button>}{confirmDelete && <ConfirmDialog
     title={`删除 ${id}？`}
     description="删除后可以重新下载。"
     confirmLabel="删除"
@@ -612,7 +881,7 @@ function ModelRow({ id, note, notify }: { id: string; note: string; notify: (mes
 
 function SettingToggle({ label, description, checked, onChange }: { label: string; description: string; checked: boolean; onChange: (value: boolean) => void }) { return <label className="setting-toggle"><span><strong>{label}</strong><small>{description}</small></span><input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} /></label>; }
 
-function EmptyDocument({ completed, onNew }: { completed: boolean; onNew: () => void }) { return <div className="empty-document"><div><FileText /><h1>{completed ? "还没有已完成任务" : "创建第一个任务"}</h1><p>{completed ? "完成的任务会保留全部文本、录音和总结。" : "将任务绑定到数字键，随时切换并记录。"}</p>{!completed && <button className="primary" onClick={onNew}><Plus />新建任务</button>}</div></div>; }
+function EmptyDocument({ completed, onNew }: { completed: boolean; onNew: () => void }) { return <div className={completed ? "completed-list-empty" : "active-list-empty"}>{completed ? <CircleCheck /> : <FileText />}<strong>{completed ? "还没有已完成任务" : "创建第一个任务"}</strong>{!completed && <button className="primary" onClick={onNew}>新建</button>}</div>; }
 
 function TaskHudWindow() {
   const [payload, setPayload] = useState<TaskHudPayload | null>(null);
@@ -634,7 +903,7 @@ function Pet() {
   useEffect(() => { document.documentElement.classList.add("hud-document"); return () => { document.documentElement.classList.remove("hud-document"); }; }, []);
   useEffect(() => { const timer = window.setInterval(() => void api.syncHoverState(), 80); return () => window.clearInterval(timer); }, []);
   async function drag() { setPressed(true); try { await api.setPetDragging(true); await getCurrentWindow().startDragging(); } finally { setPressed(false); void api.setPetDragging(false); } }
-  return <div className={`pet-shell ${petState(currentTask)} ${pressed ? "pressed" : ""}`} onPointerDown={() => void drag()} onContextMenu={(event) => { event.preventDefault(); void api.showConsole(); }}><button className="keycap" title={currentTask?.title ?? "RedKey"}><span><b>{currentTask ? slotLabel(currentTask.slot) : "R"}</b><i>{currentTask ? "ACTIVE" : "READY"}</i></span></button></div>;
+  return <div className={`pet-shell ${petState(currentTask)} ${pressed ? "pressed" : ""}`} onPointerDown={() => void drag()} onContextMenu={(event) => { event.preventDefault(); void api.showConsole(); }}><button className="keycap" title={currentTask?.title ?? "AlphaKey"}><span><b>{currentTask ? slotLabel(currentTask.slot) : "A"}</b><i>{currentTask ? "ACTIVE" : "READY"}</i></span></button></div>;
 }
 
 function IconButton({ label, children, onClick, disabled, active, danger }: { label: string; children: React.ReactNode; onClick?: () => void; disabled?: boolean; active?: boolean; danger?: boolean }) { return <button type="button" className={`icon-button ${active ? "active" : ""} ${danger ? "danger" : ""}`} title={label} aria-label={label} disabled={disabled} onClick={onClick}>{children}</button>; }
@@ -653,10 +922,24 @@ function ConfirmDialog({ title, description, confirmLabel = "确认", cancelLabe
 }
 function NavButton({ active, icon, label, count, onClick }: { active: boolean; icon: React.ReactElement; label: string; count?: number; onClick: () => void }) { return <button className={`nav-button ${active ? "active" : ""}`} onClick={onClick}>{icon}<span>{label}</span>{count != null && <b className="nav-badge">{count}</b>}</button>; }
 function AudioMeter({ level }: { level: number }) { return <span className="audio-meter">{Array.from({ length: 16 }, (_, index) => <i key={index} style={{ height: `${Math.max(12, Math.min(100, 12 + level * 160 * (0.4 + ((index * 7) % 9) / 14)))}%` }} />)}</span>; }
-function LoadingState({ error }: { error?: string | null }) { return <div className="loading-state"><span>R</span><p>{error ?? "正在加载 RedKey…"}</p></div>; }
+function LoadingState({ error }: { error?: string | null }) { return <div className="loading-state"><span>A</span><p>{error ?? "正在加载 AlphaKey…"}</p></div>; }
 function sortRecent(tasks: Task[]) { return [...tasks].sort((a, b) => (b.lastOpenedAt ?? b.startedAt).localeCompare(a.lastOpenedAt ?? a.startedAt)); }
 function formatDate(value: string | null) { if (!value) return ""; const date = new Date(value); return `${date.getFullYear()}/${String(date.getMonth() + 1).padStart(2, "0")}/${String(date.getDate()).padStart(2, "0")} ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`; }
 function formatShortDate(value: string | null) { if (!value) return "未打开"; const date = new Date(value); return `${date.getMonth() + 1}/${date.getDate()} ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`; }
+function formatRelative(value: string | null) {
+  if (!value) return "";
+  const ts = new Date(value).getTime();
+  if (Number.isNaN(ts)) return "";
+  const diffMs = Date.now() - ts;
+  if (diffMs < 0) return "刚刚";
+  const minutes = Math.floor(diffMs / 60000);
+  if (minutes < 1) return "刚刚";
+  if (minutes < 60) return `${minutes} m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} h`;
+  const days = Math.floor(hours / 24);
+  return `${days} d`;
+}
 function formatDuration(seconds: number) { return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`; }
 function formatTimestamp(milliseconds: number) { return formatDuration(Math.floor(milliseconds / 1000)); }
 

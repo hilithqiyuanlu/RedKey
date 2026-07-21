@@ -1,4 +1,5 @@
 use crate::models::{ActionItem, DeepSeekSettings, RecordingSummary, TaskDocument};
+use crate::no_window;
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use reqwest::Client;
@@ -57,7 +58,7 @@ fn remove_key() -> Result<()> {
 #[cfg(target_os = "windows")]
 fn read_key() -> Result<Option<String>> {
     let script = format!("$v=New-Object Windows.Security.Credentials.PasswordVault; try {{$c=$v.Retrieve('{KEY_SERVICE}','{KEY_ACCOUNT}');$c.RetrievePassword();[Console]::Write($c.Password)}} catch {{exit 1}}");
-    let output = Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]).output().context("无法读取 Windows 凭据管理器")?;
+    let output = no_window(&mut Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script])).output().context("无法读取 Windows 凭据管理器")?;
     if !output.status.success() { return Ok(None); }
     Ok(Some(String::from_utf8(output.stdout)?.trim().to_string()))
 }
@@ -65,7 +66,7 @@ fn read_key() -> Result<Option<String>> {
 #[cfg(target_os = "windows")]
 fn write_key(value: &str) -> Result<()> {
     let script = format!("$v=New-Object Windows.Security.Credentials.PasswordVault; try {{$v.Remove($v.Retrieve('{KEY_SERVICE}','{KEY_ACCOUNT}'))}} catch {{}}; $v.Add((New-Object Windows.Security.Credentials.PasswordCredential('{KEY_SERVICE}','{KEY_ACCOUNT}',$env:REDKEY_SECRET)))");
-    let status = Command::new("powershell").env("REDKEY_SECRET", value).args(["-NoProfile", "-NonInteractive", "-Command", &script]).status().context("无法写入 Windows 凭据管理器")?;
+    let status = no_window(&mut Command::new("powershell").env("REDKEY_SECRET", value).args(["-NoProfile", "-NonInteractive", "-Command", &script])).status().context("无法写入 Windows 凭据管理器")?;
     anyhow::ensure!(status.success(), "Windows 凭据管理器拒绝保存 API Key");
     Ok(())
 }
@@ -73,7 +74,7 @@ fn write_key(value: &str) -> Result<()> {
 #[cfg(target_os = "windows")]
 fn remove_key() -> Result<()> {
     let script = format!("$v=New-Object Windows.Security.Credentials.PasswordVault; try {{$v.Remove($v.Retrieve('{KEY_SERVICE}','{KEY_ACCOUNT}'))}} catch {{}}");
-    let _ = Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]).status();
+    let _ = no_window(&mut Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script])).status();
     Ok(())
 }
 

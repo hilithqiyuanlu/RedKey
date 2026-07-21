@@ -166,6 +166,17 @@ CREATE TABLE IF NOT EXISTS recording_summaries (
 CREATE INDEX IF NOT EXISTS idx_recordings_task ON recordings(task_id);
 CREATE INDEX IF NOT EXISTS idx_recordings_created ON recordings(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_text_cards_task ON task_text_cards(task_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS task_image_cards (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  filename TEXT NOT NULL DEFAULT '',
+  mime_type TEXT NOT NULL DEFAULT 'image/png',
+  data TEXT NOT NULL DEFAULT '',
+  content TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_image_cards_task ON task_image_cards(task_id, created_at DESC);
 "#;
 
 pub struct Database {
@@ -234,7 +245,18 @@ impl Database {
                user_edited INTEGER NOT NULL DEFAULT 0,
                updated_at TEXT NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS idx_text_cards_task ON task_text_cards(task_id, created_at DESC);",
+             CREATE INDEX IF NOT EXISTS idx_text_cards_task ON task_text_cards(task_id, created_at DESC);
+             CREATE TABLE IF NOT EXISTS task_image_cards (
+               id TEXT PRIMARY KEY,
+               task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+               filename TEXT NOT NULL DEFAULT '',
+               mime_type TEXT NOT NULL DEFAULT 'image/png',
+               data TEXT NOT NULL DEFAULT '',
+               content TEXT NOT NULL DEFAULT '',
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_image_cards_task ON task_image_cards(task_id, created_at DESC);",
         )?;
         let has_color: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name='color')",
@@ -281,6 +303,10 @@ impl Database {
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('transcript_segments') WHERE name='user_corrected')", [], |row| row.get(0),
         )?;
         if !corrected_exists { self.conn.execute("ALTER TABLE transcript_segments ADD COLUMN user_corrected INTEGER NOT NULL DEFAULT 0", [])?; }
+        let image_content_exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('task_image_cards') WHERE name='content')", [], |row| row.get(0),
+        )?;
+        if !image_content_exists { self.conn.execute("ALTER TABLE task_image_cards ADD COLUMN content TEXT NOT NULL DEFAULT ''", [])?; }
         self.conn.execute(
             "UPDATE tasks SET color='blue' WHERE color IS NULL OR color NOT IN ('blue','green','purple','amber','red')",
             [],
@@ -349,11 +375,10 @@ impl Database {
                     let prefix = raw.pointer("/shortcuts/slots/0").and_then(|value| value.as_str())
                         .and_then(|value| value.rsplit_once('+').map(|(prefix, _)| prefix))
                         .filter(|value| !value.is_empty())
-                        .unwrap_or("Control");
+                        .unwrap_or("Control+Alt");
                     current.shortcuts.task_prefix = prefix.replace("Option", "Alt");
                 }
             }
-            if current.shortcuts.task_prefix == "Control+Alt" { current.shortcuts.task_prefix = "Control".into(); }
             self.conn.execute(
                 "UPDATE settings SET value=?1 WHERE key='app_settings'",
                 [serde_json::to_string(&current)?],
@@ -529,10 +554,15 @@ impl Database {
             let cards = statement.query_map([task_id], |row| Ok(TextCard { id: row.get(0)?, task_id: row.get(1)?, content: row.get(2)?, created_at: row.get(3)?, updated_at: row.get(4)? }))?.collect::<rusqlite::Result<Vec<_>>>()?;
             cards
         };
+        let image_cards = {
+            let mut statement = self.conn.prepare("SELECT id,task_id,filename,mime_type,data,content,created_at,updated_at FROM task_image_cards WHERE task_id=?1 ORDER BY created_at DESC")?;
+            let cards = statement.query_map([task_id], |row| Ok(ImageCard { id: row.get(0)?, task_id: row.get(1)?, filename: row.get(2)?, mime_type: row.get(3)?, data: row.get(4)?, content: row.get(5)?, created_at: row.get(6)?, updated_at: row.get(7)? }))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            cards
+        };
         let recordings = self.list_recordings()?.into_iter().filter(|recording| recording.task_id.as_deref() == Some(task_id)).collect::<Vec<_>>();
         let recording_ids = recordings.iter().map(|recording| recording.id.as_str()).collect::<HashSet<_>>();
         let summaries = self.list_recording_summaries()?.into_iter().filter(|summary| recording_ids.contains(summary.recording_id.as_str())).collect();
-        Ok(TaskDocument { task, text_cards, recordings, summaries })
+        Ok(TaskDocument { task, text_cards, image_cards, recordings, summaries })
     }
 
     pub fn task_document_for_recording(&self, recording_id: &str) -> Result<TaskDocument> {
@@ -570,6 +600,56 @@ impl Database {
         let task_id: String = self.conn.query_row("SELECT task_id FROM task_text_cards WHERE id=?1", [card_id], |row| row.get(0)).context("文本卡不存在")?;
         self.ensure_active_task(&task_id)?;
         self.conn.execute("DELETE FROM task_text_cards WHERE id=?1", [card_id])?;
+        Ok(())
+    }
+
+    pub fn reassign_text_card(&self, card_id: &str, task_id: &str) -> Result<()> {
+        let active: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND EXISTS(SELECT 1 FROM task_revisions r WHERE r.task_id=tasks.id AND r.status='active'))",
+            [task_id], |row| row.get(0),
+        )?;
+        anyhow::ensure!(active, "只能切换到进行中的任务");
+        let changed = self.conn.execute(
+            "UPDATE task_text_cards SET task_id=?2,updated_at=?3 WHERE id=?1",
+            params![card_id, task_id, now()],
+        )?;
+        anyhow::ensure!(changed == 1, "文本卡不存在");
+        Ok(())
+    }
+
+    pub fn create_image_card(&self, task_id: &str, filename: &str, mime_type: &str, data: &str, content: &str) -> Result<ImageCard> {
+        self.ensure_active_task(task_id)?;
+        let id = Uuid::new_v4().to_string();
+        let timestamp = now();
+        self.conn.execute("INSERT INTO task_image_cards(id,task_id,filename,mime_type,data,content,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)", params![id, task_id, filename, mime_type, data, content, timestamp])?;
+        Ok(ImageCard { id, task_id: task_id.into(), filename: filename.into(), mime_type: mime_type.into(), data: data.into(), content: content.into(), created_at: timestamp.clone(), updated_at: timestamp })
+    }
+
+    pub fn update_image_card(&self, card_id: &str, filename: &str, mime_type: &str, data: &str, content: &str) -> Result<()> {
+        let task_id: String = self.conn.query_row("SELECT task_id FROM task_image_cards WHERE id=?1", [card_id], |row| row.get(0)).context("图片卡不存在")?;
+        self.ensure_active_task(&task_id)?;
+        self.conn.execute("UPDATE task_image_cards SET filename=?2,mime_type=?3,data=?4,content=?5,updated_at=?6 WHERE id=?1", params![card_id, filename, mime_type, data, content, now()])?;
+        Ok(())
+    }
+
+    pub fn delete_image_card(&self, card_id: &str) -> Result<()> {
+        let task_id: String = self.conn.query_row("SELECT task_id FROM task_image_cards WHERE id=?1", [card_id], |row| row.get(0)).context("图片卡不存在")?;
+        self.ensure_active_task(&task_id)?;
+        self.conn.execute("DELETE FROM task_image_cards WHERE id=?1", [card_id])?;
+        Ok(())
+    }
+
+    pub fn reassign_image_card(&self, card_id: &str, task_id: &str) -> Result<()> {
+        let active: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND EXISTS(SELECT 1 FROM task_revisions r WHERE r.task_id=tasks.id AND r.status='active'))",
+            [task_id], |row| row.get(0),
+        )?;
+        anyhow::ensure!(active, "只能切换到进行中的任务");
+        let changed = self.conn.execute(
+            "UPDATE task_image_cards SET task_id=?2,updated_at=?3 WHERE id=?1",
+            params![card_id, task_id, now()],
+        )?;
+        anyhow::ensure!(changed == 1, "图片卡不存在");
         Ok(())
     }
 
@@ -809,6 +889,7 @@ impl Database {
             "DELETE FROM progress_events;
              DELETE FROM recording_summaries;
              DELETE FROM task_text_cards;
+             DELETE FROM task_image_cards;
              DELETE FROM recordings;
              DELETE FROM group_slot_bindings;
              DELETE FROM completed_group_slot_bindings;
@@ -886,6 +967,33 @@ impl Database {
         Ok(())
     }
 
+    pub fn swap_slots(&mut self, group: &str, slot_a: i64, slot_b: i64) -> Result<()> {
+        validate_slot(slot_a)?;
+        validate_slot(slot_b)?;
+        anyhow::ensure!(slot_a != slot_b, "不能与同一个槽位交换");
+        let group = self.available_group(group)?;
+        let tx = self.conn.transaction()?;
+        let task_a: Option<String> = tx.query_row(
+            "SELECT task_id FROM group_slot_bindings WHERE group_name=?1 AND slot=?2",
+            params![group, slot_a], |row| row.get(0),
+        ).optional()?;
+        let task_b: Option<String> = tx.query_row(
+            "SELECT task_id FROM group_slot_bindings WHERE group_name=?1 AND slot=?2",
+            params![group, slot_b], |row| row.get(0),
+        ).optional()?;
+        tx.execute("DELETE FROM group_slot_bindings WHERE group_name=?1 AND slot IN (?2,?3)", params![group, slot_a, slot_b])?;
+        if let Some(task_b) = &task_b {
+            tx.execute("DELETE FROM group_slot_bindings WHERE task_id=?1", [task_b])?;
+            tx.execute("INSERT INTO group_slot_bindings(group_name,slot,task_id,created_at) VALUES(?1,?2,?3,?4)", params![group, slot_a, task_b, now()])?;
+        }
+        if let Some(task_a) = &task_a {
+            tx.execute("DELETE FROM group_slot_bindings WHERE task_id=?1", [task_a])?;
+            tx.execute("INSERT INTO group_slot_bindings(group_name,slot,task_id,created_at) VALUES(?1,?2,?3,?4)", params![group, slot_b, task_a, now()])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     fn bind_slot_tx(tx: &Transaction<'_>, group: &str, slot: i64, task_id: Option<&str>) -> Result<()> {
         if let Some(task_id) = task_id {
             let available: bool = tx.query_row(
@@ -956,6 +1064,17 @@ impl Database {
                 params![Uuid::new_v4().to_string(), name, now()],
             )
             .context("联系人已存在")?;
+        Ok(())
+    }
+
+    pub fn rename_contact(&self, contact_id: &str, name: &str) -> Result<()> {
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "联系人姓名不能为空");
+        let rows = self.conn.execute(
+            "UPDATE contacts SET name=?2 WHERE id=?1",
+            params![contact_id, name],
+        )?;
+        anyhow::ensure!(rows > 0, "联系人不存在");
         Ok(())
     }
 

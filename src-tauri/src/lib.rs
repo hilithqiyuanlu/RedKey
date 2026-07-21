@@ -1,7 +1,7 @@
 mod db;
-mod hardware;
 mod llm;
 mod models;
+mod ocr;
 mod speech;
 
 #[cfg(windows)]
@@ -14,10 +14,14 @@ use crate::models::*;
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use tauri_plugin_clipboard_manager::ClipboardExt;
+#[cfg(target_os = "macos")]
 use std::io::{BufRead, BufReader, Write};
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 use std::sync::mpsc;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::Child;
+#[cfg(target_os = "macos")]
+use std::process::{ChildStdin, Command, Stdio};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Duration;
 use tauri::menu::{Menu, MenuItem};
@@ -37,6 +41,7 @@ extern "C" {
 struct RuntimeState {
     db: Mutex<Option<Database>>,
     tray_icon: Mutex<Option<TrayIcon>>,
+    tray_recording_item: Mutex<Option<MenuItem<tauri::Wry>>>,
     keyboard_monitor: Mutex<Option<KeyboardMonitor>>,
     hover_regions: Mutex<HoverRegions>,
     speech_worker: Mutex<Option<speech::SpeechWorker>>,
@@ -52,6 +57,7 @@ impl Default for RuntimeState {
         Self {
             db: Mutex::new(None),
             tray_icon: Mutex::new(None),
+            tray_recording_item: Mutex::new(None),
             keyboard_monitor: Mutex::new(None),
             hover_regions: Mutex::new(HoverRegions::default()),
             speech_worker: Mutex::new(None),
@@ -115,6 +121,16 @@ struct HoverRegions {
 fn err(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
+
+/// 在 Windows 上为子进程设置 CREATE_NO_WINDOW 标志，避免弹出控制台窗口；
+/// 其他平台为 no-op。供 llm/speech 等模块共享。
+#[cfg(windows)]
+pub(crate) fn no_window(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x08000000)
+}
+#[cfg(not(windows))]
+pub(crate) fn no_window(cmd: &mut std::process::Command) -> &mut std::process::Command { cmd }
 
 fn snapshot(app: &AppHandle) -> Result<Snapshot> {
     app.state::<RuntimeState>().db().snapshot()
@@ -473,21 +489,30 @@ fn position_hud(app: &AppHandle) -> Result<tauri::WebviewWindow> {
     let hud = app.get_webview_window("hud").context("提示窗口不存在")?;
     let monitor = hud.primary_monitor()?.context("无法读取主显示器")?;
     let work_area = monitor.work_area();
-    let width = (work_area.size.width as i32 - 64).clamp(640, 2560) as u32;
-    let height = ((work_area.size.height as i32 * 2) / 12).clamp(300, 560) as u32;
+    let width = (work_area.size.width as i32 - 120).clamp(560, 1920) as u32;
+    let height = ((work_area.size.height as i32) / 7).clamp(140, 300) as u32;
     let desired = Size::Physical(PhysicalSize::new(width, height));
     hud.set_size(desired)?;
+    // 先记录当前焦点窗口（控制台），显示 HUD 后立即归还焦点
+    let console_visible = app.get_webview_window("console").and_then(|w| w.is_visible().ok()).unwrap_or(false);
+    hud.show()?;
+    hud.set_always_on_top(true)?;
+    if console_visible {
+        if let Some(console) = app.get_webview_window("console") {
+            let _ = console.set_focus();
+        }
+    }
     let size = hud.outer_size()?;
     let x = work_area.position.x + (work_area.size.width as i32 - size.width as i32) / 2;
     let y = work_area.position.y + ((work_area.size.height as i32 - size.height as i32) as f32 * 0.74) as i32;
     hud.set_position(Position::Physical(PhysicalPosition::new(x, y)))?;
-    hud.set_always_on_top(true)?;
+    #[cfg(target_os = "macos")]
     hud.set_visible_on_all_workspaces(true)?;
     hud.set_ignore_cursor_events(true)?;
     Ok(hud)
 }
 
-fn emit_task_hud(app: &AppHandle) -> Result<()> {
+pub fn emit_task_hud(app: &AppHandle) -> Result<()> {
     let snapshot = snapshot(app)?;
     let slots = (0..10).map(|slot| {
         let task = snapshot.tasks.iter().find(|task| task.group == snapshot.current_group && task.slot == Some(slot) && task.status == "active");
@@ -498,12 +523,11 @@ fn emit_task_hud(app: &AppHandle) -> Result<()> {
         })
     }).collect::<Vec<_>>();
     let hud = position_hud(app)?;
-    hud.show()?;
     hud.emit("redkey://task-hud", serde_json::json!({ "slots": slots }))?;
     Ok(())
 }
 
-fn set_task_hud_visible(app: &AppHandle, visible: bool) -> Result<()> {
+pub fn set_task_hud_visible(app: &AppHandle, visible: bool) -> Result<()> {
     let show = {
         let runtime = app.state::<RuntimeState>();
         let mut state = runtime.hud_state.lock();
@@ -512,7 +536,11 @@ fn set_task_hud_visible(app: &AppHandle, visible: bool) -> Result<()> {
     };
     if show { emit_task_hud(app)?; }
     if !visible {
-        if let Some(hud) = app.get_webview_window("hud") { hud.hide()?; }
+        if let Some(hud) = app.get_webview_window("hud") {
+            // 先清空 HUD 内容，避免 hide() 在某些平台上不立即生效时残留画面
+            let _ = hud.emit("redkey://task-hud", serde_json::json!({ "slots": [] }));
+            hud.hide()?;
+        }
     }
     Ok(())
 }
@@ -595,33 +623,23 @@ fn start_keyboard_monitor(app: &AppHandle, settings: &ShortcutSettings) -> Keybo
     keyboard_windows::start_keyboard_monitor(app, settings)
 }
 
-#[cfg(windows)]
-fn install_keyboard_tap(app: &AppHandle, monitor: &KeyboardMonitor) {
-    keyboard_windows::install_keyboard_tap(app, monitor)
-}
-
 fn update_keyboard_listener(app: &AppHandle, settings: &ShortcutSettings) -> Result<()> {
     settings.validate()?;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    { let _ = (app, settings); return Ok(()); }
-    #[cfg(any(target_os = "macos", windows))]
-    {
-        let state = app.state::<RuntimeState>();
-        let mut monitor = state.keyboard_monitor.lock();
-        if let Some(monitor) = monitor.as_ref() {
-            #[cfg(target_os = "macos")]
-            {
-                *monitor.config.lock() = prefix_config(&settings.task_prefix);
-                *monitor.error.lock() = None;
-                install_keyboard_tap(app, monitor);
-            }
-            #[cfg(windows)]
-            {
-                monitor.update_config(keyboard_windows::PrefixConfig::from_string(&settings.task_prefix));
-            }
-        } else {
-            *monitor = Some(start_keyboard_monitor(app, settings));
+    let state = app.state::<RuntimeState>();
+    let mut monitor = state.keyboard_monitor.lock();
+    if let Some(monitor) = monitor.as_ref() {
+        #[cfg(target_os = "macos")]
+        {
+            *monitor.config.lock() = prefix_config(&settings.task_prefix);
+            *monitor.error.lock() = None;
+            install_keyboard_tap(app, monitor);
         }
+        #[cfg(windows)]
+        {
+            monitor.update_config(keyboard_windows::PrefixConfig::from_string(&settings.task_prefix));
+        }
+    } else {
+        *monitor = Some(start_keyboard_monitor(app, settings));
     }
     Ok(())
 }
@@ -635,20 +653,31 @@ fn set_pet_visible_inner(app: &AppHandle, visible: bool) -> Result<()> {
     Ok(())
 }
 
+fn update_tray_recording_text(app: &AppHandle) {
+    let state = app.state::<RuntimeState>();
+    let is_recording = state.native_recording.lock().is_some();
+    let guard = state.tray_recording_item.lock();
+    if let Some(item) = guard.as_ref() {
+        let _ = item.set_text(if is_recording { "停止录音" } else { "开始录音" });
+    }
+}
+
 fn setup_tray(app: &tauri::App) -> Result<()> {
     let show = MenuItem::with_id(app, "show", "打开控制台", true, None::<&str>)?;
+    let recording = MenuItem::with_id(app, "recording", "开始录音", true, None::<&str>)?;
+    *app.state::<RuntimeState>().tray_recording_item.lock() = Some(recording.clone());
     let pet_visible = app.state::<RuntimeState>().db().settings()?.pet_visible;
     let toggle_pet = MenuItem::with_id(app, "toggle_pet", if pet_visible { "休眠宠物" } else { "唤醒宠物" }, true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &toggle_pet, &settings, &quit])?;
+    let menu = Menu::with_items(app, &[&show, &recording, &toggle_pet, &settings, &quit])?;
     let icon = app
         .default_window_icon()
         .context("应用图标不存在，无法创建菜单栏图标")?
         .clone();
     let builder = TrayIconBuilder::with_id("redkey-tray")
         .menu(&menu)
-        .tooltip("RedKey")
+        .tooltip("AlphaKey")
         .icon(icon)
         .icon_as_template(true)
         .show_menu_on_left_click(true);
@@ -656,6 +685,19 @@ fn setup_tray(app: &tauri::App) -> Result<()> {
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "show" => {
                 let _ = show_console_window(app);
+            }
+            "recording" => {
+                let state = app.state::<RuntimeState>();
+                if state.native_recording.lock().is_some() {
+                    if let Err(e) = stop_native_recording(app.clone()) {
+                        eprintln!("托盘停止录音失败：{e}");
+                    }
+                } else {
+                    if let Err(e) = start_native_recording(app.clone()) {
+                        eprintln!("托盘开始录音失败：{e}");
+                    }
+                }
+                update_tray_recording_text(app);
             }
             "settings" => {
                 let _ = show_settings_window(app);
@@ -674,7 +716,7 @@ fn setup_tray(app: &tauri::App) -> Result<()> {
         .build(app)
         .context("无法创建系统托盘图标")?;
     *app.state::<RuntimeState>().tray_icon.lock() = Some(tray);
-    eprintln!("RedKey menu bar item registered: redkey-tray");
+    eprintln!("AlphaKey menu bar item registered: redkey-tray");
     Ok(())
 }
 
@@ -854,6 +896,52 @@ fn delete_text_card(app: AppHandle, card_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn reassign_text_card(app: AppHandle, card_id: String, task_id: String) -> Result<Snapshot, String> {
+    app.state::<RuntimeState>().db().reassign_text_card(&card_id, &task_id).map_err(err)?;
+    emit_snapshot(&app).map_err(err)
+}
+
+#[tauri::command]
+fn paste_text_card(app: AppHandle, task_id: String) -> Result<TextCard, String> {
+    let text = app.clipboard().read_text().map_err(err)?.trim().to_string();
+    if text.is_empty() { return Err("剪切板为空".into()); }
+    if text.chars().count() > 50_000 { return Err("剪切板文本过长".into()); }
+    let card = app.state::<RuntimeState>().db().create_text_card(&task_id).map_err(err)?;
+    app.state::<RuntimeState>().db().update_text_card(&card.id, &text).map_err(err)?;
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let card = TextCard { id: card.id, task_id: card.task_id, content: text, created_at: timestamp.clone(), updated_at: timestamp };
+    let _ = emit_snapshot(&app);
+    Ok(card)
+}
+
+#[tauri::command]
+fn create_image_card(app: AppHandle, task_id: String, filename: String, mime_type: String, data: String, content: String) -> Result<ImageCard, String> {
+    let card = app.state::<RuntimeState>().db().create_image_card(&task_id, &filename, &mime_type, &data, &content).map_err(err)?;
+    let _ = emit_snapshot(&app);
+    Ok(card)
+}
+
+#[tauri::command]
+fn update_image_card(app: AppHandle, card_id: String, filename: String, mime_type: String, data: String, content: String) -> Result<(), String> {
+    app.state::<RuntimeState>().db().update_image_card(&card_id, &filename, &mime_type, &data, &content).map_err(err)?;
+    let _ = emit_snapshot(&app);
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_image_card(app: AppHandle, card_id: String) -> Result<(), String> {
+    app.state::<RuntimeState>().db().delete_image_card(&card_id).map_err(err)?;
+    let _ = emit_snapshot(&app);
+    Ok(())
+}
+
+#[tauri::command]
+fn reassign_image_card(app: AppHandle, card_id: String, task_id: String) -> Result<Snapshot, String> {
+    app.state::<RuntimeState>().db().reassign_image_card(&card_id, &task_id).map_err(err)?;
+    emit_snapshot(&app).map_err(err)
+}
+
+#[tauri::command]
 fn update_task_title(app: AppHandle, task_id: String, title: String) -> Result<Snapshot, String> {
     app.state::<RuntimeState>().db().update_task_title(&task_id, &title).map_err(err)?;
     emit_snapshot(&app).map_err(err)
@@ -885,7 +973,6 @@ fn clear_all_data(app: AppHandle) -> Result<Snapshot, String> {
         return Err("录音进行中，无法清除数据".into());
     }
     app.state::<RuntimeState>().db().clear_all_data().map_err(err)?;
-    llm::delete_key().map_err(err)?;
     let settings = app.state::<RuntimeState>().db().settings().map_err(err)?;
     if settings.autostart { app.autolaunch().enable().map_err(|error| format!("无法恢复开机启动：{error}"))?; }
     emit_snapshot(&app).map_err(err)
@@ -941,14 +1028,15 @@ fn update_recording_summary(app: AppHandle, recording_id: String, mut summary: R
 
 #[tauri::command]
 fn keyboard_listener_status(app: AppHandle) -> Option<String> {
-    app.state::<RuntimeState>().keyboard_monitor.lock().as_ref().and_then(|monitor| {
-        #[cfg(target_os = "macos")]
-        { monitor.error.lock().clone() }
-        #[cfg(windows)]
-        { monitor.error.lock().clone() }
-        #[cfg(not(any(target_os = "macos", windows)))]
-        { None }
-    })
+    #[cfg(any(target_os = "macos", windows))]
+    {
+        app.state::<RuntimeState>().keyboard_monitor.lock().as_ref().and_then(|monitor| monitor.error.lock().clone())
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        let _ = app;
+        None
+    }
 }
 
 #[tauri::command]
@@ -1001,6 +1089,15 @@ fn bind_slot(app: AppHandle, group: String, slot: i64, task_id: Option<String>) 
 }
 
 #[tauri::command]
+fn swap_slots(app: AppHandle, group: String, slot_a: i64, slot_b: i64) -> Result<Snapshot, String> {
+    app.state::<RuntimeState>()
+        .db()
+        .swap_slots(&group, slot_a, slot_b)
+        .map_err(err)?;
+    emit_snapshot(&app).map_err(err)
+}
+
+#[tauri::command]
 fn set_current_group(app: AppHandle, group: String) -> Result<Snapshot, String> {
     app.state::<RuntimeState>().db().set_current_group(&group).map_err(err)?;
     emit_snapshot(&app).map_err(err)
@@ -1026,6 +1123,15 @@ fn add_contact(app: AppHandle, name: String) -> Result<Snapshot, String> {
     app.state::<RuntimeState>()
         .db()
         .add_contact(&name)
+        .map_err(err)?;
+    emit_snapshot(&app).map_err(err)
+}
+
+#[tauri::command]
+fn rename_contact(app: AppHandle, contact_id: String, name: String) -> Result<Snapshot, String> {
+    app.state::<RuntimeState>()
+        .db()
+        .rename_contact(&contact_id, &name)
         .map_err(err)?;
     emit_snapshot(&app).map_err(err)
 }
@@ -1133,9 +1239,18 @@ fn save_shortcuts(app: AppHandle, shortcuts: ShortcutSettings) -> Result<Snapsho
 #[tauri::command]
 fn start_recording(app: AppHandle) -> Result<String, String> {
     let snapshot = app.state::<RuntimeState>().db().snapshot().map_err(err)?;
-    let current = snapshot.current_task_id.as_deref().and_then(|id| snapshot.tasks.iter().find(|task| task.id == id && task.status == "active" && task.slot.is_some()))
-        .or_else(|| snapshot.tasks.iter().filter(|task| task.status == "active" && task.slot.is_some()).min_by_key(|task| task.manual_order));
-    let id = app.state::<RuntimeState>().db().start_recording(current.map(|task| task.id.as_str())).map_err(err)?;
+    // 优先使用当前任务；若当前任务无 slot 或不存在，回退到最近打开的有 slot 的活动任务。
+    let current = snapshot.current_task_id.as_deref()
+        .and_then(|id| snapshot.tasks.iter().find(|task| task.id == id && task.status == "active" && task.slot.is_some()));
+    let task = current.or_else(|| {
+        let mut candidates: Vec<&Task> = snapshot.tasks.iter()
+            .filter(|task| task.status == "active" && task.slot.is_some())
+            .collect();
+        candidates.sort_by(|a, b| b.last_opened_at.cmp(&a.last_opened_at));
+        candidates.into_iter().next()
+    });
+    let task_id = task.map(|task| task.id.as_str()).ok_or_else(|| "没有绑定按键的任务，无法录音".to_string())?;
+    let id = app.state::<RuntimeState>().db().start_recording(Some(task_id)).map_err(err)?;
     emit_snapshot(&app).map_err(err)?;
     Ok(id)
 }
@@ -1155,7 +1270,7 @@ async fn request_microphone_permission() -> Result<bool, String> {
                     _ => std::thread::sleep(Duration::from_millis(100)),
                 }
             }
-            Err("等待麦克风授权超时，请重新打开 RedKey 后再试".into())
+            Err("等待麦克风授权超时，请重新打开 AlphaKey 后再试".into())
         })
         .await
         .map_err(err)?;
@@ -1175,7 +1290,13 @@ fn start_native_recording(app: AppHandle) -> Result<String, String> {
         let dir = app.path().app_data_dir().map_err(err)?.join("recordings");
         std::fs::create_dir_all(&dir).map_err(err)?;
         let path = dir.join(format!("{id}.wav"));
-        let mut child = Command::new(env!("REDKEY_AUDIO_HELPER")).arg(&path).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(err)?;
+        let mut child = match Command::new(env!("REDKEY_AUDIO_HELPER")).arg(&path).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = app.state::<RuntimeState>().db().fail_recording(&id, &format!("音频进程启动失败：{e}"));
+                return Err(format!("音频进程启动失败：{e}"));
+            }
+        };
         let input = child.stdin.take().ok_or("无法连接录音进程")?;
         let stdout = child.stdout.take().ok_or("无法读取录音进程")?;
         let mut reader = BufReader::new(stdout);
@@ -1187,17 +1308,25 @@ fn start_native_recording(app: AppHandle) -> Result<String, String> {
             return Err("无法启动系统麦克风，请检查麦克风权限".into());
         }
         *app.state::<RuntimeState>().native_recording.lock() = Some(NativeRecording { id: id.clone(), path, started: std::time::Instant::now(), child, input });
+        update_tray_recording_text(&app);
         Ok(id)
     }
     #[cfg(windows)]
     {
         if app.state::<RuntimeState>().native_recording.lock().is_some() { return Err("已经在录音".into()); }
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = start_recording(app.clone())?;
         let dir = app.path().app_data_dir().map_err(err)?.join("recordings");
         std::fs::create_dir_all(&dir).map_err(err)?;
         let path = dir.join(format!("{id}.wav"));
-        let recording = recording_windows::start_recording(id.clone(), path.clone()).map_err(err)?;
+        let recording = match recording_windows::start_recording(id.clone(), path.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = app.state::<RuntimeState>().db().fail_recording(&id, &format!("麦克风启动失败：{e}"));
+                return Err(format!("麦克风启动失败：{e}"));
+            }
+        };
         *app.state::<RuntimeState>().native_recording.lock() = Some(recording);
+        update_tray_recording_text(&app);
         Ok(id)
     }
 }
@@ -1225,6 +1354,7 @@ fn stop_native_recording(app: AppHandle) -> Result<Snapshot, String> {
     begin_processing(&app, &recording.id);
     let background_app = app.clone();
     std::thread::spawn(move || run_transcription_pipeline(background_app, recording.path, recording.id));
+    update_tray_recording_text(&app);
     snapshot(&app).map_err(err)
 }
 
@@ -1335,7 +1465,8 @@ fn reveal_model_dir(app: AppHandle, model_id: String) -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("explorer").arg(&dir).spawn().map_err(|e| e.to_string())?;
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new("explorer").arg(&dir).creation_flags(0x08000000).spawn().map_err(|e| e.to_string())?;
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -1481,7 +1612,15 @@ pub fn run() {
             let _ = show_console_window(app);
         }))
         .plugin(tauri_plugin_clipboard_manager::init())
-        .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                // The HUD's visibility is purely a transient reflection of the
+                // shortcut prefix key being held; persisting/restoring it across
+                // launches can leave it shown (and, on Windows, blocking clicks
+                // underneath it) even before any key is pressed.
+                .skip_initial_state("hud")
+                .build(),
+        )
         .plugin({
             tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec!["--background"]))
         })
@@ -1497,6 +1636,7 @@ pub fn run() {
             let settings = database.settings().unwrap_or_default();
             if settings.autostart { let _ = app.autolaunch().enable(); }
             *app.state::<RuntimeState>().db.lock() = Some(database);
+            let _ = emit_snapshot(app.handle());
             if let Err(e) = update_keyboard_listener(app.handle(), &settings.shortcuts) {
                 eprintln!("Failed to start keyboard listener: {e}");
             }
@@ -1505,6 +1645,14 @@ pub fn run() {
             }
             if !settings.pet_visible {
                 if let Some(pet) = app.get_webview_window("pet") { let _ = pet.hide(); }
+            }
+            // Defensive reset: the HUD should always start hidden and click-through.
+            // Without this, a HUD left visible from an unclean previous exit (or a
+            // platform where nothing sets ignore-cursor-events at show time) would
+            // block mouse input to whatever sits underneath its bounds.
+            if let Some(hud) = app.get_webview_window("hud") {
+                let _ = hud.set_ignore_cursor_events(true);
+                let _ = hud.hide();
             }
             // Force non-overlay scrollbar on macOS WebKit
             if let Some(window) = app.get_webview_window("console") { let _ = window.eval("document.documentElement.style.scrollbarGutter='stable'"); }
@@ -1528,6 +1676,12 @@ pub fn run() {
             create_text_card,
             update_text_card,
             delete_text_card,
+            reassign_text_card,
+            paste_text_card,
+            create_image_card,
+            update_image_card,
+            delete_image_card,
+            reassign_image_card,
             update_task_title,
             update_task_contact,
             update_task_link,
@@ -1549,8 +1703,10 @@ pub fn run() {
             set_current_group,
             set_group_name,
             bind_slot,
+            swap_slots,
             move_task_to_top,
             add_contact,
+            rename_contact,
             remove_contact,
             dispatch_action,
             update_settings,
@@ -1586,6 +1742,7 @@ pub fn run() {
             show_console,
             open_console_new_task,
             resolve_link_title,
+            crate::ocr::perform_ocr,
         ]);
 
     let app = builder

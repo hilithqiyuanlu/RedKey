@@ -15,23 +15,25 @@ pub struct PrefixConfig {
     pub alt: bool,
     pub shift: bool,
     pub win: bool,
+    pub caps: bool,
 }
 
 impl Default for PrefixConfig {
     fn default() -> Self {
-        Self { control: false, alt: true, shift: false, win: false }
+        Self { control: true, alt: true, shift: false, win: false, caps: false }
     }
 }
 
 impl PrefixConfig {
     pub fn from_string(value: &str) -> Self {
-        let mut config = Self { control: false, alt: false, shift: false, win: false };
+        let mut config = Self { control: false, alt: false, shift: false, win: false, caps: false };
         for item in value.split('+').map(str::trim) {
             match item {
                 "Control" => config.control = true,
                 "Alt" | "Option" => config.alt = true,
                 "Shift" => config.shift = true,
                 "Command" | "Win" | "Windows" => config.win = true,
+                "CapsLock" => config.caps = true,
                 _ => {}
             }
         }
@@ -49,6 +51,10 @@ struct SharedState {
     // the shortcut prefix in settings: an RwLock lets the hot path take a
     // cheap read lock instead of contending on a plain Mutex.
     config: RwLock<PrefixConfig>,
+    // Track modifier state locally instead of reading GetAsyncKeyState, because
+    // the hook runs before the system updates key state, so key-up events would
+    // still read as "pressed" and the HUD would not dismiss on release.
+    modifiers: Mutex<PrefixConfig>,
     // Never replaced after the monitor starts, so it doesn't need a Mutex —
     // mpsc::Sender is already Clone + Send + Sync.
     sender: mpsc::Sender<KeyboardEvent>,
@@ -72,38 +78,29 @@ fn vk_to_action(vk: u32) -> Option<AppAction> {
     }
 }
 
-fn is_modifier_vk(vk: u32) -> bool {
-    vk == VK_CONTROL as u32
-        || vk == VK_LCONTROL as u32
-        || vk == VK_RCONTROL as u32
-        || vk == VK_MENU as u32
-        || vk == VK_LMENU as u32
-        || vk == VK_RMENU as u32
-        || vk == VK_SHIFT as u32
-        || vk == VK_LSHIFT as u32
-        || vk == VK_RSHIFT as u32
-        || vk == VK_LWIN as u32
-        || vk == VK_RWIN as u32
-}
-
-fn get_current_modifiers() -> (bool, bool, bool, bool) {
-    unsafe {
-        let ctrl = (GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000) != 0;
-        let alt = (GetAsyncKeyState(VK_MENU as i32) as u16 & 0x8000) != 0;
-        let shift = (GetAsyncKeyState(VK_SHIFT as i32) as u16 & 0x8000) != 0;
-        let win = (GetAsyncKeyState(VK_LWIN as i32) as u16 & 0x8000) != 0 || (GetAsyncKeyState(VK_RWIN as i32) as u16 & 0x8000) != 0;
-        (ctrl, alt, shift, win)
+fn vk_modifier_kind(vk: u32) -> Option<fn(&mut PrefixConfig, bool)> {
+    match vk {
+        v if v == VK_CONTROL as u32
+            || v == VK_LCONTROL as u32
+            || v == VK_RCONTROL as u32 => Some(|m, v| m.control = v),
+        v if v == VK_MENU as u32
+            || v == VK_LMENU as u32
+            || v == VK_RMENU as u32 => Some(|m, v| m.alt = v),
+        v if v == VK_SHIFT as u32
+            || v == VK_LSHIFT as u32
+            || v == VK_RSHIFT as u32 => Some(|m, v| m.shift = v),
+        v if v == VK_LWIN as u32 || v == VK_RWIN as u32 => Some(|m, v| m.win = v),
+        v if v == VK_CAPITAL as u32 => Some(|m, v| m.caps = v),
+        _ => None,
     }
 }
 
-fn exact_prefix_match(config: &PrefixConfig) -> bool {
-    let (ctrl, alt, shift, win) = get_current_modifiers();
-    if config.control != ctrl { return false; }
-    if config.alt != alt { return false; }
-    if config.shift != shift { return false; }
-    if config.win != win { return false; }
-    let extra = (ctrl && !config.control) || (alt && !config.alt) || (shift && !config.shift) || (win && !config.win);
-    !extra
+fn exact_prefix_match(config: &PrefixConfig, modifiers: &PrefixConfig) -> bool {
+    config.control == modifiers.control
+        && config.alt == modifiers.alt
+        && config.shift == modifiers.shift
+        && config.win == modifiers.win
+        && config.caps == modifiers.caps
 }
 
 unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
@@ -115,15 +112,24 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
     let vk = kbd_struct.vkCode;
     let is_down = matches!(w_param as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
 
-    if let Some(state) = &SHARED_STATE {
+    let shared = unsafe { &*core::ptr::addr_of_mut!(SHARED_STATE) };
+    if let Some(state) = shared {
         let config = *state.config.read();
-        if is_modifier_vk(vk) {
-            let active = exact_prefix_match(&config);
+        if let Some(update_modifier) = vk_modifier_kind(vk) {
+            // 修饰键：先更新本地状态，再判断前缀是否匹配
+            let mut modifiers = state.modifiers.lock();
+            update_modifier(&mut modifiers, is_down);
+            let active = exact_prefix_match(&config, &modifiers);
+            drop(modifiers);
             let _ = state.sender.send(KeyboardEvent::Prefix(active));
-        } else if is_down && exact_prefix_match(&config) {
-            if let Some(action) = vk_to_action(vk) {
-                let _ = state.sender.send(KeyboardEvent::Action(action));
-                return 1;
+        } else if is_down {
+            // 非修饰键且按下：检查前缀是否匹配，匹配则触发动作并吞键
+            let modifiers = *state.modifiers.lock();
+            if exact_prefix_match(&config, &modifiers) {
+                if let Some(action) = vk_to_action(vk) {
+                    let _ = state.sender.send(KeyboardEvent::Action(action));
+                    return 1;
+                }
             }
         }
     }
@@ -135,7 +141,6 @@ pub struct KeyboardMonitor {
     pub config: Arc<Mutex<PrefixConfig>>,
     pub error: Arc<Mutex<Option<String>>>,
     pub running: Arc<AtomicBool>,
-    pub sender: mpsc::Sender<KeyboardEvent>,
     shared_state: Arc<SharedState>,
 }
 
@@ -188,24 +193,21 @@ pub fn start_keyboard_monitor(app: &AppHandle, settings: &crate::models::Shortcu
 
     let shared_state = Arc::new(SharedState {
         config: RwLock::new(PrefixConfig::from_string(&settings.task_prefix)),
-        sender: sender.clone(),
+        modifiers: Mutex::new(PrefixConfig { control: false, alt: false, shift: false, win: false, caps: false }),
+        sender,
     });
 
     std::thread::spawn(move || {
         for event in receiver {
             match event {
                 KeyboardEvent::Prefix(active) => {
-                    let state = app_handle.state::<crate::RuntimeState>();
-                    state.hud_state.lock().prefix_held = active;
-                    if let Some(hud) = app_handle.get_webview_window("hud") {
-                        if active { let _ = hud.show(); } else { let _ = hud.hide(); }
-                    }
+                    let _ = crate::set_task_hud_visible(&app_handle, active);
                     let _ = app_handle.emit("redkey://prefix-changed", active);
                 }
                 KeyboardEvent::Action(AppAction::ActivateSlot { slot }) => {
                     let _ = crate::dispatch_internal(&app_handle, AppAction::ActivateSlot { slot });
                     if app_handle.state::<crate::RuntimeState>().hud_state.lock().prefix_held {
-                        let _ = app_handle.emit("redkey://show-hud", ());
+                        let _ = crate::emit_task_hud(&app_handle);
                     }
                 }
                 KeyboardEvent::Action(action) => {
@@ -219,7 +221,6 @@ pub fn start_keyboard_monitor(app: &AppHandle, settings: &crate::models::Shortcu
         config: config.clone(),
         error,
         running,
-        sender,
         shared_state,
     };
     install_keyboard_tap(app, &monitor);
@@ -229,7 +230,7 @@ pub fn start_keyboard_monitor(app: &AppHandle, settings: &crate::models::Shortcu
 impl KeyboardMonitor {
     pub fn update_config(&self, new_config: PrefixConfig) {
         *self.config.lock() = new_config;
-        if let Some(state) = unsafe { &SHARED_STATE } {
+        if let Some(state) = unsafe { &*core::ptr::addr_of_mut!(SHARED_STATE) } {
             *state.config.write() = new_config;
         }
     }

@@ -42,7 +42,7 @@ pub struct ShortcutSettings {
     pub task_prefix: String,
 }
 
-fn default_task_prefix() -> String { "Control".into() }
+fn default_task_prefix() -> String { "Control+Alt".into() }
 
 impl Default for ShortcutSettings {
     fn default() -> Self {
@@ -54,10 +54,7 @@ impl ShortcutSettings {
     pub fn validate(&self) -> anyhow::Result<()> {
         let values = self.task_prefix.split('+').map(str::trim).filter(|value| !value.is_empty()).collect::<Vec<_>>();
         anyhow::ensure!(!values.is_empty(), "前缀不能为空");
-        anyhow::ensure!(values.len() <= 4, "前缀最多包含四个修饰键");
-        anyhow::ensure!(values.iter().all(|value| matches!(*value, "Control" | "Alt" | "Option" | "Shift" | "Command")), "前缀只能使用修饰键");
-        let unique = values.iter().map(|value| value.to_lowercase()).collect::<std::collections::HashSet<_>>();
-        anyhow::ensure!(unique.len() == values.len(), "前缀不能重复按键");
+        anyhow::ensure!(values.len() <= 4, "前缀最多包含四个按键");
         Ok(())
     }
 }
@@ -139,6 +136,22 @@ pub struct TextCard {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct ImageCard {
+    pub id: String,
+    pub task_id: String,
+    pub filename: String,
+    pub mime_type: String,
+    /// base64-encoded image data (empty for placeholder cards)
+    pub data: String,
+    /// OCR text or placeholder hint
+    #[serde(default)]
+    pub content: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct ActionItem {
     pub text: String,
     pub owner: Option<String>,
@@ -169,6 +182,7 @@ pub struct RecordingSummary {
 pub struct TaskDocument {
     pub task: Task,
     pub text_cards: Vec<TextCard>,
+    pub image_cards: Vec<ImageCard>,
     pub recordings: Vec<Recording>,
     pub summaries: Vec<RecordingSummary>,
 }
@@ -347,14 +361,14 @@ mod tests {
     #[test]
     fn default_shortcuts_use_task_prefix() {
         let shortcuts = ShortcutSettings::default();
-        assert_eq!(shortcuts.task_prefix, "Control");
+        assert_eq!(shortcuts.task_prefix, "Control+Alt");
         assert!(shortcuts.validate().is_ok());
     }
 
     #[test]
-    fn task_prefix_rejects_regular_keys() {
+    fn task_prefix_allows_regular_keys() {
         let mut shortcuts = ShortcutSettings::default();
         shortcuts.task_prefix = "Control+T".into();
-        assert!(shortcuts.validate().is_err());
+        assert!(shortcuts.validate().is_ok());
     }
 }

@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "RedKey",
+  "productName": "AlphaKey",
   "version": "0.1.0",
-  "identifier": "com.hilith.redkey",
+  "identifier": "com.hilith.alphakey",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://127.0.0.1:1420",
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "console",
-        "title": "RedKey",
+        "title": "AlphaKey",
         "url": "index.html?view=console",
         "width": 1080,
         "height": 720,
@@ -24,7 +24,7 @@
       },
       {
         "label": "pet",
-        "title": "RedKey Pet",
+        "title": "AlphaKey Pet",
         "url": "index.html?view=pet",
         "width": 112,
         "height": 112,
@@ -40,7 +40,7 @@
       },
       {
         "label": "quick-panel",
-        "title": "RedKey Quick Panel",
+        "title": "AlphaKey Quick Panel",
         "url": "index.html?view=quick",
         "width": 320,
         "height": 420,
@@ -52,7 +52,7 @@
       },
       {
         "label": "hud",
-        "title": "RedKey HUD",
+        "title": "AlphaKey HUD",
         "url": "index.html?view=hud",
         "width": 2560,
         "height": 680,
@@ -61,7 +61,7 @@
         "transparent": true,
         "backgroundColor": "#00000000",
         "alwaysOnTop": true,
-        "focusable": false,
+        "focusable": true,
         "skipTaskbar": true,
         "resizable": false,
         "shadow": false
@@ -75,7 +75,8 @@
     "active": true,
     "resources": {
       "../workers/qwen_asr_worker.py": "workers/qwen_asr_worker.py",
-      "../workers/diarization_worker.py": "workers/diarization_worker.py"
+      "../workers/diarization_worker.py": "workers/diarization_worker.py",
+      "../workers/ocr_worker.py": "workers/ocr_worker.py"
     },
     "targets": ["nsis"],
     "icon": [
@@ -86,8 +87,8 @@
       "icons/icon.ico"
     ],
     "category": "Productivity",
-    "shortDescription": "A tactile task controller for Figma workflows",
-    "longDescription": "RedKey binds Figma tasks to keyboard shortcuts and keeps progress visible from a compact desktop controller.",
+    "shortDescription": "A tactile task controller for workflows",
+    "longDescription": "AlphaKey binds tasks to keyboard shortcuts and keeps progress visible from a compact desktop controller.",
     "macOS": {
       "minimumSystemVersion": "10.15",
       "infoPlist": "Info.plist",
