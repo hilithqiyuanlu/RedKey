@@ -232,6 +232,19 @@ fn default_progress_kind() -> String { "idle".into() }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AsrModelStatus {
+    pub id: String,
+    pub name: String,
+    pub bundled: bool,
+    pub ready: bool,
+    pub downloading: bool,
+    pub progress: u8,
+    pub stage: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateTaskInput {
     pub title: String,
     pub title_mode: String,

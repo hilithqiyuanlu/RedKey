@@ -79,7 +79,7 @@
       "resources/models/FunASR": "models/FunASR",
       "resources/models/RapidOCR": "models/RapidOCR"
     },
-    "targets": ["nsis"],
+    "targets": ["nsis", "app", "dmg"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -94,12 +94,9 @@
       "minimumSystemVersion": "10.15",
       "infoPlist": "Info.plist",
       "entitlements": "Entitlements.plist",
-      "signingIdentity": "D714C62392BCC2C26F114278A7734F18AF562AC8"
+      "signingIdentity": "-"
     },
     "windows": {
-      "certificateThumbprint": "1DF87D8F0EC52A9D02468AB48F2364A5C3433A4B",
-      "digestAlgorithm": "sha256",
-      "timestampUrl": "http://timestamp.digicert.com",
       "nsis": {
         "installMode": "currentUser"
       }

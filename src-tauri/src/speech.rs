@@ -1,13 +1,14 @@
-use crate::models::{ModelStatus, SpeakerSegment};
+use crate::models::{AsrModelStatus, ModelStatus, SpeakerSegment};
 use crate::no_window;
 use anyhow::{bail, Context, Result};
 use serde_json::json;
 use std::{
+    collections::HashMap,
     fs,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}},
     time::Duration,
 };
 use tauri::{AppHandle, Emitter, Manager};
