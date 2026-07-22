@@ -6,10 +6,10 @@ import {
   FileImage, FileText, KeyRound, Link2, ListTodo, LoaderCircle, Mic, MicOff, Pause, Pencil, Play,
   Plus, RefreshCw, RotateCcw, Settings as SettingsIcon, Sparkles, Trash2, UserRound, X,
 } from "lucide-react";
-import { api, onLinkDrop, onNewTask, onPetMode, onQuickPanelShown, onRecordingToggle, onTaskHud } from "./api";
+import { api, onAsrModelDownloadProgress, onLinkDrop, onNewTask, onPetMode, onQuickPanelShown, onRecordingToggle, onTaskHud } from "./api";
 import { extractHttpUrl, petState, slotLabel } from "./domain";
 import type {
-  DeepSeekSettings, ImageCard, Recording, RecordingDetail, RecordingSummary, Settings,
+  AsrModelStatus, DeepSeekSettings, ImageCard, Recording, RecordingDetail, RecordingSummary, Settings,
   Snapshot, Task, TaskDocument, TaskHudPayload, TextCard,
 } from "./types";
 import { useSnapshot } from "./useSnapshot";
@@ -1124,8 +1124,80 @@ function DeepSeekPanel({ notify }: { notify: (message: string) => void }) {
 }
 
 function LocalModels() {
-  const models = [{ id: "FunASR", note: "本地录音转写、标点与发言人分离" }, { id: "RapidOCR", note: "本地图片文字识别" }];
-  return <section className="settings-section"><div className="section-heading"><div><h2>本地模型</h2><p>模型已内置在安装包中，无需额外下载。</p></div></div>{models.map((model) => <div className="model-row" key={model.id}><div><strong>{model.id}</strong><small>{model.note}</small></div><span className="status-badge success">已内置</span></div>)}</section>;
+  const [models, setModels] = useState<AsrModelStatus[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  async function refresh() {
+    setLoading(true);
+    try { setModels(await api.asrModelStatuses()); }
+    catch { setModels([]); }
+    finally { setLoading(false); }
+  }
+
+  useEffect(() => {
+    void refresh();
+    let cleanup: (() => void) | undefined;
+    void onAsrModelDownloadProgress((payload) => {
+      setModels((prev) => prev.map((m) => {
+        if (m.id !== payload.id) return m;
+        return {
+          ...m,
+          downloading: payload.stage === "下载中" || payload.stage === "准备中" || payload.stage === "连接中" || payload.stage === "解压中",
+          progress: payload.progress,
+          stage: payload.stage,
+          error: payload.error,
+          ready: payload.stage === "已就绪",
+        };
+      }));
+    }).then((stop) => { cleanup = stop; });
+    return () => cleanup?.();
+  }, []);
+
+  async function download(id: string) {
+    setModels((prev) => prev.map((m) => m.id === id ? { ...m, downloading: true, stage: "准备中", error: null } : m));
+    try {
+      await api.downloadAsrModel(id);
+    } catch (reason) {
+      setModels((prev) => prev.map((m) => m.id === id ? { ...m, downloading: false, stage: "下载失败", error: String(reason) } : m));
+    }
+  }
+
+  return (
+    <section className="settings-section">
+      <div className="section-heading">
+        <div>
+          <h2>本地模型</h2>
+          <p>FunASR 大模型首次使用前需下载，小模型与 OCR 已内置。</p>
+        </div>
+        <button className="icon-button" title="刷新状态" onClick={() => void refresh()} disabled={loading}>
+          <RefreshCw className={loading ? "spin" : ""} />
+        </button>
+      </div>
+      {models.map((model) => (
+        <div className="model-row" key={model.id}>
+          <div>
+            <strong>{model.name}</strong>
+            <small>{model.id}{model.bundled ? " · 已内置" : " · 首次使用需下载"}</small>
+          </div>
+          <div className="model-status">
+            {model.ready ? (
+              <span className="status-badge success"><CircleCheck size={14} /> 已就绪</span>
+            ) : model.downloading ? (
+              <div className="model-progress">
+                <span>{model.stage} {model.progress}%</span>
+                <div className="progress-bar"><div style={{ width: `${model.progress}%` }} /></div>
+              </div>
+            ) : (
+              <button className="status-badge" onClick={() => void download(model.id)} disabled={model.downloading}>
+                {model.error ? "重试" : "下载"}
+              </button>
+            )}
+            {model.error && <small className="model-error">{model.error}</small>}
+          </div>
+        </div>
+      ))}
+    </section>
+  );
 }
 
 function SettingToggle({ label, description, checked, onChange }: { label: string; description: string; checked: boolean; onChange: (value: boolean) => void }) { return <label className="setting-toggle"><span><strong>{label}</strong><small>{description}</small></span><input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} /></label>; }

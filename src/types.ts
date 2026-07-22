@@ -107,6 +107,17 @@ export interface ModelStatus {
   verified: boolean;
 }
 
+export interface AsrModelStatus {
+  id: string;
+  name: string;
+  bundled: boolean;
+  ready: boolean;
+  downloading: boolean;
+  progress: number;
+  stage: string;
+  error: string | null;
+}
+
 export interface TaskHudPayload {
   slots: { slot: number; taskId: string | null; name: string | null; title: string | null }[];
 }

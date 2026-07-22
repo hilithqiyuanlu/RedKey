@@ -3,11 +3,9 @@
 协议：每行一个 JSON 请求，输出也是每行一个 JSON。Rust/Tauri 只负责进程
 生命周期和数据库，不直接依赖 Python 包。
 
-使用本地内置模型（随安装包分发）：
-- /models/FunASR/SenseVoiceSmall
-- /models/FunASR/FSMN-VAD
-- /models/FunASR/CT-Transformer
-- /models/FunASR/CAM++
+模型来源：
+- 内置（随安装包分发）：CAM++、FSMN-VAD
+- 下载（首次使用时从 GitHub Release 下载）：CT-Transformer、SenseVoiceSmall
 """
 
 import json
@@ -25,20 +23,45 @@ def resource_dir() -> Path:
     return Path("/models")
 
 
+def model_dirs():
+    """返回每个模型所在的目录。"""
+    bundle = Path(os.environ.get("BUNDLE_MODEL_DIR", resource_dir() / "FunASR"))
+    data = Path(os.environ.get("DATA_MODEL_DIR", resource_dir() / "FunASR"))
+    return {
+        "CAM++": bundle / "CAM++",
+        "FSMN-VAD": bundle / "FSMN-VAD",
+        "CT-Transformer": data / "CT-Transformer",
+        "SenseVoiceSmall": data / "SenseVoiceSmall",
+    }
+
+
+def check_models(dirs):
+    required = {
+        "SenseVoiceSmall": "model.pt",
+        "FSMN-VAD": "model.pt",
+        "CT-Transformer": "model.pt",
+        "CAM++": "campplus_cn_en_common.pt",
+    }
+    missing = [name for name, marker in required.items() if not (dirs[name] / marker).exists()]
+    if missing:
+        raise FileNotFoundError(f"缺少模型：{', '.join(missing)}，请前往设置页下载")
+
+
 def emit(value):
     sys.stdout.write(json.dumps(value, ensure_ascii=False) + "\n")
     sys.stdout.flush()
 
 
 def load_model():
-    base = resource_dir() / "FunASR"
+    dirs = model_dirs()
+    check_models(dirs)
     from funasr import AutoModel
 
     return AutoModel(
-        model=str(base / "SenseVoiceSmall"),
-        vad_model=str(base / "FSMN-VAD"),
-        punc_model=str(base / "CT-Transformer"),
-        spk_model=str(base / "CAM++"),
+        model=str(dirs["SenseVoiceSmall"]),
+        vad_model=str(dirs["FSMN-VAD"]),
+        punc_model=str(dirs["CT-Transformer"]),
+        spk_model=str(dirs["CAM++"]),
         device="cpu",
     )
 

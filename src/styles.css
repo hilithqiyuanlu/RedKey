@@ -2177,6 +2177,47 @@ button.primary:hover,
 .model-row progress::-moz-progress-bar { background: var(--accent); }
 .model-row progress:indeterminate { background: var(--surface-alt); }
 
+.model-status {
+  display: grid;
+  gap: 4px;
+  justify-items: end;
+}
+.model-status button.status-badge {
+  cursor: pointer;
+  border: none;
+  background: var(--surface-alt);
+  color: var(--fg);
+}
+.model-status button.status-badge:hover { background: var(--border); }
+.model-progress {
+  display: grid;
+  gap: 4px;
+  width: min(220px, 40vw);
+}
+.model-progress span {
+  font-size: 10px;
+  color: var(--muted);
+  text-align: right;
+}
+.progress-bar {
+  height: 6px;
+  background: var(--surface-alt);
+  overflow: hidden;
+}
+.progress-bar > div {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+.model-error {
+  color: var(--destructive);
+  font-size: 10px;
+  line-height: 1.3;
+  max-width: 220px;
+  text-align: right;
+  word-break: break-all;
+}
+
 .model-progress-line.indeterminate progress {
   background: linear-gradient(
     -45deg,

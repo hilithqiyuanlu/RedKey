@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AppAction,
+  AsrModelStatus,
   CreateTaskInput,
   Settings,
   Snapshot,
@@ -115,6 +116,8 @@ export const api = {
   submitDroppedLink: (url: string) => invoke<void>("submit_dropped_link", { url }),
   showConsole: () => invoke<void>("show_console"),
   openConsoleNewTask: (url: string) => invoke<void>("open_console_new_task", { url }),
+  asrModelStatuses: () => invoke<AsrModelStatus[]>("asr_model_statuses"),
+  downloadAsrModel: (id: string) => invoke<void>("download_asr_model", { id }),
 };
 
 export async function onSnapshot(callback: (snapshot: Snapshot) => void): Promise<UnlistenFn> {
@@ -150,4 +153,18 @@ export async function onTaskHud(callback: (payload: TaskHudPayload) => void): Pr
 export async function onPetMode(callback: (mode: string) => void): Promise<UnlistenFn> {
   if (!inTauri()) return () => undefined;
   return listen<string>("redkey://pet-mode", ({ payload }) => callback(payload));
+}
+
+export interface AsrModelDownloadProgress {
+  id: string;
+  progress: number;
+  stage: string;
+  error: string | null;
+}
+
+export async function onAsrModelDownloadProgress(
+  callback: (payload: AsrModelDownloadProgress) => void,
+): Promise<UnlistenFn> {
+  if (!inTauri()) return () => undefined;
+  return listen<AsrModelDownloadProgress>("redkey://model-download-progress", ({ payload }) => callback(payload));
 }

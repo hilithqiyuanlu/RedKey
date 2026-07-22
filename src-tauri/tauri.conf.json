@@ -77,7 +77,8 @@
       "../workers/funasr_asr_worker.py": "workers/funasr_asr_worker.py",
       "../workers/ocr_worker.py": "workers/ocr_worker.py",
       "resources/models/FunASR": "models/FunASR",
-      "resources/models/RapidOCR": "models/RapidOCR"
+      "resources/models/RapidOCR": "models/RapidOCR",
+      "resources/python-embed": "python-embed"
     },
     "targets": ["nsis", "app", "dmg"],
     "icon": [

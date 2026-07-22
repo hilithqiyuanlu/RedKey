@@ -1528,6 +1528,8 @@ pub fn run() {
             open_console_new_task,
             resolve_link_title,
             crate::ocr::perform_ocr,
+            speech::asr_model_statuses,
+            speech::download_asr_model,
         ]);
 
     let app = builder
