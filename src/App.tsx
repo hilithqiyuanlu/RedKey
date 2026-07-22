@@ -131,8 +131,8 @@ function ConsoleApp() {
       recordingIdRef.current = await api.startNativeRecording(); nativeRecordingRef.current = true;
       recordingStartedRef.current = Date.now(); startClock(); setIsRecording(true); notify("已开始录音"); setDocumentVersion((value) => value + 1);
     } catch (reason) {
-      if (recordingIdRef.current) void api.failRecording(recordingIdRef.current, String(reason));
-      recordingIdRef.current = null; setIsRecording(false); notify(`无法开始录音：${String(reason)}`);
+      recordingIdRef.current = null; setIsRecording(false); setDocumentVersion((value) => value + 1);
+      notify(`无法开始录音：${String(reason)}`);
     }
   }
 
@@ -380,8 +380,9 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
 
   useEffect(() => { setTitle(task.title); }, [task.title]);
   useEffect(() => { setEditingTitle(false); setContactOpen(false); setLinkOpen(false); setOptimisticCards({ text: [], image: [] }); setDeletedCardIds(new Set()); }, [task.id]);
-  // Sync pet mode: "edit" when user is editing, "ai-summary" when AI is working, "default" otherwise
+  // Sync pet mode: "recording" when actively recording, "edit" when user is editing, "ai-summary" when AI is working, "default" otherwise
   useEffect(() => {
+    if (activeRecording) { void api.setPetMode("recording"); return; }
     if (summarizing) { void api.setPetMode("ai-summary"); return; }
     const hasAiWork = document.recordings.some((r) =>
       r.processingStatus === "transcribing" ||
@@ -390,7 +391,7 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
     if (hasAiWork) { void api.setPetMode("ai-summary"); return; }
     if (editingTitle || editingCardId != null) { void api.setPetMode("edit"); return; }
     void api.setPetMode("default");
-  }, [editingTitle, editingCardId, summarizing, document.recordings, document.summaries]);
+  }, [activeRecording, editingTitle, editingCardId, summarizing, document.recordings, document.summaries]);
   // Ctrl+V 粘贴（图片优先，否则粘贴文本；仅进行中任务界面，非输入框时生效）
   useEffect(() => {
     if (readOnly) return;
@@ -1037,11 +1038,11 @@ function SnapshotTools({ setSnapshot, notify }: { setSnapshot: (value: Snapshot)
   const [busy, setBusy] = useState(false);
   async function copySnapshot() { setBusy(true); try { await writeText(await api.exportData()); notify("快照已复制到剪贴板"); } catch (reason) { notify(String(reason)); } finally { setBusy(false); } }
   async function pasteSnapshot() { setBusy(true); try { const payload = await readText(); if (!payload.trim()) throw new Error("剪贴板没有快照内容"); setSnapshot(await api.importData(payload)); notify("快照已粘贴并恢复"); } catch (reason) { notify(String(reason)); } finally { setBusy(false); } }
-  async function clearAll() { setBusy(true); try { setSnapshot(await api.clearAllData()); notify("数据已清除，本地模型保留"); } catch (reason) { notify(String(reason)); } finally { setBusy(false); } }
+  async function clearAll() { setBusy(true); try { setSnapshot(await api.clearAllData()); notify("数据已清除，API Key 和本地模型保留"); } catch (reason) { notify(String(reason)); } finally { setBusy(false); } }
   const [confirmClear, setConfirmClear] = useState(false);
-  return <section className="settings-section data-tools"><div className="section-heading"><div><h2>数据</h2><p>通过剪贴板备份与恢复；清除不影响本地模型。</p></div></div><div className="data-tool-actions"><button disabled={busy} onClick={() => void copySnapshot()}><Clipboard />复制快照</button><button disabled={busy} onClick={() => void pasteSnapshot()}><ClipboardPaste />粘贴快照</button><button className="danger-action" disabled={busy} onClick={() => setConfirmClear(true)}><Trash2 />清除全部数据</button></div>{confirmClear && <ConfirmDialog
+  return <section className="settings-section data-tools"><div className="section-heading"><div><h2>数据</h2><p>通过剪贴板备份与恢复；清除不影响 API Key 和本地模型。</p></div></div><div className="data-tool-actions"><button disabled={busy} onClick={() => void copySnapshot()}><Clipboard />复制快照</button><button disabled={busy} onClick={() => void pasteSnapshot()}><ClipboardPaste />粘贴快照</button><button className="danger-action" disabled={busy} onClick={() => setConfirmClear(true)}><Trash2 />清除全部数据</button></div>{confirmClear && <ConfirmDialog
     title="清除全部数据？"
-    description="所有任务、录音和文本将被删除，本地模型不受影响。"
+    description="所有任务、录音和文本将被删除，API Key 和本地模型不受影响。"
     confirmLabel="清除全部"
     danger
     onConfirm={() => { setConfirmClear(false); void clearAll(); }}
@@ -1125,16 +1126,16 @@ function QuickPanel() {
 
 function Pet() {
   const { currentTask } = useSnapshot(); const [pressed, setPressed] = useState(false);
-  const [petMode, setPetMode] = useState<"default" | "edit" | "ai-summary">("default");
+  const [petMode, setPetMode] = useState<"default" | "edit" | "recording" | "ai-summary">("default");
   useEffect(() => { document.documentElement.classList.add("hud-document"); return () => { document.documentElement.classList.remove("hud-document"); }; }, []);
   useEffect(() => { const timer = window.setInterval(() => void api.syncHoverState(), 80); return () => window.clearInterval(timer); }, []);
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    (async () => { unlisten = await onPetMode((mode) => { setPetMode(mode as "default" | "edit" | "ai-summary"); }); })();
+    (async () => { unlisten = await onPetMode((mode) => { setPetMode(mode as "default" | "edit" | "recording" | "ai-summary"); }); })();
     return () => { unlisten?.(); };
   }, []);
   async function drag() { setPressed(true); try { await api.setPetDragging(true); await getCurrentWindow().startDragging(); } finally { setPressed(false); void api.setPetDragging(false); } }
-  const imageSrc = petMode === "edit" ? "/pet/edit.png" : petMode === "ai-summary" ? "/pet/ai-summary.png" : "/pet/default.png";
+  const imageSrc = petMode === "edit" ? "/pet/edit.png" : petMode === "recording" ? "/pet/recording.png" : petMode === "ai-summary" ? "/pet/ai-summary.png" : "/pet/default.png";
   const state = petState(currentTask);
   return <div className={`pet-shell ${state} ${pressed ? "pressed" : ""}`} onPointerDown={() => void drag()} onContextMenu={(event) => { event.preventDefault(); void api.showConsole(); }}>
     <img className="pet-image" src={imageSrc} alt="Pet" draggable={false} />

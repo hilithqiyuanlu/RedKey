@@ -2,7 +2,7 @@ use crate::models::ModelStatus;
 use crate::no_window;
 use anyhow::{bail, Context, Result};
 use serde_json::json;
-use std::{collections::HashSet, fs, fs::OpenOptions, io::{BufRead, BufReader, Write}, path::{Path, PathBuf}, process::{Child, ChildStdin, ChildStdout, Command, Stdio}, sync::{Arc, Mutex, OnceLock}, thread, time::Duration};
+use std::{collections::HashSet, fs, fs::OpenOptions, io::{BufRead, BufReader, Cursor, Read, Write}, path::{Path, PathBuf}, process::{Child, ChildStdin, ChildStdout, Command, Stdio}, sync::{Arc, Mutex, OnceLock}, thread, time::Duration};
 use tauri::{AppHandle, Emitter, Manager};
 
 pub const ASR_ID: &str = "Qwen3-ASR-1.7B";
@@ -213,7 +213,7 @@ fn install(app: &AppHandle, id: &str) -> Result<()> {
     let python = runtime.join(if cfg!(windows) { "Scripts/python.exe" } else { "bin/python" });
     if !python.exists() || !venv_python_compatible(&python) {
         if python.exists() { let _ = fs::remove_dir_all(&runtime); }
-        let bootstrap = find_python().context("未找到可用于初始化内置运行环境的 Python 3.10~3.12，请安装 Python 3.11")?;
+        let bootstrap = find_python(app).context("未找到可用于初始化内置运行环境的 Python 3.10~3.12，请安装 Python 3.11")?;
         fs::create_dir_all(&runtime)?;
         run_cancelable(app, id, Command::new(&bootstrap).args(["-m", "venv"]).arg(&runtime), "创建语音运行环境失败", 3, None, None)?;
     }
@@ -239,7 +239,7 @@ fn install_diarization(app: &AppHandle, id: &str, python: &Path) -> Result<()> {
     fs::create_dir_all(&dir)?;
     let repo = dir.join("3D-Speaker");
     if !repo.join("speakerlab").exists() {
-        run_cancelable(app, id, Command::new("git").args(["clone", "--depth", "1", "https://github.com/modelscope/3D-Speaker.git"]).arg(&repo), "下载 3D-Speaker 失败", 0, None, None)?;
+        download_3d_speaker(app, id, &repo)?;
     }
     // The repository root requirements pin NumPy <1.24 and scikit-learn 1.0.2,
     // which cannot be installed on Python 3.11/macOS. Install only the current
@@ -430,7 +430,45 @@ fn tail_text(value: &str, max_chars: usize) -> String {
     chars.reverse();
     chars.into_iter().collect::<String>().trim().to_string()
 }
-fn find_python() -> Option<String> {
+fn find_python(app: &AppHandle) -> Option<String> {
+    // 优先使用内嵌的 Python（从资源包解压）
+    if let Ok(bundled) = prepare_bundled_python(app) {
+        return Some(bundled.to_string_lossy().to_string());
+    }
+    find_system_python()
+}
+
+/// 从内嵌的 python-embed.zip 解压并配置 Python 运行环境。
+/// 解压后修改 _pth 文件以启用 site-packages，使其能创建 venv。
+fn prepare_bundled_python(app: &AppHandle) -> Result<PathBuf> {
+    let bootstrap_dir = app.path().app_data_dir()?.join("python-bootstrap");
+    let python_exe = bootstrap_dir.join("python.exe");
+    if python_exe.exists() && venv_python_compatible(&python_exe) {
+        return Ok(python_exe);
+    }
+    if python_exe.exists() { let _ = fs::remove_dir_all(&bootstrap_dir); }
+    let resource_path = app.path().resource_dir()?.join("python-embed.zip");
+    if !resource_path.exists() {
+        bail!("内嵌 Python 资源未找到，请安装 Python 3.10~3.12")
+    }
+    let zip_data = fs::read(&resource_path).context("读取内嵌 Python 失败")?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(zip_data)).context("解压内嵌 Python 失败")?;
+    fs::create_dir_all(&bootstrap_dir)?;
+    archive.extract(&bootstrap_dir).context("写入 Python 文件失败")?;
+    // 修改 python311._pth：取消 import site 的注释以使 pip/site-packages 可用
+    let pth_path = bootstrap_dir.join("python311._pth");
+    if pth_path.exists() {
+        let content = fs::read_to_string(&pth_path)?;
+        let fixed = content.replace("#import site", "import site");
+        fs::write(&pth_path, fixed)?;
+    }
+    if !python_exe.exists() {
+        bail!("内嵌 Python 解压后 python.exe 缺失")
+    }
+    Ok(python_exe)
+}
+
+fn find_system_python() -> Option<String> {
     // 优先搜索兼容版本（Python 3.10-3.12），避免 3.13+ 的包兼容问题
     for name in ["python3.11", "python3.10", "python3.12", "python3", "python"] {
         if let Ok(output) = no_window(&mut Command::new(name).arg("-c").arg("import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")).output() {
@@ -499,6 +537,56 @@ fn venv_python_compatible(python: &std::path::Path) -> bool {
     }
     false
 }
+
+/// 通过 HTTP 下载 3D-Speaker 仓库 zip 并解压，替代 git clone。
+fn download_3d_speaker(app: &AppHandle, id: &str, dest: &Path) -> Result<()> {
+    let url = "https://github.com/modelscope/3D-Speaker/archive/refs/heads/main.zip";
+    let parent = dest.parent().context("3D-Speaker 目标路径无效")?;
+    let tmp = parent.join(".3dspeaker-tmp.zip");
+    save_status(app, &ModelStatus { id: id.into(), installed: false, downloading: true, progress: 0, stage: "下载 3D-Speaker 源码".into(), error: None, size_bytes: directory_size(dest), downloaded_bytes: 0, total_bytes: None, progress_kind: "indeterminate".into(), detail: "正在通过 HTTP 下载 3D-Speaker 源码包".into(), verified: false })?;
+    let response = reqwest::blocking::get(url).context("无法连接 GitHub 下载 3D-Speaker")?;
+    let total = response.content_length();
+    let mut downloaded: u64 = 0;
+    let mut last_update = std::time::Instant::now();
+    let mut reader = response;
+    let mut file = fs::File::create(&tmp).context("无法创建临时文件")?;
+    let mut buf = [0u8; 8192];
+    loop {
+        if cancel_path(app, id)?.exists() {
+            let _ = fs::remove_file(&tmp);
+            bail!("下载已取消")
+        }
+        let n = reader.read(&mut buf).context("下载 3D-Speaker 失败")?;
+        if n == 0 { break; }
+        file.write_all(&buf[..n])?;
+        downloaded += n as u64;
+        let now = std::time::Instant::now();
+        if now.duration_since(last_update) >= Duration::from_secs(2) {
+            let progress = total.filter(|t| *t > 0).map(|t| ((downloaded.min(t) * 100) / t) as u8).unwrap_or(0);
+            let detail = total.map(|t| format!("{} / {}", format_bytes(downloaded.min(t)), format_bytes(t))).unwrap_or_else(|| format_bytes(downloaded));
+            let _ = save_status(app, &ModelStatus { id: id.into(), installed: false, downloading: true, progress, stage: "下载 3D-Speaker".into(), error: None, size_bytes: downloaded, downloaded_bytes: downloaded, total_bytes: total, progress_kind: if total.is_some() { "download".into() } else { "indeterminate".into() }, detail, verified: false });
+            last_update = now;
+        }
+    }
+    file.flush()?;
+    drop(file);
+    // Extract: the zip contains a single top-level folder "3D-Speaker-main"
+    let zip_data = fs::read(&tmp).context("读取 3D-Speaker 临时文件失败")?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(zip_data)).context("3D-Speaker zip 无效")?;
+    // Extract to parent, then rename "3D-Speaker-main" to "3D-Speaker"
+    archive.extract(parent).context("解压 3D-Speaker 失败")?;
+    let _ = fs::remove_file(&tmp);
+    let extracted = parent.join("3D-Speaker-main");
+    if extracted.exists() {
+        if dest.exists() { fs::remove_dir_all(dest)?; }
+        fs::rename(&extracted, dest).context("重命名 3D-Speaker 目录失败")?;
+    }
+    if !dest.join("speakerlab").exists() {
+        bail!("3D-Speaker 解压后 speakerlab 模块缺失")
+    }
+    Ok(())
+}
+
 fn contains_weight(path: &Path) -> bool { fs::read_dir(path).ok().into_iter().flatten().flatten().any(|entry| { let path = entry.path(); if path.is_dir() { contains_weight(&path) } else { matches!(path.extension().and_then(|x| x.to_str()), Some("safetensors" | "bin" | "pt" | "onnx")) } }) }
 fn directory_size(path: &Path) -> u64 { fs::read_dir(path).ok().into_iter().flatten().flatten().map(|entry| { let path = entry.path(); if path.is_dir() { directory_size(&path) } else { entry.metadata().map(|m| m.len()).unwrap_or(0) } }).sum() }
 fn format_bytes(bytes: u64) -> String { if bytes >= 1_073_741_824 { format!("{:.2} GB", bytes as f64 / 1_073_741_824.0) } else { format!("{:.1} MB", bytes as f64 / 1_048_576.0) } }

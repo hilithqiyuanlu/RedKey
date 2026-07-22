@@ -868,7 +868,7 @@ fn set_pet_dragging(app: AppHandle, dragging: bool) -> Result<(), String> {
 
 #[tauri::command]
 fn set_pet_mode(app: AppHandle, mode: String) -> Result<(), String> {
-    let valid_modes = ["default", "edit", "ai-summary"];
+    let valid_modes = ["default", "edit", "recording", "ai-summary"];
     if !valid_modes.contains(&mode.as_str()) {
         return Err(format!("Invalid pet mode: {}", mode));
     }

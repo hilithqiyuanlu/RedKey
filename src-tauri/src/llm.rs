@@ -1,17 +1,16 @@
 use crate::db::transcript_hash;
 use crate::models::{ActionItem, DeepSeekSettings, RecordingSummary, TaskDocument};
-use crate::no_window;
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
+#[cfg(target_os = "macos")]
 use std::process::Command;
 use std::time::Duration;
 
 pub const MODEL: &str = "deepseek-v4-flash";
 const KEY_SERVICE: &str = "com.hilith.redkey";
-const KEY_ACCOUNT: &str = "deepseek_api_key";
 const PROMPT_VERSION: &str = "recording-summary-v1";
 
 pub fn settings() -> Result<DeepSeekSettings> {
@@ -56,25 +55,28 @@ fn remove_key() -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
+fn key_path() -> Result<std::path::PathBuf> {
+    let dir = std::path::PathBuf::from(std::env::var("APPDATA").context("无法获取 APPDATA 目录")?).join(KEY_SERVICE);
+    std::fs::create_dir_all(&dir).context("无法创建配置目录")?;
+    Ok(dir.join("deepseek_key"))
+}
+
+#[cfg(target_os = "windows")]
 fn read_key() -> Result<Option<String>> {
-    let script = format!("$v=New-Object Windows.Security.Credentials.PasswordVault; try {{$c=$v.Retrieve('{KEY_SERVICE}','{KEY_ACCOUNT}');$c.RetrievePassword();[Console]::Write($c.Password)}} catch {{exit 1}}");
-    let output = no_window(&mut Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script])).output().context("无法读取 Windows 凭据管理器")?;
-    if !output.status.success() { return Ok(None); }
-    Ok(Some(String::from_utf8(output.stdout)?.trim().to_string()))
+    let path = key_path()?;
+    if !path.exists() { return Ok(None); }
+    Ok(Some(std::fs::read_to_string(&path).context("无法读取 API Key 文件")?.trim().to_string()))
 }
 
 #[cfg(target_os = "windows")]
 fn write_key(value: &str) -> Result<()> {
-    let script = format!("$v=New-Object Windows.Security.Credentials.PasswordVault; try {{$v.Remove($v.Retrieve('{KEY_SERVICE}','{KEY_ACCOUNT}'))}} catch {{}}; $v.Add((New-Object Windows.Security.Credentials.PasswordCredential('{KEY_SERVICE}','{KEY_ACCOUNT}',$env:REDKEY_SECRET)))");
-    let status = no_window(&mut Command::new("powershell").env("REDKEY_SECRET", value).args(["-NoProfile", "-NonInteractive", "-Command", &script])).status().context("无法写入 Windows 凭据管理器")?;
-    anyhow::ensure!(status.success(), "Windows 凭据管理器拒绝保存 API Key");
-    Ok(())
+    std::fs::write(key_path()?, value).context("无法保存 API Key")
 }
 
 #[cfg(target_os = "windows")]
 fn remove_key() -> Result<()> {
-    let script = format!("$v=New-Object Windows.Security.Credentials.PasswordVault; try {{$v.Remove($v.Retrieve('{KEY_SERVICE}','{KEY_ACCOUNT}'))}} catch {{}}");
-    let _ = no_window(&mut Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script])).status();
+    let path = key_path()?;
+    if path.exists() { let _ = std::fs::remove_file(&path); }
     Ok(())
 }
 
@@ -250,9 +252,8 @@ pub fn task_summary_prompt(document: &TaskDocument) -> Result<String> {
 4. 建议的结构（按需选用，跳过没有内容的板块）：
    - 当前状态：一句话概括任务进展
    - 对接结论：最近确认了什么
-   - 待处理事项：还有什么事要做
-   - 未解决问题：有哪些悬而未决的问题
-   - 备注/补充：从笔记或图片中提取的关键补充信息
+   - 待处理：还有哪些事要做或问题待确认
+   - 备注：从笔记或图片中提取的关键补充信息
 5. 保持简洁，避免重复"#;
 
     let user = format!("需求标题：{}\n联系人：{}\n\n上下文信息：\n{}", document.task.title, contact, context);

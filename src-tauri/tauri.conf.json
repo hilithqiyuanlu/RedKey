@@ -76,7 +76,8 @@
     "resources": {
       "../workers/qwen_asr_worker.py": "workers/qwen_asr_worker.py",
       "../workers/diarization_worker.py": "workers/diarization_worker.py",
-      "../workers/ocr_worker.py": "workers/ocr_worker.py"
+      "../workers/ocr_worker.py": "workers/ocr_worker.py",
+      "resources/python-embed.zip": "python-embed.zip"
     },
     "targets": ["nsis"],
     "icon": [
@@ -96,6 +97,9 @@
       "signingIdentity": "D714C62392BCC2C26F114278A7734F18AF562AC8"
     },
     "windows": {
+      "certificateThumbprint": "1DF87D8F0EC52A9D02468AB48F2364A5C3433A4B",
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "http://timestamp.digicert.com",
       "nsis": {
         "installMode": "currentUser"
       }
