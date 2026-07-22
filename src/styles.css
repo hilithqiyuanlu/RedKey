@@ -2702,6 +2702,11 @@ button.primary:hover,
   background: transparent;
   -webkit-user-select: none;
   user-select: none;
+  cursor: grab;
+}
+
+.pet-shell:active {
+  cursor: grabbing;
 }
 
 .pet-image {

@@ -1210,7 +1210,15 @@ function Pet() {
     (async () => { unlisten = await onPetMode((mode) => { setPetMode(mode as "default" | "edit" | "recording" | "ai-summary"); }); })();
     return () => { unlisten?.(); };
   }, []);
-  async function drag() { setPressed(true); try { await api.setPetDragging(true); await getCurrentWindow().startDragging(); } finally { setPressed(false); void api.setPetDragging(false); } }
+  function drag() {
+    setPressed(true);
+    void api.setPetDragging(true);
+    const win = getCurrentWindow();
+    void win.startDragging().finally(() => {
+      setPressed(false);
+      void api.setPetDragging(false);
+    });
+  }
   const imageSrc = petMode === "edit" ? "/pet/edit.png" : petMode === "recording" ? "/pet/recording.png" : petMode === "ai-summary" ? "/pet/ai-summary.png" : "/pet/default.png";
   const state = petState(currentTask);
   return <div className={`pet-shell ${state} ${pressed ? "pressed" : ""}`} onPointerDown={() => void drag()} onContextMenu={(event) => { event.preventDefault(); void api.showConsole(); }}>
