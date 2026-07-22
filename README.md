@@ -40,10 +40,11 @@ RedKey 是一个跨平台的桌面工作台，用键盘快捷键将需求任务�
 - 识别结果直接作为文本卡保存到当前任务
 
 ### AI 梳理
-- DeepSeek 根据完整对话生成需求对齐总结
-- 输出需求、决策、待办和风险
+- DeepSeek 根据完整对话生成需求对齐总结，输出需求、决策、待办和风险
+- 支持任务级总结：汇总所有对接记录、笔记和 OCR 图片文字，生成任务状态概览
 - API Key 加密保存在系统钥匙串，不暴露给前端
 - 总结可追溯到原始转写版本
+- 云端 API 开关：关闭后不调用 DeepSeek，改为复制 prompt 到剪贴板，方便在其他 AI 平台使用
 
 ### 桌面交互
 - 全局快捷键：按下修饰键（默认 Control）显示 HUD 悬浮提示条，松开隐藏
@@ -99,6 +100,7 @@ npm run tauri build -- --bundles nsis
 ├── src/                    # React 前端
 │   ├── App.tsx             # 主视图路由 (console / pet / quick / hud / settings)
 │   ├── api.ts              # Tauri invoke 封装
+│   ├── useSnapshot.ts      # 快照功能 Hook（截图 + OCR 管线）
 │   ├── domain.ts           # 领域模型与状态管理
 │   └── types.ts            # TypeScript 类型定义
 ├── src-tauri/              # Tauri + Rust 后端
