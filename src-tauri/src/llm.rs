@@ -11,7 +11,30 @@ use std::time::Duration;
 
 pub const MODEL: &str = "deepseek-v4-flash";
 const KEY_SERVICE: &str = "com.hilith.redkey";
-const PROMPT_VERSION: &str = "recording-summary-v1";
+const PROMPT_VERSION: &str = "recording-summary-v2";
+
+const RECORDING_SYSTEM: &str = r#"从对话转写中提取待办事项和关键信息。
+- 只根据转写内容提取明确事实，不猜测未提及的文档内容
+- 不确定的信息放入 openQuestions
+- 没有内容的字段返回空数组，不要凑数
+- pendingItems 只保留简短、可执行或需要确认的事项，用于卡片收起态展示
+- confirmedDecisions 仅列出影响后续工作的关键决策，无关紧要的不要列
+
+只返回 JSON，不要 Markdown，不要额外解释。字段：
+- overview(string)：一句话结论，没有明确结论则留空字符串
+- pendingItems(string[])：待办事项
+- openQuestions(string[])：需要确认但尚未明确的问题
+- actionItems(array of {text:string,owner:string|null,due:string|null})：具体行动项
+- confirmedDecisions(string[])：关键决策
+- requestedChanges(string[])：明确提出的修改需求"#;
+
+const TASK_SYSTEM: &str = r#"从以下材料中提取待办事项，生成简洁的总结。
+- 待办为主：列出需要去做或需要确认的事，每条一行
+- 如果某条待办需要关键背景，在该条后用括号补一句
+- 材料里没有涉及的方面直接跳过，不输出空标题，不写"无"或"暂无"
+- 没有待办就只输出"暂无待办"
+- 可选在末尾补充一句任务状态或关键备注，没有就不写
+- 用自然语言，不要用 JSON"#;
 
 pub fn settings() -> Result<DeepSeekSettings> {
     let configured = read_key()?.is_some_and(|value| !value.trim().is_empty());
@@ -154,9 +177,8 @@ pub fn recording_summary_prompt(document: &TaskDocument, recording_id: &str) -> 
     let transcript = if !recording.transcript.trim().is_empty() { recording.transcript.as_str() } else { recording.raw_transcript.as_str() };
     anyhow::ensure!(!transcript.trim().is_empty(), "没有可用于梳理的转写内容");
     let contact = document.task.contact_name.as_deref().unwrap_or("未指定");
-    let system = r#"你是一个需求对接记录整理助手。你只能根据提供的对话转写提取明确事实，不能分析或猜测 Figma、策划案或未提供的文档内容。把不确定的信息放入 openQuestions。只返回 JSON，不要 Markdown，不要额外解释。字段必须为：overview(string)、pendingItems(string[])、confirmedDecisions(string[])、requestedChanges(string[])、actionItems(array of {text:string,owner:string|null,due:string|null})、openQuestions(string[])。pendingItems 只保留简短、可执行或需要确认的事项，用于卡片收起状态。没有内容时返回空数组。"#;
     let user = format!("需求标题：{}\n联系人：{}\n录音 ID：{}\n\n最终转写：\n{}", document.task.title, contact, recording_id, transcript);
-    Ok(format!("系统提示：{}\n\n用户输入：{}", system, user))
+    Ok(format!("系统提示：{}\n\n用户输入：{}", RECORDING_SYSTEM, user))
 }
 
 pub async fn summarize(document: &TaskDocument, recording_id: &str) -> Result<RecordingSummary> {
@@ -164,9 +186,8 @@ pub async fn summarize(document: &TaskDocument, recording_id: &str) -> Result<Re
     let transcript = if !recording.transcript.trim().is_empty() { recording.transcript.as_str() } else { recording.raw_transcript.as_str() };
     anyhow::ensure!(!transcript.trim().is_empty(), "没有可用于梳理的转写内容");
     let contact = document.task.contact_name.as_deref().unwrap_or("未指定");
-    let system = r#"你是一个需求对接记录整理助手。你只能根据提供的对话转写提取明确事实，不能分析或猜测 Figma、策划案或未提供的文档内容。把不确定的信息放入 openQuestions。只返回 JSON，不要 Markdown，不要额外解释。字段必须为：overview(string)、pendingItems(string[])、confirmedDecisions(string[])、requestedChanges(string[])、actionItems(array of {text:string,owner:string|null,due:string|null})、openQuestions(string[])。pendingItems 只保留简短、可执行或需要确认的事项，用于卡片收起状态。没有内容时返回空数组。"#;
     let user = format!("需求标题：{}\n联系人：{}\n录音 ID：{}\n\n最终转写：\n{}", document.task.title, contact, recording_id, transcript);
-    let raw = chat(system, &user).await?;
+    let raw = chat(RECORDING_SYSTEM, &user).await?;
     let value = json_content(&raw)?;
     let now = Utc::now().to_rfc3339();
     Ok(RecordingSummary {
@@ -244,20 +265,8 @@ pub fn task_summary_prompt(document: &TaskDocument) -> Result<String> {
         context.push('\n');
     }
 
-    let system = r#"你是一个需求对接整理助手。根据提供的任务上下文，生成一份简洁的任务状态总结。
-规则：
-1. 只根据提供的材料总结，不猜测或编造信息
-2. 哪些方面有信息就写哪些，没有信息的方面完全不提（不要写"无"或"暂无"）
-3. 用自然语言段落，不要用 JSON
-4. 建议的结构（按需选用，跳过没有内容的板块）：
-   - 当前状态：一句话概括任务进展
-   - 对接结论：最近确认了什么
-   - 待处理：还有哪些事要做或问题待确认
-   - 备注：从笔记或图片中提取的关键补充信息
-5. 保持简洁，避免重复"#;
-
     let user = format!("需求标题：{}\n联系人：{}\n\n上下文信息：\n{}", document.task.title, contact, context);
-    Ok(format!("系统提示：{}\n\n用户输入：{}", system, user))
+    Ok(format!("系统提示：{}\n\n用户输入：{}", TASK_SYSTEM, user))
 }
 
 pub async fn summarize_task(document: &TaskDocument) -> Result<String> {
@@ -320,21 +329,8 @@ pub async fn summarize_task(document: &TaskDocument) -> Result<String> {
         context.push('\n');
     }
 
-    let system = r#"你是一个需求对接整理助手。根据提供的任务上下文，生成一份简洁的任务状态总结。
-规则：
-1. 只根据提供的材料总结，不猜测或编造信息
-2. 哪些方面有信息就写哪些，没有信息的方面完全不提（不要写"无"或"暂无"）
-3. 用自然语言段落，不要用 JSON
-4. 建议的结构（按需选用，跳过没有内容的板块）：
-   - 当前状态：一句话概括任务进展
-   - 对接结论：最近确认了什么
-   - 待处理事项：还有什么事要做
-   - 未解决问题：有哪些悬而未决的问题
-   - 备注/补充：从笔记或图片中提取的关键补充信息
-5. 保持简洁，避免重复"#;
-
     let user = format!("需求标题：{}\n联系人：{}\n\n上下文信息：\n{}", document.task.title, contact, context);
-    chat_text(system, &user).await
+    chat_text(TASK_SYSTEM, &user).await
 }
 
 pub async fn test_connection() -> Result<()> {
