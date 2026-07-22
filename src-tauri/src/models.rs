@@ -42,7 +42,7 @@ pub struct ShortcutSettings {
     pub task_prefix: String,
 }
 
-fn default_task_prefix() -> String { "Control+Alt".into() }
+fn default_task_prefix() -> String { "CapsLock+Alt".into() }
 
 impl Default for ShortcutSettings {
     fn default() -> Self {

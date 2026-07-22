@@ -54,6 +54,7 @@ textarea:focus-visible,
 select:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
+  transition: outline-color 0.15s;
 }
 
 /* ----------------------------------------------------------
@@ -136,12 +137,13 @@ select:focus-visible {
   color: var(--muted);
   cursor: pointer;
   text-align: left;
-  transition: background 0.15s, border-color 0.15s, color 0.15s;
+  transition: background 0.15s, border-color 0.15s, color 0.15s, transform 0.1s, box-shadow 0.15s;
 }
 .slot-nav-item:hover { background: var(--surface-alt); border-color: var(--border-l3); color: var(--fg); }
+.slot-nav-item:active:not(.drag-over) { transform: scale(0.97); }
 .slot-nav-item.bound { color: var(--fg); }
 .slot-nav-item.current { border-color: var(--accent); background: rgba(0, 64, 255, 0.08); }
-.slot-nav-item.drag-over { border-color: var(--accent); background: rgba(0, 64, 255, 0.15); transform: scale(1.05); }
+.slot-nav-item.drag-over { border-color: var(--accent); background: rgba(0, 64, 255, 0.15); transform: scale(1.05); box-shadow: 2px 2px 0 rgba(0,64,255,0.3); }
 .content-card[draggable]:hover { cursor: grab; }
 .content-card[draggable]:active { cursor: grabbing; }
 .content-card[draggable] header { cursor: grab !important; }
@@ -254,13 +256,14 @@ select:focus-visible {
   font-size: 12px;
   font-weight: 500;
   text-align: left;
-  transition: background 0.15s, color 0.15s;
+  transition: background 0.15s, color 0.15s, transform 0.1s;
 }
 .nav-button svg { width: 17px; }
 .nav-button:hover {
   background: var(--surface-alt);
   color: var(--fg);
 }
+.nav-button:active { transform: scale(0.97); }
 .nav-button.active {
   color: #fff;
   background: var(--accent);
@@ -338,9 +341,8 @@ select:focus-visible {
 .sidebar-task-list > button.selected {
   border: 1px solid var(--accent);
   border-radius: 0;
-  background: rgba(46, 141, 255, 0.08);
+  background: rgba(0, 64, 255, 0.08);
 }
-
 .sidebar-task-list kbd {
   display: grid;
   width: 29px;
@@ -456,7 +458,7 @@ select:focus-visible {
 .icon-button.danger { color: var(--destructive); }
 .icon-button.danger:hover:not(:disabled) {
   background: var(--red-soft);
-  border-color: rgba(246, 90, 90, 0.3);
+  border-color: rgba(239, 68, 68, 0.3);
 }
 .icon-button:disabled {
   cursor: not-allowed;
@@ -614,11 +616,12 @@ select:focus-visible {
   border: 1px solid var(--border);
   border-radius: 0;
   background: var(--bg-secondary);
-  transition: border-color 0.2s, box-shadow 0.2s;
+  transition: border-color 0.2s, box-shadow 0.2s, transform 0.2s;
 }
 .content-card:hover {
   border-color: var(--border-l3);
   box-shadow: 2px 2px 0 rgba(0,0,0,0.5);
+  transform: translate(-1px, -1px);
 }
 .content-card > header {
   display: flex;
@@ -637,12 +640,12 @@ select:focus-visible {
 .ai-badge {
   display: inline-block;
   background: var(--surface-alt);
-  color: var(--amber);
+  color: var(--warning);
   font-size: 9px;
   font-weight: 700;
   letter-spacing: 0.04em;
   padding: 1px 5px;
-  border-radius: 3px;
+  border-radius: 0;
   margin-left: 6px;
 }
 .content-card > header > div {
@@ -702,7 +705,7 @@ select:focus-visible {
   width: 180px;
   max-height: 160px;
   overflow: hidden;
-  border-radius: 8px;
+  border-radius: 0;
   cursor: pointer;
   border: 1px solid var(--border);
 }
@@ -756,7 +759,7 @@ select:focus-visible {
   cursor: pointer;
   color: var(--muted-2);
   border: 2px dashed var(--border);
-  border-radius: 8px;
+  border-radius: 0;
   margin: 12px 18px 18px;
   transition: border-color .15s, color .15s;
 }
@@ -793,9 +796,9 @@ select:focus-visible {
 .lightbox img {
   max-width: 92vw;
   max-height: 92vh;
-  border-radius: 10px;
+  border-radius: 0;
   cursor: default;
-  box-shadow: 0 0 40px rgba(0,0,0,.4);
+  box-shadow: 2px 2px 0 rgba(0,0,0,1);
 }
 
 /* ----------------------------------------------------------
@@ -885,7 +888,7 @@ select:focus-visible {
 }
 
 .recording-live {
-  border-color: rgba(255, 59, 48, 0.35);
+  border-color: rgba(239, 68, 68, 0.35);
   background: var(--red-soft);
   animation: recording-pulse-border 2s ease-in-out infinite;
 }
@@ -920,7 +923,7 @@ select:focus-visible {
 }
 .stop-recording:hover {
   background: #f86262;
-  box-shadow: 0 0 0 3px rgba(255, 59, 48, 0.25);
+  box-shadow: 2px 2px 0 rgba(239, 68, 68, 0.4);
 }
 .recording-live-copy {
   margin: 0;
@@ -1029,7 +1032,7 @@ select:focus-visible {
 .summary-empty.error {
   color: var(--destructive);
   background: var(--red-soft);
-  border-color: rgba(246, 90, 90, 0.2);
+  border-color: rgba(239, 68, 68, 0.2);
 }
 .summary-empty.error svg { animation: none; }
 
@@ -1178,12 +1181,13 @@ select:focus-visible {
   background: var(--surface-alt);
   cursor: pointer;
   text-align: left;
-  transition: background 0.15s, border-color 0.15s;
+  transition: background 0.15s, border-color 0.15s, transform 0.1s, box-shadow 0.15s;
 }
 .key-dock > button:hover {
   background: var(--bg-secondary);
   border-color: var(--border-l3);
 }
+.key-dock > button:active { transform: scale(0.95); }
 .key-dock > button.active {
   color: #fff;
   background: var(--accent);
@@ -1290,9 +1294,10 @@ select:focus-visible {
   background: var(--surface-alt);
   cursor: pointer;
   font-size: 11px;
-  transition: background 0.15s;
+  transition: background 0.15s, transform 0.1s;
 }
 .popover-actions button:hover { background: var(--bg-secondary); }
+.popover-actions button:active { transform: translateY(1px); }
 .popover-actions svg { width: 14px; }
 
 button.primary,
@@ -1538,9 +1543,10 @@ button.primary:hover,
   background: var(--surface-alt);
   cursor: pointer;
   font-size: 11px;
-  transition: background 0.15s;
+  transition: background 0.15s, transform 0.1s, box-shadow 0.15s;
 }
 .modal footer button:hover { background: var(--bg-secondary); }
+.modal footer button:active { transform: translateY(1px); box-shadow: 2px 2px 0 rgba(0,0,0,1); }
 .modal footer button:first-child {
   background: transparent;
   color: var(--muted);
@@ -1581,8 +1587,9 @@ button.primary:hover,
   border-radius: 0;
   background: var(--surface-alt);
   cursor: pointer;
-  transition: background 0.15s, border-color 0.15s;
+  transition: background 0.15s, border-color 0.15s, color 0.15s, transform 0.1s;
 }
+.slot-block:active:not(.occupied):not(:disabled) { transform: scale(0.95); }
 .slot-block:hover:not(.occupied):not(:disabled) {
   background: var(--bg-secondary);
   border-color: var(--border-l3);
@@ -1780,9 +1787,10 @@ button.primary:hover,
   transition: border-color 0.15s, background 0.15s, color 0.15s;
 }
 .completed-item-delete:hover {
-  border-color: var(--accent);
-  background: rgba(240, 90, 90, 0.1);
-  color: var(--accent);
+  border-color: var(--destructive);
+  background: var(--red-soft);
+  color: var(--destructive);
+  box-shadow: 2px 2px 0 rgba(0,0,0,0.5);
 }
 .completed-item-delete svg { width: 14px; height: 14px; }
 .completed-list-empty {
@@ -2323,6 +2331,35 @@ button.primary:hover,
   font-size: 12px;
 }
 
+.document-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  height: 100%;
+  color: var(--muted);
+  font-size: 14px;
+}
+.document-loading svg {
+  width: 28px;
+  height: 28px;
+}
+
+.spin {
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.content-card.deleting {
+  opacity: 0;
+  transform: translateX(-20px);
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
 /* ----------------------------------------------------------
    Quick Panel (Pet Hover)
    ---------------------------------------------------------- */
@@ -2403,7 +2440,7 @@ button.primary:hover,
   gap: 5px 7px;
   margin-top: 8px;
   padding: 9px;
-  border: 1px solid rgba(246, 90, 90, 0.2);
+  border: 1px solid rgba(239, 68, 68, 0.2);
   border-radius: 0;
   background: var(--red-soft);
 }
@@ -2574,7 +2611,7 @@ button.primary:hover,
 }
 
 /* ----------------------------------------------------------
-   Pet (Desktop Keycap)
+   Pet (Desktop Mascot)
    ---------------------------------------------------------- */
 
 .pet-shell {
@@ -2587,39 +2624,26 @@ button.primary:hover,
   user-select: none;
 }
 
-.keycap {
-  width: 62px;
-  height: 59px;
-  padding: 0;
-  border: 1px solid rgba(0, 64, 255, 0.3);
-  border-bottom-width: 4px;
-  border-radius: 0;
-  color: #fff;
-  background: var(--accent);
-  cursor: grab;
-  box-shadow: 2px 2px 0 rgba(0,64,255,0.6);
-  transition: transform 0.1s, box-shadow 0.1s;
+.pet-image {
+  width: 56px;
+  height: 56px;
+  object-fit: contain;
+  pointer-events: none;
   animation: pet-breathe 3s ease-in-out infinite;
 }
-.keycap:hover {
-  box-shadow: 2px 2px 0 rgba(0,64,255,0.6);
-}
-.keycap:active,
-.pet-shell.pressed .keycap {
-  border-bottom-width: 2px;
-  transform: translateY(2px);
-  box-shadow: 2px 2px 0 rgba(0,64,255,0.6);
-  animation: none;
-}
-.keycap > span { display: grid; gap: 2px; }
-.keycap b { font-size: 20px; font-weight: 700; }
-.keycap i { font-size: 7px; font-style: normal; opacity: 0.72; }
-.pet-shell.idle .keycap {
-  background: var(--muted-2);
-  border-color: rgba(102, 107, 117, 0.3);
-  color: var(--fg);
-  box-shadow: 2px 2px 0 rgba(0,0,0,0.5);
+
+.pet-shell.idle .pet-image {
+  opacity: 0.8;
   animation: pet-breathe-idle 4s ease-in-out infinite;
+}
+
+.pet-shell.pressed .pet-image {
+  animation: none;
+  transform: scale(0.95);
+}
+
+.pet-shell.completed .pet-image {
+  animation: pet-breathe 3s ease-in-out infinite;
 }
 
 /* ----------------------------------------------------------
@@ -2689,24 +2713,23 @@ button.primary:hover,
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-end;
   width: 100vw;
   height: 100vh;
   background: transparent;
+  pointer-events: none;
 }
 .task-hud {
+  pointer-events: auto;
   display: grid;
   width: 100vw;
-  height: 100vh;
+  height: auto;
   grid-template-columns: repeat(10, minmax(0, 1fr));
-  grid-template-rows: 1fr;
-  gap: 12px;
-  padding: 24px 24px 24px;
-  padding-top: max(24px, calc(50vh - 180px));
-  padding-bottom: max(24px, calc(50vh - 180px));
+  gap: 8px;
+  padding: 12px 24px 16px;
   color: var(--fg);
-  background: rgba(26, 27, 29, 0.85);
-  
+  background: rgba(26, 27, 29, 0.92);
+  backdrop-filter: blur(8px);
 }
 .task-hud-key {
   display: flex;
@@ -2714,43 +2737,52 @@ button.primary:hover,
   justify-content: space-between;
   min-width: 0;
   min-height: 0;
-  padding: 12px 14px;
+  padding: 10px 12px;
   border-radius: 0;
-  color: var(--fg);
-  background: rgba(224, 226, 242, 0.06);
-  border: 1px solid rgba(224, 226, 242, 0.08);
-  overflow: hidden;
-  transition: background 0.2s, border-color 0.2s;
-}
-.task-hud-key:empty {
   color: rgba(209, 211, 219, 0.35);
   background: rgba(224, 226, 242, 0.03);
-  border-color: transparent;
+  border: 1px solid transparent;
+  overflow: hidden;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+  pointer-events: none;
+  user-select: none;
+}
+.task-hud-key.bound {
+  pointer-events: auto;
+  cursor: pointer;
+  color: var(--fg);
+  background: rgba(224, 226, 242, 0.06);
+  border-color: rgba(224, 226, 242, 0.08);
+}
+.task-hud-key.bound.hovered {
+  background: rgba(224, 226, 242, 0.14);
+  border-color: var(--accent);
+}
+.task-hud-key.bound:active {
+  background: rgba(224, 226, 242, 0.2);
 }
 .task-hud-key kbd {
   display: block;
   color: var(--accent);
   background: transparent;
-  font-size: 16px;
+  font-size: 14px;
   font-weight: 600;
   font-family: inherit;
 }
 .task-hud-labels {
   display: grid;
-  gap: 4px;
+  gap: 2px;
   overflow: hidden;
 }
 .task-hud-contact {
-  color: var(--fg);
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 500;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .task-hud-title {
-  color: var(--muted);
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 400;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2784,6 +2816,11 @@ button.primary:hover,
   to { opacity: 1; transform: scale(1) translateY(0); }
 }
 
+@keyframes modal-out {
+  from { opacity: 1; transform: scale(1) translateY(0); }
+  to { opacity: 0; transform: scale(0.96) translateY(4px); }
+}
+
 @keyframes popover-in {
   from { opacity: 0; transform: scale(0.95); }
   to { opacity: 1; transform: scale(1); }
@@ -2801,16 +2838,16 @@ button.primary:hover,
 
 @keyframes pet-breathe {
   0%, 100% { transform: scale(1); }
-  50% { transform: scale(1.04); }
+  50% { transform: scale(1.08); }
 }
 @keyframes pet-breathe-idle {
-  0%, 100% { opacity: 0.85; }
-  50% { opacity: 1; }
+  0%, 100% { opacity: 0.75; transform: scale(0.97); }
+  50% { opacity: 1; transform: scale(1.02); }
 }
 
 @keyframes recording-pulse-border {
-  0%, 100% { border-color: rgba(255, 59, 48, 0.35); }
-  50% { border-color: rgba(255, 59, 48, 0.55); }
+  0%, 100% { border-color: rgba(239, 68, 68, 0.35); }
+  50% { border-color: rgba(239, 68, 68, 0.55); }
 }
 
 /* ----------------------------------------------------------

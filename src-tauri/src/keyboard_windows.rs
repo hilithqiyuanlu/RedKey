@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -47,16 +47,9 @@ pub enum KeyboardEvent {
 }
 
 struct SharedState {
-    // Read on every keystroke system-wide, written only when the user changes
-    // the shortcut prefix in settings: an RwLock lets the hot path take a
-    // cheap read lock instead of contending on a plain Mutex.
     config: RwLock<PrefixConfig>,
-    // Track modifier state locally instead of reading GetAsyncKeyState, because
-    // the hook runs before the system updates key state, so key-up events would
-    // still read as "pressed" and the HUD would not dismiss on release.
     modifiers: Mutex<PrefixConfig>,
-    // Never replaced after the monitor starts, so it doesn't need a Mutex —
-    // mpsc::Sender is already Clone + Send + Sync.
+    prefix_active: Mutex<bool>,
     sender: mpsc::Sender<KeyboardEvent>,
 }
 
@@ -95,6 +88,19 @@ fn vk_modifier_kind(vk: u32) -> Option<fn(&mut PrefixConfig, bool)> {
     }
 }
 
+fn is_foreground_our_window() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() { return false; }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        pid == GetCurrentProcessId()
+    }
+}
+
 fn exact_prefix_match(config: &PrefixConfig, modifiers: &PrefixConfig) -> bool {
     config.control == modifiers.control
         && config.alt == modifiers.alt
@@ -116,14 +122,17 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
     if let Some(state) = shared {
         let config = *state.config.read();
         if let Some(update_modifier) = vk_modifier_kind(vk) {
-            // 修饰键：先更新本地状态，再判断前缀是否匹配
             let mut modifiers = state.modifiers.lock();
             update_modifier(&mut modifiers, is_down);
             let active = exact_prefix_match(&config, &modifiers);
             drop(modifiers);
-            let _ = state.sender.send(KeyboardEvent::Prefix(active));
+            let mut last_active = state.prefix_active.lock();
+            if active != *last_active {
+                *last_active = active;
+                drop(last_active);
+                let _ = state.sender.send(KeyboardEvent::Prefix(active));
+            }
         } else if is_down {
-            // 非修饰键且按下：检查前缀是否匹配，匹配则触发动作并吞键
             let modifiers = *state.modifiers.lock();
             if exact_prefix_match(&config, &modifiers) {
                 if let Some(action) = vk_to_action(vk) {
@@ -194,6 +203,7 @@ pub fn start_keyboard_monitor(app: &AppHandle, settings: &crate::models::Shortcu
     let shared_state = Arc::new(SharedState {
         config: RwLock::new(PrefixConfig::from_string(&settings.task_prefix)),
         modifiers: Mutex::new(PrefixConfig { control: false, alt: false, shift: false, win: false, caps: false }),
+        prefix_active: Mutex::new(false),
         sender,
     });
 

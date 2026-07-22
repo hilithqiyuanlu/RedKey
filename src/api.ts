@@ -74,6 +74,7 @@ export const api = {
   resolveTaskOverflow: (keepIds: string[]) => invoke<Snapshot>("resolve_task_overflow", { keepIds }),
   clearAllData: () => invoke<Snapshot>("clear_all_data"),
   dispatch: (action: AppAction) => invoke<Snapshot>("dispatch_action", { action }),
+  activateSlot: (slot: number) => invoke<void>("activate_slot", { slot }),
   resolveTitle: (url: string) => invoke<TitleSuggestion>("resolve_link_title", { url }),
   addContact: (name: string) => invoke<Snapshot>("add_contact", { name }),
   renameContact: (contactId: string, name: string) => invoke<Snapshot>("rename_contact", { contactId, name }),
@@ -87,6 +88,7 @@ export const api = {
   startRecording: () => invoke<string>("start_recording"),
   startNativeRecording: () => invoke<string>("start_native_recording"),
   stopNativeRecording: () => invoke<Snapshot>("stop_native_recording"),
+  nativeRecordingLevel: () => invoke<number>("native_recording_level"),
   finishRecording: (recordingId: string, audio: Uint8Array, duration: number, transcript = "") => invoke<Snapshot>("finish_recording", { recordingId, audio, duration, transcript }),
   failRecording: (recordingId: string, message: string) => invoke<Snapshot>("fail_recording", { recordingId, message }),
   deleteRecording: (recordingId: string) => invoke<Snapshot>("delete_recording", { recordingId }),
@@ -117,6 +119,7 @@ export const api = {
   toggleQuickPanel: () => invoke<void>("toggle_quick_panel"),
   showQuickPanel: () => invoke<void>("show_quick_panel"),
   setPetDragging: (dragging: boolean) => invoke<void>("set_pet_dragging", { dragging }),
+  setPetMode: (mode: string) => invoke<void>("set_pet_mode", { mode }),
   syncHoverState: () => invoke<void>("sync_hover_state"),
   submitDroppedLink: (url: string) => invoke<void>("submit_dropped_link", { url }),
   showConsole: () => invoke<void>("show_console"),
@@ -161,4 +164,9 @@ export async function onModelStatus(callback: (status: ModelStatus) => void): Pr
 export async function onPartialTranscript(callback: (value: { recordingId: string; text: string }) => void): Promise<UnlistenFn> {
   if (!inTauri()) return () => undefined;
   return listen<{ recordingId: string; text: string }>("redkey://partial-transcript", ({ payload }) => callback(payload));
+}
+
+export async function onPetMode(callback: (mode: string) => void): Promise<UnlistenFn> {
+  if (!inTauri()) return () => undefined;
+  return listen<string>("redkey://pet-mode", ({ payload }) => callback(payload));
 }

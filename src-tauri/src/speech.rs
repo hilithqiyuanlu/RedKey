@@ -146,9 +146,69 @@ pub fn delete(app: &AppHandle, id: &str) -> Result<()> {
     Ok(())
 }
 
+fn estimated_min_space(id: &str) -> u64 {
+    match id {
+        id if id == ASR_ID => 3_500_000_000,
+        id if id == ALIGNER_ID => 2_000_000_000,
+        id if id == DIARIZATION_ID => 4_000_000_000,
+        id if id == OCR_ID => 800_000_000,
+        _ => 1_000_000_000,
+    }
+}
+
+#[cfg(windows)]
+fn free_disk_space(path: &Path) -> Result<u64> {
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let root_path = match path.components().next() {
+        Some(std::path::Component::Prefix(p)) => {
+            let mut s = p.as_os_str().to_os_string();
+            s.push("\\");
+            s
+        }
+        _ => std::ffi::OsString::from("C:\\"),
+    };
+    let root_wide: Vec<u16> = root_path.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+    let mut free_bytes = 0u64;
+    let mut total_bytes = 0u64;
+    let mut total_free = 0u64;
+    unsafe {
+        if GetDiskFreeSpaceExW(
+            root_wide.as_ptr(),
+            &mut free_bytes,
+            &mut total_bytes,
+            &mut total_free,
+        ) == 0
+        {
+            bail!("无法获取磁盘空间信息");
+        }
+    }
+    Ok(free_bytes)
+}
+
+#[cfg(not(windows))]
+fn free_disk_space(_path: &Path) -> Result<u64> {
+    Ok(u64::MAX)
+}
+
+fn check_disk_space(app: &AppHandle, id: &str) -> Result<()> {
+    let models_dir = models_dir(app)?;
+    let min_space = estimated_min_space(id);
+    let free = free_disk_space(&models_dir).unwrap_or(u64::MAX);
+    if free < min_space {
+        let needed = format_bytes(min_space);
+        let available = format_bytes(free);
+        bail!("磁盘空间不足：需要至少 {needed}，当前可用 {available}");
+    }
+    Ok(())
+}
+
 fn install(app: &AppHandle, id: &str) -> Result<()> {
     // 3D-Speaker has a different dependency graph from Qwen. Keeping it in a
     // separate venv prevents its scientific packages from breaking ASR.
+    if let Err(e) = check_disk_space(app, id) {
+        save_status(app, &ModelStatus { id: id.into(), installed: false, downloading: false, progress: 0, stage: "空间不足".into(), error: Some(e.to_string()), size_bytes: 0, downloaded_bytes: 0, total_bytes: None, progress_kind: "idle".into(), detail: "请清理磁盘空间后重试".into(), verified: false })?;
+        return Err(e);
+    }
     let runtime = if id == DIARIZATION_ID { diarization_runtime_dir(app)? } else { runtime_dir(app)? };
     let python = runtime.join(if cfg!(windows) { "Scripts/python.exe" } else { "bin/python" });
     if !python.exists() || !venv_python_compatible(&python) {
@@ -200,7 +260,7 @@ fn install_diarization(app: &AppHandle, id: &str, python: &Path) -> Result<()> {
     ]), "安装科学计算依赖失败", 0, None, None)?;
     run_cancelable(app, id, Command::new(python).args([
         "-m", "pip", "install", "--only-binary", ":all:",
-        "modelscope", "datasets", "soundfile", "tqdm", "pyyaml", "kaldiio", "addict",
+        "modelscope", "datasets", "pillow", "soundfile", "tqdm", "pyyaml", "kaldiio", "addict",
         "simplejson", "sortedcontainers",
     ]), "安装 3D-Speaker 工具依赖失败", 0, None, None)?;
     // 聚类相关依赖（fastcluster、umap-learn 和 hdbscan 在 Windows 上常需从源码构建，
@@ -342,8 +402,11 @@ fn run_cancelable(app: &AppHandle, id: &str, command: &mut Command, context: &st
             if !status.success() {
                 let details = fs::read_to_string(&log_path).unwrap_or_default();
                 let details = tail_text(&details, 2800);
-                if details.is_empty() { bail!("{context}（退出码 {status}）") }
-                bail!("{context}：\n{details}")
+                let downloaded = download_dir.map(directory_size).unwrap_or(0);
+                let total = read_total(total_path);
+                let error_msg = if details.is_empty() { format!("{context}（退出码 {status}）") } else { format!("{context}：\n{details}") };
+                let _ = save_status(app, &ModelStatus { id: id.into(), installed: false, downloading: false, progress: 0, stage: "安装失败".into(), error: Some(error_msg.clone()), size_bytes: downloaded, downloaded_bytes: downloaded, total_bytes: total, progress_kind: "idle".into(), detail: context.into(), verified: false });
+                bail!("{error_msg}")
             }
             return Ok(())
         }

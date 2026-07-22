@@ -9,6 +9,10 @@ import os
 import sys
 from pathlib import Path
 
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 
 def emit(value):
     sys.stdout.write(json.dumps(value, ensure_ascii=False) + "\n")

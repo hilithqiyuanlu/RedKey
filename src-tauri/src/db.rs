@@ -381,7 +381,7 @@ impl Database {
                     let prefix = raw.pointer("/shortcuts/slots/0").and_then(|value| value.as_str())
                         .and_then(|value| value.rsplit_once('+').map(|(prefix, _)| prefix))
                         .filter(|value| !value.is_empty())
-                        .unwrap_or("Control+Alt");
+                        .unwrap_or("CapsLock+Alt");
                     current.shortcuts.task_prefix = prefix.replace("Option", "Alt");
                 }
             }

@@ -24,6 +24,13 @@ pub struct NativeRecording {
     writer_tx: mpsc::Sender<WriterMessage>,
     writer_thread: Option<std::thread::JoinHandle<Result<()>>>,
     running: Arc<AtomicBool>,
+    level: Arc<parking_lot::Mutex<f32>>,
+}
+
+impl NativeRecording {
+    pub fn level(&self) -> f32 {
+        *self.level.lock()
+    }
 }
 
 unsafe impl Send for NativeRecording {}
@@ -52,6 +59,12 @@ fn find_input_device() -> Result<cpal::Device> {
         .ok_or_else(|| anyhow!("未找到可用的麦克风设备"))
 }
 
+fn compute_rms(samples: &[i16]) -> f32 {
+    if samples.is_empty() { return 0.0; }
+    let sum: f64 = samples.iter().map(|&s| (s as f64).powi(2)).sum();
+    (sum / samples.len() as f64).sqrt() as f32 / i16::MAX as f32
+}
+
 pub fn start_recording(id: String, path: PathBuf) -> Result<NativeRecording> {
     let device = find_input_device()?;
     let supported_config = device.default_input_config()?;
@@ -69,13 +82,17 @@ pub fn start_recording(id: String, path: PathBuf) -> Result<NativeRecording> {
     let buf_writer = BufWriter::new(file);
     let writer = WavWriter::new(buf_writer, spec)?;
     let running = Arc::new(AtomicBool::new(true));
+    let level = Arc::new(parking_lot::Mutex::new(0.0f32));
 
     let (writer_tx, writer_rx) = mpsc::channel::<WriterMessage>();
+    let level_clone = level.clone();
     let writer_thread = std::thread::spawn(move || -> Result<()> {
         let mut writer = writer;
         for message in writer_rx {
             match message {
                 WriterMessage::Samples(samples) => {
+                    let rms = compute_rms(&samples);
+                    *level_clone.lock() = rms;
                     for sample in samples {
                         let _ = writer.write_sample(sample);
                     }
@@ -146,5 +163,6 @@ pub fn start_recording(id: String, path: PathBuf) -> Result<NativeRecording> {
         writer_tx,
         writer_thread: Some(writer_thread),
         running,
+        level,
     })
 }

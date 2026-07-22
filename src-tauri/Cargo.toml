@@ -26,6 +26,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_SystemServices",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
+    "Win32_Storage_FileSystem",
 ] }
 cpal = "0.15"
 hound = "3"

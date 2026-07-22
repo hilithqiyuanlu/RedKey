@@ -55,7 +55,7 @@
         "title": "AlphaKey HUD",
         "url": "index.html?view=hud",
         "width": 2560,
-        "height": 680,
+        "height": 124,
         "visible": false,
         "decorations": false,
         "transparent": true,

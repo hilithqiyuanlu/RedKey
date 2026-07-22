@@ -114,7 +114,7 @@ export interface ModelStatus {
 }
 
 export interface TaskHudPayload {
-  slots: { slot: number; name: string | null; title: string | null }[];
+  slots: { slot: number; taskId: string | null; name: string | null; title: string | null }[];
 }
 
 export type AppAction =

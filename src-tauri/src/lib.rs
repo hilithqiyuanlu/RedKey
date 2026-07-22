@@ -50,6 +50,7 @@ struct RuntimeState {
     partial_busy: std::sync::atomic::AtomicBool,
     native_recording: Mutex<Option<NativeRecording>>,
     hud_state: Mutex<HudState>,
+    pet_mode: Mutex<String>,
 }
 
 impl Default for RuntimeState {
@@ -66,6 +67,7 @@ impl Default for RuntimeState {
             partial_busy: std::sync::atomic::AtomicBool::new(false),
             native_recording: Mutex::new(None),
             hud_state: Mutex::new(HudState::default()),
+            pet_mode: Mutex::new("default".to_string()),
         }
     }
 }
@@ -117,6 +119,7 @@ struct HoverRegions {
     dragging: bool,
     generation: u64,
 }
+
 
 fn err(error: impl std::fmt::Display) -> String {
     error.to_string()
@@ -485,22 +488,23 @@ pub fn dispatch_internal(app: &AppHandle, action: AppAction) -> Result<Snapshot>
     emit_snapshot(app)
 }
 
+const HUD_HEIGHT: u32 = 124;
+
 fn position_hud(app: &AppHandle) -> Result<tauri::WebviewWindow> {
     let hud = app.get_webview_window("hud").context("提示窗口不存在")?;
     let monitor = hud.primary_monitor()?.context("无法读取主显示器")?;
     let work_area = monitor.work_area();
-    let width = (work_area.size.width as i32 - 120).clamp(560, 1920) as u32;
-    let height = ((work_area.size.height as i32) / 7).clamp(140, 300) as u32;
-    let desired = Size::Physical(PhysicalSize::new(width, height));
+    let width = work_area.size.width as u32;
+    let desired = Size::Physical(PhysicalSize::new(width, HUD_HEIGHT));
     hud.set_size(desired)?;
-    let size = hud.outer_size()?;
-    let x = work_area.position.x + (work_area.size.width as i32 - size.width as i32) / 2;
-    let y = work_area.position.y + ((work_area.size.height as i32 - size.height as i32) as f32 * 0.74) as i32;
+    let x = work_area.position.x;
+    let y = work_area.position.y + work_area.size.height as i32 - HUD_HEIGHT as i32;
     hud.set_position(Position::Physical(PhysicalPosition::new(x, y)))?;
     hud.set_always_on_top(true)?;
     #[cfg(target_os = "macos")]
     hud.set_visible_on_all_workspaces(true)?;
-    hud.set_ignore_cursor_events(true)?;
+    // HUD 现在需要接收鼠标悬停/点击事件，但保持 focusable=false 不抢键盘焦点。
+    hud.set_ignore_cursor_events(false)?;
     Ok(hud)
 }
 
@@ -510,18 +514,13 @@ pub fn emit_task_hud(app: &AppHandle) -> Result<()> {
         let task = snapshot.tasks.iter().find(|task| task.group == snapshot.current_group && task.slot == Some(slot) && task.status == "active");
         serde_json::json!({
             "slot": slot,
+            "task_id": task.map(|task| task.id.clone()),
             "name": task.and_then(|task| task.contact_name.clone()),
             "title": task.map(|task| task.source_title.clone().unwrap_or_else(|| task.title.clone()))
         })
     }).collect::<Vec<_>>();
     let hud = position_hud(app)?;
-    let console_visible = app.get_webview_window("console").and_then(|w| w.is_visible().ok()).unwrap_or(false);
     hud.show()?;
-    if console_visible {
-        if let Some(console) = app.get_webview_window("console") {
-            let _ = console.set_focus();
-        }
-    }
     hud.emit("redkey://task-hud", serde_json::json!({ "slots": slots }))?;
     Ok(())
 }
@@ -536,6 +535,7 @@ pub fn set_task_hud_visible(app: &AppHandle, visible: bool) -> Result<()> {
     } else {
         if let Some(hud) = app.get_webview_window("hud") {
             let _ = hud.emit("redkey://task-hud", serde_json::json!({ "slots": [] }));
+            let _ = hud.set_ignore_cursor_events(true);
             hud.hide()?;
         }
     }
@@ -750,8 +750,8 @@ fn show_quick_panel_inner(app: &AppHandle, focus: bool) -> Result<()> {
         let top = work_area.position.y;
         let right = left + work_area.size.width as i32;
         let bottom = top + work_area.size.height as i32;
-        let left_candidate = pet_position.x - quick_size.width as i32 - 12;
-        let right_candidate = pet_position.x + pet_size.width as i32 + 12;
+        let left_candidate = pet_position.x - quick_size.width as i32 - 4;
+        let right_candidate = pet_position.x + pet_size.width as i32 + 4;
         let mut x = if left_candidate >= left {
             left_candidate
         } else {
@@ -863,6 +863,29 @@ fn set_pet_dragging(app: AppHandle, dragging: bool) -> Result<(), String> {
     if !dragging {
         sync_hover_state(app)?;
     }
+    Ok(())
+}
+
+#[tauri::command]
+fn set_pet_mode(app: AppHandle, mode: String) -> Result<(), String> {
+    let valid_modes = ["default", "edit", "ai-summary"];
+    if !valid_modes.contains(&mode.as_str()) {
+        return Err(format!("Invalid pet mode: {}", mode));
+    }
+    {
+        let state = app.state::<RuntimeState>();
+        let mut pet_mode = state.pet_mode.lock();
+        *pet_mode = mode.clone();
+    }
+    if let Some(pet_window) = app.get_webview_window("pet") {
+        let _ = pet_window.emit("redkey://pet-mode", mode);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn activate_slot(app: AppHandle, slot: i64) -> Result<(), String> {
+    dispatch_internal(&app, AppAction::ActivateSlot { slot }).map_err(err)?;
     Ok(())
 }
 
@@ -1263,6 +1286,7 @@ fn save_shortcuts(app: AppHandle, shortcuts: ShortcutSettings) -> Result<Snapsho
         autostart: previous.autostart,
         pet_visible: previous.pet_visible,
         multi_group_enabled: previous.multi_group_enabled,
+        cloud_api_enabled: previous.cloud_api_enabled,
         shortcuts,
     };
     settings.validate().map_err(err)?;
@@ -1397,6 +1421,29 @@ fn stop_native_recording(app: AppHandle) -> Result<Snapshot, String> {
     std::thread::spawn(move || run_transcription_pipeline(background_app, recording.path, recording.id));
     update_tray_recording_text(&app);
     snapshot(&app).map_err(err)
+}
+
+#[tauri::command]
+fn native_recording_level(app: AppHandle) -> Result<f32, String> {
+    let state = app.state::<RuntimeState>();
+    let recording = state.native_recording.lock();
+    #[cfg(windows)]
+    {
+        if let Some(rec) = recording.as_ref() {
+            return Ok(rec.level());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = recording;
+        return Ok(0.0);
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = recording;
+        return Ok(0.0);
+    }
+    Err("当前没有录音".into())
 }
 
 #[tauri::command]
@@ -1758,6 +1805,7 @@ pub fn run() {
             rename_contact,
             remove_contact,
             dispatch_action,
+            activate_slot,
             update_settings,
             set_autostart,
             set_pet_visible,
@@ -1766,6 +1814,7 @@ pub fn run() {
             start_recording,
             start_native_recording,
             stop_native_recording,
+            native_recording_level,
             finish_recording,
             fail_recording,
             delete_recording,
@@ -1786,6 +1835,7 @@ pub fn run() {
             toggle_quick_panel,
             show_quick_panel,
             set_pet_dragging,
+            set_pet_mode,
             sync_hover_state,
             submit_dropped_link,
             show_console,
