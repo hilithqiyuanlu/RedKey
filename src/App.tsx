@@ -3,7 +3,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import {
   Archive, Check, ChevronDown, ChevronRight, CircleAlert, CircleCheck, Clipboard, ClipboardPaste, Download, ExternalLink,
-  FileImage, FileText, KeyRound, Link2, ListTodo, LoaderCircle, Mic, MicOff, Pencil,
+  FileImage, FileText, KeyRound, Link2, ListTodo, LoaderCircle, Mic, MicOff, Pause, Pencil, Play,
   Plus, RefreshCw, RotateCcw, Settings as SettingsIcon, Sparkles, Trash2, UserRound, X,
 } from "lucide-react";
 import { api, onLinkDrop, onModelStatus, onNewTask, onPartialTranscript, onPetMode, onQuickPanelShown, onRecordingToggle, onTaskHud } from "./api";
@@ -855,7 +855,7 @@ function RecordingCard({ recording, summary, activeElapsed, activeLevel, readOnl
       }}><RefreshCw />{summary?.status === "stale" ? "重新梳理" : "梳理总结"}</button>}
       {recording.processingError && <p className="error-message"><CircleAlert />{recording.processingError}</p>}
       <TranscriptTimeline detail={detail} fallback={recording.transcript} />
-      {audioUrl && <audio className="audio-player-native" controls src={audioUrl} />}
+      {audioUrl && <AudioPlayer src={audioUrl} />}
     </div>}
     {editing && summary && <SummaryEditor summary={summary} onClose={() => setEditing(false)} onSave={(next) => void api.updateRecordingSummary(recording.id, next).then(() => { setEditing(false); onRefresh(); }).catch((reason) => notify(String(reason)))} />}
     {confirmDelete && <ConfirmDialog
@@ -902,8 +902,84 @@ function SummaryEditor({ summary, onClose, onSave }: { summary: RecordingSummary
   return <div className="modal-backdrop" onClick={onClose}><section className="modal summary-editor" onClick={(event) => event.stopPropagation()}><header><strong>编辑录音总结</strong><IconButton label="关闭" onClick={onClose}><X /></IconButton></header><label>对接结论<textarea value={overview} onChange={(event) => setOverview(event.target.value)} /></label><label>待处理事项<textarea value={pending} onChange={(event) => setPending(event.target.value)} /></label><label>已确认事项<textarea value={decisions} onChange={(event) => setDecisions(event.target.value)} /></label><label>任务变化<textarea value={changes} onChange={(event) => setChanges(event.target.value)} /></label><label>未解决问题<textarea value={questions} onChange={(event) => setQuestions(event.target.value)} /></label><footer><button onClick={onClose}>取消</button><button className="primary" onClick={() => onSave({ ...summary, overview: overview.trim(), pendingItems: lines(pending), confirmedDecisions: lines(decisions), requestedChanges: lines(changes), openQuestions: lines(questions) })}>保存</button></footer></section></div>;
 }
 
+function AudioPlayer({ src }: { src: string }) {
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [playing, setPlaying] = useState(false);
+  const [current, setCurrent] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [rate, setRate] = useState(1);
+  const rates = [1, 1.25, 1.5, 2];
+
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    const onTime = () => setCurrent(audio.currentTime);
+    const onMeta = () => setDuration(audio.duration || 0);
+    const onEnd = () => { setPlaying(false); setCurrent(0); };
+    const onPlay = () => setPlaying(true);
+    const onPause = () => setPlaying(false);
+    audio.addEventListener("timeupdate", onTime);
+    audio.addEventListener("loadedmetadata", onMeta);
+    audio.addEventListener("ended", onEnd);
+    audio.addEventListener("play", onPlay);
+    audio.addEventListener("pause", onPause);
+    return () => {
+      audio.removeEventListener("timeupdate", onTime);
+      audio.removeEventListener("loadedmetadata", onMeta);
+      audio.removeEventListener("ended", onEnd);
+      audio.removeEventListener("play", onPlay);
+      audio.removeEventListener("pause", onPause);
+    };
+  }, []);
+
+  const toggle = () => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    if (audio.paused) void audio.play(); else audio.pause();
+  };
+
+  const seek = (event: React.MouseEvent<HTMLButtonElement>) => {
+    const audio = audioRef.current;
+    if (!audio || !duration) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+    audio.currentTime = ratio * duration;
+    setCurrent(audio.currentTime);
+  };
+
+  const cycleRate = () => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    const next = rates[(rates.indexOf(rate) + 1) % rates.length];
+    setRate(next);
+    audio.playbackRate = next;
+  };
+
+  return <div className="audio-player">
+    <audio ref={audioRef} src={src} preload="metadata" />
+    <button className="audio-play-btn" onClick={toggle} aria-label={playing ? "暂停" : "播放"}>{playing ? <Pause /> : <Play />}</button>
+    <span className="audio-time">{formatDuration(Math.floor(current))}</span>
+    <button className="audio-seek" onClick={seek} disabled={!duration} aria-label="拖动调整播放进度"><span className="audio-seek-fill" style={{ width: `${duration ? (current / duration) * 100 : 0}%` }} /></button>
+    <span className="audio-time">{formatDuration(Math.floor(duration))}</span>
+    <button className="audio-rate" onClick={cycleRate} aria-label="切换倍速">{rate}x</button>
+  </div>;
+}
+
 function TranscriptTimeline({ detail, fallback }: { detail: RecordingDetail | null; fallback: string }) {
-  return <section className="transcript-block"><h3>发言人时间轴</h3>{detail?.segments.length ? <div className="timeline-list">{detail.segments.map((segment) => <div className="timeline-segment" key={segment.id}><time>{formatTimestamp(segment.startMs)}</time><strong>{detail.speakers.find((speaker) => speaker.speakerId === segment.speakerId)?.displayName ?? "Speaker"}</strong><p>{segment.text}</p></div>)}</div> : <p>{fallback || "尚未生成转写内容。"}</p>}</section>;
+  const [showRaw, setShowRaw] = useState(false);
+  const hasSegments = !!detail?.segments.length;
+  return <section className="transcript-block">
+    <div className="transcript-header">
+      <h3>发言人时间轴</h3>
+      {hasSegments && fallback && <button className="transcript-toggle-raw" onClick={() => setShowRaw((v) => !v)}>{showRaw ? "隐藏原始文本" : "显示原始文本"}</button>}
+    </div>
+    {hasSegments
+      ? <>
+          <div className="timeline-list">{detail!.segments.map((segment) => <div className="timeline-segment" key={segment.id}><time>{formatTimestamp(segment.startMs)}</time><strong>{detail!.speakers.find((speaker) => speaker.speakerId === segment.speakerId)?.displayName ?? "Speaker"}</strong><p>{segment.text}</p></div>)}</div>
+          {showRaw && <div className="transcript-raw"><h4>原始转写文本</h4><p>{fallback}</p></div>}
+        </>
+      : <p>{fallback || "尚未生成转写内容。"}</p>}
+  </section>;
 }
 
 function displayRecordingStatus(recording: Recording, summary: RecordingSummary | null) {
