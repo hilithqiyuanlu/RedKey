@@ -99,46 +99,13 @@ CREATE TABLE IF NOT EXISTS recordings (
   duration REAL NOT NULL,
   status TEXT NOT NULL CHECK(status IN ('recording', 'completed', 'transcribing', 'summarizing', 'done', 'error')),
   created_at TEXT NOT NULL,
-  transcript TEXT NOT NULL DEFAULT '[]',
-  summary TEXT,
-  ai_analysis TEXT
-);
-CREATE TABLE IF NOT EXISTS transcript_segments (
-  id TEXT PRIMARY KEY,
-  recording_id TEXT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
-  seq INTEGER NOT NULL,
-  speaker_id TEXT,
-  start_ms INTEGER,
-  end_ms INTEGER,
-  text TEXT NOT NULL,
-  is_final INTEGER NOT NULL DEFAULT 0,
-  user_corrected INTEGER NOT NULL DEFAULT 0,
-  UNIQUE(recording_id, seq, is_final)
-);
-CREATE TABLE IF NOT EXISTS transcript_words (
-  id TEXT PRIMARY KEY,
-  recording_id TEXT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
-  seq INTEGER NOT NULL,
-  text TEXT NOT NULL,
-  start_ms INTEGER NOT NULL,
-  end_ms INTEGER NOT NULL,
-  UNIQUE(recording_id, seq)
-);
-CREATE TABLE IF NOT EXISTS speaker_turns (
-  id TEXT PRIMARY KEY,
-  recording_id TEXT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
-  speaker_id TEXT NOT NULL,
-  start_ms INTEGER NOT NULL,
-  end_ms INTEGER NOT NULL,
-  confidence REAL,
-  overlap_detected INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS recording_speakers (
-  recording_id TEXT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
-  speaker_id TEXT NOT NULL,
-  display_name TEXT NOT NULL,
-  sort_order INTEGER NOT NULL,
-  PRIMARY KEY(recording_id, speaker_id)
+  transcript TEXT NOT NULL DEFAULT '',
+  raw_transcript TEXT NOT NULL DEFAULT '',
+  speaker_segments TEXT NOT NULL DEFAULT '[]',
+  processing_status TEXT NOT NULL DEFAULT 'pending',
+  processing_error TEXT,
+  audio_path TEXT,
+  updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS task_text_cards (
   id TEXT PRIMARY KEY,
@@ -282,18 +249,11 @@ impl Database {
         }
         for (name, sql) in [
             ("audio_path", "ALTER TABLE recordings ADD COLUMN audio_path TEXT"),
-            ("capture_device", "ALTER TABLE recordings ADD COLUMN capture_device TEXT"),
-            ("processing_status", "ALTER TABLE recordings ADD COLUMN processing_status TEXT NOT NULL DEFAULT 'idle'"),
+            ("processing_status", "ALTER TABLE recordings ADD COLUMN processing_status TEXT NOT NULL DEFAULT 'pending'"),
             ("raw_transcript", "ALTER TABLE recordings ADD COLUMN raw_transcript TEXT NOT NULL DEFAULT ''"),
-            ("final_transcript", "ALTER TABLE recordings ADD COLUMN final_transcript TEXT NOT NULL DEFAULT ''"),
-            ("error_message", "ALTER TABLE recordings ADD COLUMN error_message TEXT"),
-            ("updated_at", "ALTER TABLE recordings ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''"),
-            ("alignment_status", "ALTER TABLE recordings ADD COLUMN alignment_status TEXT NOT NULL DEFAULT 'pending'"),
-            ("diarization_status", "ALTER TABLE recordings ADD COLUMN diarization_status TEXT NOT NULL DEFAULT 'pending'"),
-            ("speaker_count", "ALTER TABLE recordings ADD COLUMN speaker_count INTEGER NOT NULL DEFAULT 2"),
-            ("transcript_hash", "ALTER TABLE recordings ADD COLUMN transcript_hash TEXT"),
-            ("processed_transcript_hash", "ALTER TABLE recordings ADD COLUMN processed_transcript_hash TEXT"),
+            ("speaker_segments", "ALTER TABLE recordings ADD COLUMN speaker_segments TEXT NOT NULL DEFAULT '[]'"),
             ("processing_error", "ALTER TABLE recordings ADD COLUMN processing_error TEXT"),
+            ("updated_at", "ALTER TABLE recordings ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''"),
         ] {
             let exists: bool = self.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('recordings') WHERE name=?1)",
@@ -301,10 +261,6 @@ impl Database {
             )?;
             if !exists { self.conn.execute(sql, [])?; }
         }
-        let corrected_exists: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('transcript_segments') WHERE name='user_corrected')", [], |row| row.get(0),
-        )?;
-        if !corrected_exists { self.conn.execute("ALTER TABLE transcript_segments ADD COLUMN user_corrected INTEGER NOT NULL DEFAULT 0", [])?; }
         let image_content_exists: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('task_image_cards') WHERE name='content')", [], |row| row.get(0),
         )?;
@@ -345,7 +301,11 @@ impl Database {
             "DROP TABLE IF EXISTS archived_group_slot_bindings;
              DROP TABLE IF EXISTS archived_slot_bindings;
              DROP TABLE IF EXISTS slot_bindings;
-             DROP TABLE IF EXISTS completed_slot_bindings;",
+             DROP TABLE IF EXISTS completed_slot_bindings;
+             DROP TABLE IF EXISTS transcript_segments;
+             DROP TABLE IF EXISTS transcript_words;
+             DROP TABLE IF EXISTS speaker_turns;
+             DROP TABLE IF EXISTS recording_speakers;",
         )?;
         if has_archived {
             self.conn.execute("ALTER TABLE tasks DROP COLUMN archived_at", [])?;
@@ -439,79 +399,34 @@ impl Database {
         Ok(())
     }
 
-    pub fn complete_transcription(&self, id: &str, text: &str) -> Result<()> {
-        let transcript_hash = transcript_hash(text);
+    pub fn complete_transcription(&self, id: &str, raw: &str, text: &str, segments: &[SpeakerSegment]) -> Result<()> {
+        let segments_json = serde_json::to_string(segments)?;
         let changed = self.conn.execute(
-            "UPDATE recordings SET status='done',processing_status='completed',transcript=?2,raw_transcript=?2,final_transcript=?2,transcript_hash=?3,processed_transcript_hash=NULL,error_message=NULL,updated_at=?4 WHERE id=?1",
-            params![id, text, transcript_hash, now()],
+            "UPDATE recordings SET status='done',processing_status='completed',transcript=?2,raw_transcript=?3,speaker_segments=?4,error_message=NULL,updated_at=?5 WHERE id=?1",
+            params![id, text, raw, segments_json, now()],
         )?;
         anyhow::ensure!(changed == 1, "录音记录不存在");
         Ok(())
     }
 
-    pub fn set_processing_stage(&self, id: &str, stage: &str, error: Option<&str>) -> Result<()> {
-        let (alignment, diarization) = match stage {
-            "aligning" => ("aligning", "pending"), "diarizing" => ("completed", "diarizing"),
-            "merging" => ("completed", "merging"), "completed" => ("completed", "completed"),
-            "waiting_alignment" => ("waiting_model", "pending"), "alignment_error" => ("error", "pending"),
-            "diarization_error" => ("completed", "error"), _ => ("pending", "pending"),
-        };
-        self.conn.execute("UPDATE recordings SET processing_status=?2,alignment_status=?3,diarization_status=?4,processing_error=?5,processed_transcript_hash=CASE WHEN ?2='completed' THEN transcript_hash ELSE processed_transcript_hash END,updated_at=?6 WHERE id=?1", params![id, stage, alignment, diarization, error, now()])?;
-        Ok(())
-    }
-
-    pub fn save_words(&mut self, recording_id: &str, words: &[TranscriptWord]) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM transcript_words WHERE recording_id=?1", [recording_id])?;
-        for (seq, word) in words.iter().enumerate() { tx.execute("INSERT INTO transcript_words(id,recording_id,seq,text,start_ms,end_ms) VALUES(?1,?2,?3,?4,?5,?6)", params![word.id, recording_id, seq as i64, word.text, word.start_ms, word.end_ms])?; }
-        tx.commit()?; Ok(())
-    }
-
-    pub fn save_segments(&mut self, recording_id: &str, segments: &[TranscriptSegment]) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM transcript_segments WHERE recording_id=?1 AND is_final=1", [recording_id])?;
-        for segment in segments { tx.execute("INSERT INTO transcript_segments(id,recording_id,seq,speaker_id,start_ms,end_ms,text,is_final,user_corrected) VALUES(?1,?2,?3,?4,?5,?6,?7,1,?8)", params![segment.id, recording_id, segment.seq, segment.speaker_id, segment.start_ms, segment.end_ms, segment.text, segment.user_corrected as i64])?; }
-        tx.commit()?; Ok(())
-    }
-
-    pub fn save_speaker_turns(&mut self, recording_id: &str, turns: &[crate::speech::SpeakerTurn]) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM speaker_turns WHERE recording_id=?1", [recording_id])?;
-        for turn in turns { tx.execute("INSERT INTO speaker_turns(id,recording_id,speaker_id,start_ms,end_ms,confidence,overlap_detected) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![Uuid::new_v4().to_string(), recording_id, turn.speaker_id, turn.start_ms, turn.end_ms, turn.confidence, turn.overlap as i64])?; }
-        tx.commit()?; Ok(())
-    }
-
-    pub fn ensure_speakers(&mut self, recording_id: &str, count: i64) -> Result<()> {
-        anyhow::ensure!((1..=5).contains(&count), "自动识别的发言人数必须在 1 到 5 之间");
-        let tx = self.conn.transaction()?;
-        tx.execute("UPDATE recordings SET speaker_count=?2 WHERE id=?1", params![recording_id, count])?;
-        tx.execute("DELETE FROM recording_speakers WHERE recording_id=?1", [recording_id])?;
-        for index in 0..count { let id = format!("speaker_{}", index); let name = format!("Speaker {}", (b'A' + index as u8) as char); tx.execute("INSERT INTO recording_speakers(recording_id,speaker_id,display_name,sort_order) VALUES(?1,?2,?3,?4)", params![recording_id,id,name,index])?; }
-        tx.commit()?; Ok(())
-    }
-
-    pub fn prepare_recording_processing(&mut self, recording_id: &str) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM transcript_segments WHERE recording_id=?1 AND is_final=1", [recording_id])?;
-        tx.execute("DELETE FROM speaker_turns WHERE recording_id=?1", [recording_id])?;
-        tx.execute("DELETE FROM recording_speakers WHERE recording_id=?1", [recording_id])?;
-        let changed = tx.execute("UPDATE recordings SET processing_status='diarizing',alignment_status='pending',diarization_status='diarizing',processing_error=NULL,error_message=NULL,speaker_count=0,updated_at=?2 WHERE id=?1", params![recording_id, now()])?;
-        anyhow::ensure!(changed == 1, "录音记录不存在");
-        tx.commit()?;
+    pub fn set_processing_status(&self, id: &str, status: &str, error: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE recordings SET processing_status=?2,processing_error=?3,updated_at=?4 WHERE id=?1",
+            params![id, status, error, now()],
+        )?;
         Ok(())
     }
 
     pub fn recording_detail(&self, recording_id: &str) -> Result<RecordingDetail> {
         let recording = self.list_recordings()?.into_iter().find(|item| item.id == recording_id).context("录音记录不存在")?;
-        let mut stmt = self.conn.prepare("SELECT id,text,start_ms,end_ms FROM transcript_words WHERE recording_id=?1 ORDER BY seq")?;
-        let words = stmt.query_map([recording_id], |row| Ok(TranscriptWord { id: row.get(0)?, text: row.get(1)?, start_ms: row.get(2)?, end_ms: row.get(3)? }))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut stmt = self.conn.prepare("SELECT id,seq,speaker_id,start_ms,end_ms,text,user_corrected FROM transcript_segments WHERE recording_id=?1 AND is_final=1 ORDER BY seq")?;
-        let segments = stmt.query_map([recording_id], |row| Ok(TranscriptSegment { id: row.get(0)?, seq: row.get(1)?, speaker_id: row.get(2)?, start_ms: row.get(3)?, end_ms: row.get(4)?, text: row.get(5)?, user_corrected: row.get::<_,i64>(6)? != 0 }))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut stmt = self.conn.prepare("SELECT speaker_id,display_name,sort_order FROM recording_speakers WHERE recording_id=?1 ORDER BY sort_order")?;
-        let speakers = stmt.query_map([recording_id], |row| Ok(RecordingSpeaker { speaker_id: row.get(0)?, display_name: row.get(1)?, sort_order: row.get(2)? }))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(RecordingDetail { recording, words, segments, speakers })
+        let segments_json: String = self.conn.query_row(
+            "SELECT speaker_segments FROM recordings WHERE id=?1",
+            [recording_id],
+            |row| row.get(0),
+        )?;
+        let segments: Vec<SpeakerSegment> = serde_json::from_str(&segments_json).unwrap_or_default();
+        Ok(RecordingDetail { recording, segments })
     }
-
 
     pub fn delete_recording(&mut self, id: &str) -> Result<()> {
         let changed = self.conn.execute("DELETE FROM recordings WHERE id=?1", [id])?;
@@ -536,8 +451,8 @@ impl Database {
     }
 
     fn list_recordings(&self) -> Result<Vec<Recording>> {
-        query_all(&self.conn, "SELECT r.id,r.task_id,t.title,r.filename,r.duration,r.status,r.created_at,COALESCE(NULLIF(r.final_transcript,''),r.transcript),r.raw_transcript,r.error_message,r.processing_status,r.audio_path,r.updated_at,r.alignment_status,r.diarization_status,r.speaker_count,r.processing_error FROM recordings r LEFT JOIN tasks t ON t.id=r.task_id ORDER BY r.created_at DESC", |row| Ok(Recording {
-            id: row.get(0)?, task_id: row.get(1)?, task_title: row.get(2)?, filename: row.get(3)?, duration: row.get(4)?, status: row.get(5)?, created_at: row.get(6)?, transcript: row.get(7)?, raw_transcript: row.get(8)?, error_message: row.get(9)?, processing_status: row.get(10)?, audio_path: row.get(11)?, updated_at: row.get(12)?, alignment_status: row.get(13)?, diarization_status: row.get(14)?, speaker_count: row.get(15)?, processing_error: row.get(16)?,
+        query_all(&self.conn, "SELECT r.id,r.task_id,t.title,r.filename,r.duration,r.status,r.created_at,r.transcript,r.raw_transcript,r.error_message,r.processing_status,r.audio_path,r.updated_at FROM recordings r LEFT JOIN tasks t ON t.id=r.task_id ORDER BY r.created_at DESC", |row| Ok(Recording {
+            id: row.get(0)?, task_id: row.get(1)?, task_title: row.get(2)?, filename: row.get(3)?, duration: row.get(4)?, status: row.get(5)?, created_at: row.get(6)?, transcript: row.get(7)?, raw_transcript: row.get(8)?, error_message: row.get(9)?, processing_status: row.get(10)?, audio_path: row.get(11)?, updated_at: row.get(12)?,
         }))
     }
 
@@ -548,8 +463,8 @@ impl Database {
     // full text on every snapshot, which otherwise grows with meeting length
     // and history size.
     fn list_recordings_light(&self) -> Result<Vec<Recording>> {
-        query_all(&self.conn, "SELECT r.id,r.task_id,t.title,r.filename,r.duration,r.status,r.created_at,r.error_message,r.processing_status,r.audio_path,r.updated_at,r.alignment_status,r.diarization_status,r.speaker_count,r.processing_error FROM recordings r LEFT JOIN tasks t ON t.id=r.task_id ORDER BY r.created_at DESC", |row| Ok(Recording {
-            id: row.get(0)?, task_id: row.get(1)?, task_title: row.get(2)?, filename: row.get(3)?, duration: row.get(4)?, status: row.get(5)?, created_at: row.get(6)?, transcript: String::new(), raw_transcript: String::new(), error_message: row.get(7)?, processing_status: row.get(8)?, audio_path: row.get(9)?, updated_at: row.get(10)?, alignment_status: row.get(11)?, diarization_status: row.get(12)?, speaker_count: row.get(13)?, processing_error: row.get(14)?,
+        query_all(&self.conn, "SELECT r.id,r.task_id,t.title,r.filename,r.duration,r.status,r.created_at,r.error_message,r.processing_status,r.audio_path,r.updated_at FROM recordings r LEFT JOIN tasks t ON t.id=r.task_id ORDER BY r.created_at DESC", |row| Ok(Recording {
+            id: row.get(0)?, task_id: row.get(1)?, task_title: row.get(2)?, filename: row.get(3)?, duration: row.get(4)?, status: row.get(5)?, created_at: row.get(6)?, transcript: String::new(), raw_transcript: String::new(), error_message: row.get(7)?, processing_status: row.get(8)?, audio_path: row.get(9)?, updated_at: row.get(10)?,
         }))
     }
 
@@ -1797,18 +1712,13 @@ mod tests {
         let mut db = Database::memory().unwrap();
         let recording_id = db.start_recording(None).unwrap();
         db.finish_recording(&recording_id, 3.0, "/tmp/test.wav").unwrap();
-        db.complete_transcription(&recording_id, "原始文本").unwrap();
-        db.ensure_speakers(&recording_id, 2).unwrap();
-        db.save_words(&recording_id, &[TranscriptWord { id: "word".into(), text: "原始文本".into(), start_ms: 100, end_ms: 900 }]).unwrap();
-        db.save_segments(&recording_id, &[TranscriptSegment { id: "segment".into(), seq: 0, speaker_id: Some("speaker_0".into()), start_ms: 100, end_ms: 900, text: "原始文本".into(), user_corrected: false }]).unwrap();
-
-        db.set_processing_stage(&recording_id, "diarization_error", Some("旧错误")).unwrap();
-        db.prepare_recording_processing(&recording_id).unwrap();
+        db.complete_transcription(&recording_id, "原始文本", "原始文本", &[SpeakerSegment { speaker: "SPEAKER_0".into(), text: "原始文本".into() }]).unwrap();
+        db.set_processing_status(&recording_id, "error", Some("旧错误")).unwrap();
+        db.set_processing_status(&recording_id, "transcribing", None).unwrap();
         let detail = db.recording_detail(&recording_id).unwrap();
-        assert_eq!(detail.recording.processing_status, "diarizing");
+        assert_eq!(detail.recording.processing_status, "transcribing");
         assert_eq!(detail.recording.processing_error, None);
         assert!(detail.segments.is_empty());
-        assert!(detail.speakers.is_empty());
     }
 
     #[test]
@@ -1830,7 +1740,7 @@ mod tests {
         db.update_text_card(&card.id, "补充异常状态").unwrap();
         let recording_id = db.start_recording(Some(&task_id)).unwrap();
         db.finish_recording(&recording_id, 2.0, "/tmp/test.wav").unwrap();
-        db.complete_transcription(&recording_id, "确认保留两步流程").unwrap();
+        db.complete_transcription(&recording_id, "确认保留两步流程", "确认保留两步流程", &[]).unwrap();
         db.save_recording_summary(&RecordingSummary {
             recording_id: recording_id.clone(), overview: "保留两步流程".into(), pending_items: vec!["补充异常状态".into()], confirmed_decisions: vec!["保留两步流程".into()], requested_changes: vec![], action_items: vec![ActionItem { text: "补充方案".into(), owner: None, due: None }], open_questions: vec![], source_transcript_hash: Some("hash".into()), model: Some("deepseek-v4-flash".into()), prompt_version: "recording-summary-v1".into(), status: "completed".into(), error_message: None, user_edited: false, updated_at: now(),
         }).unwrap();

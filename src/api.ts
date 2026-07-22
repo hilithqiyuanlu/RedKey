@@ -6,7 +6,6 @@ import type {
   Settings,
   Snapshot,
   ShortcutSettings,
-  ModelStatus,
   TaskHudPayload,
   TaskDocument,
   TextCard,
@@ -94,7 +93,6 @@ export const api = {
   deleteRecording: (recordingId: string) => invoke<Snapshot>("delete_recording", { recordingId }),
   reassignRecording: (recordingId: string, taskId: string | null) => invoke<Snapshot>("reassign_recording", { recordingId, taskId }),
   recordingDetail: (recordingId: string) => invoke<RecordingDetail>("get_recording_detail", { recordingId }),
-  processRecording: (recordingId: string) => invoke<Snapshot>("process_recording", { recordingId }),
   recordingAudioData: (recordingId: string) => invoke<number[]>("recording_audio_data", { recordingId }),
   deepSeekSettings: () => invoke<DeepSeekSettings>("get_deepseek_settings"),
   saveDeepSeekApiKey: (apiKey: string) => invoke<DeepSeekSettings>("save_deepseek_api_key", { apiKey }),
@@ -106,14 +104,7 @@ export const api = {
   getTaskSummaryPrompt: (taskId: string) => invoke<string>("get_task_summary_prompt", { taskId }),
   getRecordingSummaryPrompt: (recordingId: string) => invoke<string>("get_recording_summary_prompt", { recordingId }),
   updateRecordingSummary: (recordingId: string, summary: RecordingSummary) => invoke<void>("update_recording_summary", { recordingId, summary }),
-  modelStatus: (modelId: string) => invoke<ModelStatus>("model_status", { modelId }),
-  downloadModel: (modelId: string) => invoke<void>("download_model", { modelId }),
-  cancelModelDownload: (modelId: string) => invoke<void>("cancel_model_download", { modelId }),
-  deleteModel: (modelId: string) => invoke<void>("delete_model", { modelId }),
-  openModelFolder: (modelId: string) => invoke<void>("reveal_model_dir", { modelId }),
-  modelDiagnostics: (modelId: string) => invoke<string>("model_diagnostics", { modelId }),
   retryTranscription: (recordingId: string) => invoke<Snapshot>("retry_transcription", { recordingId }),
-  transcribePartial: (recordingId: string, audio: Uint8Array) => invoke<void>("transcribe_partial", { recordingId, audio }),
   exportData: () => invoke<string>("export_data"),
   importData: (payload: string) => invoke<Snapshot>("import_data", { payload }),
   toggleQuickPanel: () => invoke<void>("toggle_quick_panel"),
@@ -154,16 +145,6 @@ export async function onRecordingToggle(callback: () => void): Promise<UnlistenF
 export async function onTaskHud(callback: (payload: TaskHudPayload) => void): Promise<UnlistenFn> {
   if (!inTauri()) return () => undefined;
   return listen<TaskHudPayload>("redkey://task-hud", ({ payload }) => callback(payload));
-}
-
-export async function onModelStatus(callback: (status: ModelStatus) => void): Promise<UnlistenFn> {
-  if (!inTauri()) return () => undefined;
-  return listen<ModelStatus>("redkey://model-status", ({ payload }) => callback(payload));
-}
-
-export async function onPartialTranscript(callback: (value: { recordingId: string; text: string }) => void): Promise<UnlistenFn> {
-  if (!inTauri()) return () => undefined;
-  return listen<{ recordingId: string; text: string }>("redkey://partial-transcript", ({ payload }) => callback(payload));
 }
 
 export async function onPetMode(callback: (mode: string) => void): Promise<UnlistenFn> {

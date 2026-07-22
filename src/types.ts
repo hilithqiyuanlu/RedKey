@@ -64,16 +64,10 @@ export interface Recording {
   processingStatus: string;
   audioPath: string | null;
   updatedAt: string;
-  alignmentStatus: string;
-  diarizationStatus: string;
-  speakerCount: number;
-  processingError: string | null;
 }
 
-export interface TranscriptWord { id: string; text: string; startMs: number; endMs: number; }
-export interface TranscriptSegment { id: string; seq: number; speakerId: string | null; startMs: number; endMs: number; text: string; userCorrected: boolean; }
-export interface RecordingSpeaker { speakerId: string; displayName: string; sortOrder: number; }
-export interface RecordingDetail { recording: Recording; words: TranscriptWord[]; segments: TranscriptSegment[]; speakers: RecordingSpeaker[]; }
+export interface SpeakerSegment { speaker: string; text: string; }
+export interface RecordingDetail { recording: Recording; segments: SpeakerSegment[]; }
 
 export interface TextCard { id: string; taskId: string; content: string; source: string; createdAt: string; updatedAt: string; }
 export interface ImageCard { id: string; taskId: string; filename: string; mimeType: string; data: string; content: string; createdAt: string; updatedAt: string; }

@@ -44,9 +44,7 @@ struct RuntimeState {
     keyboard_monitor: Mutex<Option<KeyboardMonitor>>,
     hover_regions: Mutex<HoverRegions>,
     speech_worker: Mutex<Option<speech::SpeechWorker>>,
-    speech_worker_process: Mutex<Option<Arc<Mutex<Child>>>>,
     processing_cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
-    partial_busy: std::sync::atomic::AtomicBool,
     native_recording: Mutex<Option<NativeRecording>>,
     hud_state: Mutex<HudState>,
     pet_mode: Mutex<String>,
@@ -60,9 +58,7 @@ impl Default for RuntimeState {
             keyboard_monitor: Mutex::new(None),
             hover_regions: Mutex::new(HoverRegions::default()),
             speech_worker: Mutex::new(None),
-            speech_worker_process: Mutex::new(None),
             processing_cancellations: Mutex::new(HashMap::new()),
-            partial_busy: std::sync::atomic::AtomicBool::new(false),
             native_recording: Mutex::new(None),
             hud_state: Mutex::new(HudState::default()),
             pet_mode: Mutex::new("default".to_string()),
@@ -143,23 +139,20 @@ fn emit_snapshot(app: &AppHandle) -> Result<Snapshot> {
     Ok(value)
 }
 
-fn transcribe_with_worker(app: &AppHandle, path: &std::path::Path, request_id: &str, partial: bool) -> Result<String> {
+fn transcribe_with_worker(app: &AppHandle, path: &std::path::Path, request_id: &str) -> Result<Vec<crate::models::SpeakerSegment>> {
     let state = app.state::<RuntimeState>();
     let mut guard = state.speech_worker.lock();
     if guard.is_none() {
         let worker = speech::SpeechWorker::start(app)?;
-        *state.speech_worker_process.lock() = Some(worker.process_handle());
         *guard = Some(worker);
     }
-    if !partial && processing_cancelled(app, request_id) {
-        if let Some(worker) = state.speech_worker_process.lock().as_ref() { let _ = worker.lock().kill(); }
+    if processing_cancelled(app, request_id) {
         *guard = None;
-        *state.speech_worker_process.lock() = None;
         return Err(anyhow::anyhow!("录音处理已取消"));
     }
-    match guard.as_mut().unwrap().transcribe(path, request_id, partial) {
-        Ok(text) => Ok(text),
-        Err(error) => { *guard = None; *state.speech_worker_process.lock() = None; Err(error) }
+    match guard.as_mut().unwrap().transcribe(path) {
+        Ok(segments) => Ok(segments),
+        Err(error) => { *guard = None; Err(error) }
     }
 }
 
@@ -178,26 +171,24 @@ fn finish_processing(app: &AppHandle, recording_id: &str) {
 }
 
 fn cancel_processing(app: &AppHandle, recording_id: &str) {
-    let active = if let Some(token) = app.state::<RuntimeState>().processing_cancellations.lock().get(recording_id) {
+    if let Some(token) = app.state::<RuntimeState>().processing_cancellations.lock().get(recording_id) {
         token.store(true, Ordering::Release);
-        true
-    } else { false };
-    if active {
-        if let Some(worker) = app.state::<RuntimeState>().speech_worker_process.lock().as_ref() { let _ = worker.lock().kill(); }
     }
+    app.state::<RuntimeState>().speech_worker.lock().take();
 }
 
 fn run_transcription_pipeline(app: AppHandle, path: std::path::PathBuf, recording_id: String) {
     if processing_cancelled(&app, &recording_id) { finish_processing(&app, &recording_id); return; }
-    let result = transcribe_with_worker(&app, &path, &recording_id, false);
+    app.state::<RuntimeState>().db().set_processing_status(&recording_id, "transcribing", None).ok();
+    let _ = emit_snapshot(&app);
+    let result = transcribe_with_worker(&app, &path, &recording_id);
     if processing_cancelled(&app, &recording_id) { finish_processing(&app, &recording_id); return; }
     match result {
-        Ok(text) => {
-            if app.state::<RuntimeState>().db().complete_transcription(&recording_id, &text).is_ok()
-                && !processing_cancelled(&app, &recording_id)
-                && app.state::<RuntimeState>().db().prepare_recording_processing(&recording_id).is_ok()
-            {
-                let _ = process_recording_pipeline(&app, &recording_id);
+        Ok(segments) => {
+            let text = segments.iter().map(|s| format!("{}: {}", s.speaker, s.text)).collect::<Vec<_>>().join("\n");
+            let raw = segments.iter().map(|s| s.text.clone()).collect::<Vec<_>>().join("\n");
+            if app.state::<RuntimeState>().db().complete_transcription(&recording_id, &raw, &text, &segments).is_ok() && !processing_cancelled(&app, &recording_id) {
+                spawn_recording_summary(&app, &recording_id);
             }
         }
         Err(error) => {
@@ -206,82 +197,6 @@ fn run_transcription_pipeline(app: AppHandle, path: std::path::PathBuf, recordin
     }
     finish_processing(&app, &recording_id);
     let _ = emit_snapshot(&app);
-}
-
-fn process_recording_pipeline(app: &AppHandle, recording_id: &str) -> Result<()> {
-    if processing_cancelled(app, recording_id) { return Ok(()); }
-    let detail = app.state::<RuntimeState>().db().recording_detail(recording_id)?;
-    let path = detail.recording.audio_path.as_ref().map(std::path::PathBuf::from).context("录音文件不存在")?;
-    if !speech::status(app, speech::DIARIZATION_ID)?.installed {
-        app.state::<RuntimeState>().db().set_processing_stage(recording_id, "diarization_error", Some("发言人分离组件尚未安装完成"))?;
-        let _ = emit_snapshot(app);
-        return Ok(());
-    }
-    app.state::<RuntimeState>().db().set_processing_stage(recording_id, "diarizing", None)?;
-    let _ = emit_snapshot(app);
-    let turns = match speech::diarize(app, &path, || processing_cancelled(app, recording_id)).map(smooth_speaker_turns) {
-        Ok(turns) if !turns.is_empty() => turns,
-        Ok(_) => {
-            app.state::<RuntimeState>().db().set_processing_stage(recording_id, "diarization_error", Some("没有检测到可分离的讲话内容"))?;
-            let _ = emit_snapshot(app);
-            return Ok(());
-        }
-        Err(error) => {
-            if processing_cancelled(app, recording_id) { return Ok(()); }
-            app.state::<RuntimeState>().db().set_processing_stage(recording_id, "diarization_error", Some("发言人分离失败，请在设置中检查本地模型"))?;
-            let _ = emit_snapshot(app);
-            return Err(error);
-        }
-    };
-    if processing_cancelled(app, recording_id) { return Ok(()); }
-    let speaker_count = turns.iter().filter_map(|turn| turn.speaker_id.strip_prefix("speaker_")?.parse::<usize>().ok()).max().map(|value| value + 1).unwrap_or(0) as i64;
-    if !speech::status(app, speech::ALIGNER_ID)?.installed {
-        app.state::<RuntimeState>().db().set_processing_stage(recording_id, "waiting_alignment", None)?;
-        let _ = emit_snapshot(app);
-        return Ok(());
-    }
-    app.state::<RuntimeState>().db().set_processing_stage(recording_id, "aligning", None)?;
-    let _ = emit_snapshot(app);
-    let words_result = (|| -> Result<Vec<TranscriptWord>> {
-        let state = app.state::<RuntimeState>(); let mut worker = state.speech_worker.lock();
-        if worker.is_none() { *worker = Some(speech::SpeechWorker::start(app)?); }
-        worker.as_mut().unwrap().align(app, &path, &detail.recording.transcript, recording_id)
-    })();
-    let words = match words_result {
-        Ok(words) if !words.is_empty() => words,
-        Ok(_) => {
-            app.state::<RuntimeState>().db().set_processing_stage(recording_id, "alignment_error", Some("没有生成可用的文字时间戳"))?;
-            let _ = emit_snapshot(app);
-            return Ok(());
-        }
-        Err(error) => {
-            if processing_cancelled(app, recording_id) { return Ok(()); }
-            app.state::<RuntimeState>().db().set_processing_stage(recording_id, "alignment_error", Some("文字时间对齐失败，请重新处理"))?;
-            let _ = emit_snapshot(app);
-            return Err(error);
-        }
-    };
-    if processing_cancelled(app, recording_id) { return Ok(()); }
-    app.state::<RuntimeState>().db().save_words(recording_id, &words)?;
-    app.state::<RuntimeState>().db().set_processing_stage(recording_id, "merging", None)?;
-    let _ = emit_snapshot(app);
-    let segments = build_speaker_segments(&words, &turns);
-    if processing_cancelled(app, recording_id) { return Ok(()); }
-    if segments.is_empty() {
-        app.state::<RuntimeState>().db().set_processing_stage(recording_id, "diarization_error", Some("没有生成可展示的发言人对话"))?;
-        let _ = emit_snapshot(app);
-        return Ok(());
-    }
-    let state = app.state::<RuntimeState>();
-    let mut db = state.db();
-    db.save_speaker_turns(recording_id, &turns)?;
-    db.ensure_speakers(recording_id, speaker_count)?;
-    db.save_segments(recording_id, &segments)?;
-    db.set_processing_stage(recording_id, "completed", None)?;
-    drop(db);
-    let _ = emit_snapshot(app);
-    spawn_recording_summary(app, recording_id);
-    Ok(())
 }
 
 fn spawn_recording_summary(app: &AppHandle, recording_id: &str) {
@@ -309,133 +224,6 @@ fn spawn_recording_summary_with_force(app: &AppHandle, recording_id: &str, force
         }
         let _ = emit_snapshot(&app);
     });
-}
-
-fn smooth_speaker_turns(mut turns: Vec<speech::SpeakerTurn>) -> Vec<speech::SpeakerTurn> {
-    turns.sort_by_key(|turn| turn.start_ms);
-    let mut totals = HashMap::<String, i64>::new();
-    for turn in &turns { *totals.entry(turn.speaker_id.clone()).or_default() += (turn.end_ms - turn.start_ms).max(0); }
-    let mut retained = totals.into_iter().collect::<Vec<_>>();
-    retained.sort_by_key(|(_, duration)| std::cmp::Reverse(*duration));
-    retained.truncate(5);
-    let retained = retained.into_iter().map(|(label, _)| label).collect::<Vec<_>>();
-    turns.retain(|turn| turn.end_ms - turn.start_ms >= 250 && retained.contains(&turn.speaker_id));
-    let mut labels = Vec::<String>::new();
-    for turn in &turns { if !labels.contains(&turn.speaker_id) { labels.push(turn.speaker_id.clone()); } }
-    for turn in &mut turns { turn.speaker_id = format!("speaker_{}", labels.iter().position(|label| label == &turn.speaker_id).unwrap()); }
-    let mut result = Vec::<speech::SpeakerTurn>::new();
-    for turn in turns {
-        if let Some(previous) = result.last_mut() {
-            if previous.speaker_id == turn.speaker_id && turn.start_ms - previous.end_ms <= 500 {
-                previous.end_ms = previous.end_ms.max(turn.end_ms);
-                continue;
-            }
-        }
-        result.push(turn);
-    }
-    result
-}
-
-fn word_speaker(word: &TranscriptWord, turns: &[speech::SpeakerTurn]) -> Option<String> {
-    let midpoint = (word.start_ms + word.end_ms) / 2;
-    turns.iter().max_by_key(|turn| {
-        let overlap = (word.end_ms.min(turn.end_ms) - word.start_ms.max(turn.start_ms)).max(0);
-        if overlap > 0 { overlap * 1_000_000 } else { -(midpoint - ((turn.start_ms + turn.end_ms) / 2)).abs() }
-    }).map(|turn| turn.speaker_id.clone())
-}
-
-fn build_speaker_segments(words: &[TranscriptWord], turns: &[speech::SpeakerTurn]) -> Vec<TranscriptSegment> {
-    let mut result = Vec::<TranscriptSegment>::new();
-    for word in words {
-        let Some(speaker) = word_speaker(word, turns) else { continue };
-        let should_split = result.last().is_some_and(|segment| {
-            segment.speaker_id.as_deref() != Some(&speaker)
-                || word.start_ms - segment.end_ms > 1_000
-                || (segment.text.chars().count() >= 6 && segment.text.chars().last().is_some_and(|c| "。！？!?；;\n".contains(c)))
-        });
-        if should_split || result.is_empty() {
-            result.push(TranscriptSegment { id: uuid::Uuid::new_v4().to_string(), seq: result.len() as i64, speaker_id: Some(speaker), start_ms: word.start_ms, end_ms: word.end_ms, text: word.text.clone(), user_corrected: false });
-        } else if let Some(segment) = result.last_mut() {
-            segment.text.push_str(&word.text);
-            segment.end_ms = word.end_ms;
-        }
-    }
-    // Very short punctuation-led fragments are usually alignment artifacts,
-    // not useful turns. Merge them with the following same-speaker segment.
-    let mut merged = Vec::with_capacity(result.len());
-    let mut index = 0;
-    while index < result.len() {
-        let segment = &result[index];
-        if segment.text.chars().count() <= 3 && index + 1 < result.len() {
-            let next = &result[index + 1];
-            if next.speaker_id == segment.speaker_id && next.start_ms - segment.end_ms <= 1_000 {
-                let mut combined = next.clone();
-                combined.text = format!("{}{}", segment.text, combined.text);
-                combined.start_ms = segment.start_ms;
-                merged.push(combined);
-                index += 2;
-                continue;
-            }
-        }
-        merged.push(segment.clone());
-        index += 1;
-    }
-    // Merge short fragments in either direction. This handles aligner
-    // punctuation artifacts even when the fragment appears at the end.
-    let mut index = 0;
-    while index + 1 < merged.len() {
-        if merged[index].text.chars().count() <= 3
-            && merged[index].speaker_id == merged[index + 1].speaker_id
-            && merged[index + 1].start_ms - merged[index].end_ms <= 1_000
-        {
-            let next = merged.remove(index + 1);
-            merged[index].text.push_str(&next.text);
-            merged[index].end_ms = next.end_ms;
-            continue;
-        }
-        index += 1;
-    }
-    let mut merged = smooth_short_speaker_fragments(merged);
-    for (seq, segment) in merged.iter_mut().enumerate() { segment.seq = seq as i64; }
-    merged
-}
-
-fn smooth_short_speaker_fragments(mut segments: Vec<TranscriptSegment>) -> Vec<TranscriptSegment> {
-    let standalone_replies = ["嗯", "嗯嗯", "对", "对的", "是", "是的", "不是", "好", "好的", "行", "可以", "没错", "有", "没有"];
-    let mut index = 1;
-    while index + 1 < segments.len() {
-        let previous = &segments[index - 1];
-        let current = &segments[index];
-        let next = &segments[index + 1];
-        let text = current.text.trim();
-        let chars = text.chars().filter(|value| !value.is_whitespace()).count();
-        let duration = (current.end_ms - current.start_ms).max(0);
-        let before_gap = (current.start_ms - previous.end_ms).max(0);
-        let after_gap = (next.start_ms - current.end_ms).max(0);
-        let same_surrounding_speaker = previous.speaker_id == next.speaker_id
-            && current.speaker_id != previous.speaker_id;
-        let is_standalone_reply = standalone_replies.contains(&text)
-            || text.chars().last().is_some_and(|value| "。！？!?；;".contains(value));
-        let compact_token = chars <= 2
-            || (chars <= 4 && text.chars().all(|value| value.is_ascii_alphanumeric()));
-        let likely_boundary_jitter = same_surrounding_speaker
-            && !is_standalone_reply
-            && compact_token
-            && duration <= 1_000
-            && before_gap <= 300
-            && after_gap <= 300;
-        if likely_boundary_jitter {
-            let current = segments.remove(index);
-            let next = segments.remove(index);
-            segments[index - 1].text.push_str(&current.text);
-            segments[index - 1].text.push_str(&next.text);
-            segments[index - 1].end_ms = next.end_ms;
-            if index > 1 { index -= 1; }
-            continue;
-        }
-        index += 1;
-    }
-    segments
 }
 
 fn show_and_focus_window(app: &AppHandle, label: &str) -> Result<tauri::WebviewWindow> {
@@ -1460,25 +1248,6 @@ fn retry_transcription(app: AppHandle, recording_id: String) -> Result<Snapshot,
 }
 
 #[tauri::command]
-fn transcribe_partial(app: AppHandle, recording_id: String, audio: Vec<u8>) -> Result<(), String> {
-    use std::sync::atomic::Ordering;
-    let state = app.state::<RuntimeState>();
-    if state.partial_busy.swap(true, Ordering::AcqRel) { return Ok(()); }
-    let partial_dir = app.path().app_cache_dir().map_err(err)?.join("partials");
-    if let Err(error) = std::fs::create_dir_all(&partial_dir) { state.partial_busy.store(false, Ordering::Release); return Err(err(error)); }
-    let path = partial_dir.join(format!("{recording_id}.wav"));
-    if let Err(error) = std::fs::write(&path, audio) { state.partial_busy.store(false, Ordering::Release); return Err(err(error)); }
-    std::thread::spawn(move || {
-        if let Ok(text) = transcribe_with_worker(&app, &path, &format!("partial-{recording_id}"), true) {
-            let _ = app.emit("redkey://partial-transcript", serde_json::json!({ "recordingId": recording_id, "text": text }));
-        }
-        let _ = std::fs::remove_file(path);
-        app.state::<RuntimeState>().partial_busy.store(false, Ordering::Release);
-    });
-    Ok(())
-}
-
-#[tauri::command]
 fn reassign_recording(app: AppHandle, recording_id: String, task_id: Option<String>) -> Result<Snapshot, String> {
     app.state::<RuntimeState>().db().reassign_recording(&recording_id, task_id.as_deref()).map_err(err)?;
     emit_snapshot(&app).map_err(err)
@@ -1488,55 +1257,7 @@ fn reassign_recording(app: AppHandle, recording_id: String, task_id: Option<Stri
 fn get_recording_detail(app: AppHandle, recording_id: String) -> Result<RecordingDetail, String> { app.state::<RuntimeState>().db().recording_detail(&recording_id).map_err(err) }
 
 #[tauri::command]
-fn process_recording(app: AppHandle, recording_id: String) -> Result<Snapshot, String> {
-    app.state::<RuntimeState>().db().prepare_recording_processing(&recording_id).map_err(err)?;
-    begin_processing(&app, &recording_id);
-    let background = app.clone();
-    std::thread::spawn(move || {
-        let _ = process_recording_pipeline(&background, &recording_id);
-        finish_processing(&background, &recording_id);
-        let _ = emit_snapshot(&background);
-    });
-    emit_snapshot(&app).map_err(err)
-}
-
-#[tauri::command]
 fn recording_audio_data(app: AppHandle, recording_id: String) -> Result<Vec<u8>, String> { let detail = app.state::<RuntimeState>().db().recording_detail(&recording_id).map_err(err)?; let path = detail.recording.audio_path.ok_or("录音文件不存在")?; std::fs::read(path).map_err(err) }
-
-
-#[tauri::command]
-fn model_status(app: AppHandle, model_id: String) -> Result<ModelStatus, String> { speech::status(&app, &model_id).map_err(err) }
-
-#[tauri::command]
-fn download_model(app: AppHandle, model_id: String) -> Result<(), String> { speech::download(app, model_id).map_err(err) }
-
-#[tauri::command]
-fn cancel_model_download(app: AppHandle, model_id: String) -> Result<(), String> { speech::cancel(&app, &model_id).map_err(err) }
-
-#[tauri::command]
-fn delete_model(app: AppHandle, model_id: String) -> Result<(), String> { speech::delete(&app, &model_id).map_err(err) }
-
-#[tauri::command]
-fn reveal_model_dir(app: AppHandle, model_id: String) -> Result<(), String> {
-    let dir = speech::model_dir(&app, &model_id).map_err(err)?;
-    if !dir.exists() { return Err(format!("模型目录不存在：{}", dir.display())); }
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open").arg(&dir).spawn().map_err(|e| e.to_string())?;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        no_window(&mut std::process::Command::new("explorer").arg(&dir)).spawn().map_err(|e| e.to_string())?;
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        std::process::Command::new("xdg-open").arg(&dir).spawn().map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-#[tauri::command]
-fn model_diagnostics(app: AppHandle, model_id: String) -> Result<String, String> { speech::diagnostics(&app, &model_id).map_err(err) }
 
 #[tauri::command]
 fn export_data(app: AppHandle) -> Result<String, String> {
@@ -1793,16 +1514,8 @@ pub fn run() {
             delete_recording,
             reassign_recording,
             get_recording_detail,
-            process_recording,
             recording_audio_data,
-            model_status,
-            download_model,
-            cancel_model_download,
-            delete_model,
-            reveal_model_dir,
-            model_diagnostics,
             retry_transcription,
-            transcribe_partial,
             export_data,
             import_data,
             toggle_quick_panel,
@@ -1825,106 +1538,11 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_speaker_segments, humanize_title, smooth_short_speaker_fragments, smooth_speaker_turns, word_speaker};
-    use crate::{models::{TranscriptSegment, TranscriptWord}, speech::SpeakerTurn};
+    use super::humanize_title;
 
     #[test]
     fn cleans_url_titles() {
         assert_eq!(humanize_title("login-page_redesign"), "login page redesign");
         assert_eq!(humanize_title("Login Page | Figma"), "Login Page");
-    }
-
-    #[test]
-    fn automatic_speakers_are_limited_ordered_and_smoothed() {
-        let turns = vec![
-            SpeakerTurn { speaker_id: "z".into(), start_ms: 0, end_ms: 800, confidence: None, overlap: false },
-            SpeakerTurn { speaker_id: "noise".into(), start_ms: 810, end_ms: 900, confidence: None, overlap: false },
-            SpeakerTurn { speaker_id: "z".into(), start_ms: 1000, end_ms: 1800, confidence: None, overlap: false },
-            SpeakerTurn { speaker_id: "a".into(), start_ms: 1900, end_ms: 2600, confidence: None, overlap: false },
-        ];
-        let smoothed = smooth_speaker_turns(turns);
-        assert_eq!(smoothed.len(), 2);
-        assert_eq!(smoothed[0].speaker_id, "speaker_0");
-        assert_eq!((smoothed[0].start_ms, smoothed[0].end_ms), (0, 1800));
-        assert_eq!(smoothed[1].speaker_id, "speaker_1");
-    }
-
-    #[test]
-    fn automatic_speakers_never_exceed_five() {
-        let turns = (0..6).map(|index| SpeakerTurn {
-            speaker_id: format!("raw-{index}"),
-            start_ms: index * 2_000,
-            end_ms: index * 2_000 + 1_000 + index,
-            confidence: None,
-            overlap: false,
-        }).collect();
-        let smoothed = smooth_speaker_turns(turns);
-        let speakers = smoothed.iter().map(|turn| turn.speaker_id.as_str()).collect::<std::collections::HashSet<_>>();
-        assert_eq!(speakers.len(), 5);
-        assert!(speakers.iter().all(|speaker| matches!(*speaker, "speaker_0" | "speaker_1" | "speaker_2" | "speaker_3" | "speaker_4")));
-    }
-
-    #[test]
-    fn words_follow_speaker_changes_and_pauses() {
-        let turns = vec![
-            SpeakerTurn { speaker_id: "speaker_0".into(), start_ms: 0, end_ms: 900, confidence: None, overlap: false },
-            SpeakerTurn { speaker_id: "speaker_1".into(), start_ms: 900, end_ms: 1800, confidence: None, overlap: false },
-            SpeakerTurn { speaker_id: "speaker_1".into(), start_ms: 3000, end_ms: 3600, confidence: None, overlap: false },
-        ];
-        let words = vec![
-            TranscriptWord { id: "1".into(), text: "你好".into(), start_ms: 100, end_ms: 500 },
-            TranscriptWord { id: "2".into(), text: "可以。".into(), start_ms: 1000, end_ms: 1400 },
-            TranscriptWord { id: "3".into(), text: "继续".into(), start_ms: 3100, end_ms: 3500 },
-        ];
-        assert_eq!(word_speaker(&words[0], &turns).as_deref(), Some("speaker_0"));
-        let segments = build_speaker_segments(&words, &turns);
-        assert_eq!(segments.len(), 3);
-        assert_eq!(segments[0].speaker_id.as_deref(), Some("speaker_0"));
-        assert_eq!(segments[1].speaker_id.as_deref(), Some("speaker_1"));
-        assert_eq!(segments[2].speaker_id.as_deref(), Some("speaker_1"));
-    }
-
-    #[test]
-    fn short_speaker_turn_is_preserved_until_text_is_available() {
-        let turns = vec![
-            SpeakerTurn { speaker_id: "raw-b".into(), start_ms: 0, end_ms: 2_000, confidence: None, overlap: false },
-            SpeakerTurn { speaker_id: "raw-a".into(), start_ms: 2_000, end_ms: 2_300, confidence: None, overlap: false },
-            SpeakerTurn { speaker_id: "raw-b".into(), start_ms: 2_300, end_ms: 4_000, confidence: None, overlap: false },
-        ];
-        let smoothed = smooth_speaker_turns(turns);
-        assert_eq!(smoothed.len(), 3);
-        assert_eq!(smoothed[0].speaker_id, "speaker_0");
-        assert_eq!(smoothed[1].speaker_id, "speaker_1");
-        assert_eq!(smoothed[2].speaker_id, "speaker_0");
-    }
-
-    fn segment(id: &str, speaker: &str, text: &str, start_ms: i64, end_ms: i64) -> TranscriptSegment {
-        TranscriptSegment { id: id.into(), seq: 0, speaker_id: Some(speaker.into()), start_ms, end_ms, text: text.into(), user_corrected: false }
-    }
-
-    #[test]
-    fn embedded_short_tokens_return_to_the_surrounding_speaker() {
-        let segments = vec![
-            segment("1", "speaker_0", "你应该这样做", 0, 2_000),
-            segment("2", "speaker_1", "RL", 2_020, 2_500),
-            segment("3", "speaker_0", "然后继续管理团队", 2_520, 4_000),
-        ];
-        let smoothed = smooth_short_speaker_fragments(segments);
-        assert_eq!(smoothed.len(), 1);
-        assert_eq!(smoothed[0].speaker_id.as_deref(), Some("speaker_0"));
-        assert_eq!(smoothed[0].text, "你应该这样做RL然后继续管理团队");
-    }
-
-    #[test]
-    fn genuine_short_replies_remain_separate() {
-        let segments = vec![
-            segment("1", "speaker_0", "这个方案可以执行吗", 0, 2_000),
-            segment("2", "speaker_1", "可以", 2_020, 2_600),
-            segment("3", "speaker_0", "那我们继续", 2_620, 4_000),
-        ];
-        let smoothed = smooth_short_speaker_fragments(segments);
-        assert_eq!(smoothed.len(), 3);
-        assert_eq!(smoothed[1].speaker_id.as_deref(), Some("speaker_1"));
-        assert_eq!(smoothed[1].text, "可以");
     }
 }

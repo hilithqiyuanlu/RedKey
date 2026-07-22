@@ -122,10 +122,6 @@ pub struct Recording {
     pub processing_status: String,
     pub audio_path: Option<String>,
     pub updated_at: String,
-    pub alignment_status: String,
-    pub diarization_status: String,
-    pub speaker_count: i64,
-    pub processing_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -204,19 +200,11 @@ pub struct DeepSeekSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TranscriptWord { pub id: String, pub text: String, pub start_ms: i64, pub end_ms: i64 }
+pub struct SpeakerSegment { pub speaker: String, pub text: String }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TranscriptSegment { pub id: String, pub seq: i64, pub speaker_id: Option<String>, pub start_ms: i64, pub end_ms: i64, pub text: String, pub user_corrected: bool }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RecordingSpeaker { pub speaker_id: String, pub display_name: String, pub sort_order: i64 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RecordingDetail { pub recording: Recording, pub words: Vec<TranscriptWord>, pub segments: Vec<TranscriptSegment>, pub speakers: Vec<RecordingSpeaker> }
+pub struct RecordingDetail { pub recording: Recording, pub segments: Vec<SpeakerSegment> }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

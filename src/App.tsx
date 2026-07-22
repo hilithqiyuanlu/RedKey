@@ -2,14 +2,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWindow, LogicalPosition } from "@tauri-apps/api/window";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import {
-  Archive, Check, ChevronDown, ChevronRight, CircleAlert, CircleCheck, Clipboard, ClipboardPaste, Download, ExternalLink,
+  Archive, Check, ChevronDown, ChevronRight, CircleAlert, CircleCheck, Clipboard, ClipboardPaste, ExternalLink,
   FileImage, FileText, KeyRound, Link2, ListTodo, LoaderCircle, Mic, MicOff, Pause, Pencil, Play,
   Plus, RefreshCw, RotateCcw, Settings as SettingsIcon, Sparkles, Trash2, UserRound, X,
 } from "lucide-react";
-import { api, onLinkDrop, onModelStatus, onNewTask, onPartialTranscript, onPetMode, onQuickPanelShown, onRecordingToggle, onTaskHud } from "./api";
+import { api, onLinkDrop, onNewTask, onPetMode, onQuickPanelShown, onRecordingToggle, onTaskHud } from "./api";
 import { extractHttpUrl, petState, slotLabel } from "./domain";
 import type {
-  DeepSeekSettings, ImageCard, ModelStatus, Recording, RecordingDetail, RecordingSummary, Settings,
+  DeepSeekSettings, ImageCard, Recording, RecordingDetail, RecordingSummary, Settings,
   Snapshot, Task, TaskDocument, TaskHudPayload, TextCard,
 } from "./types";
 import { useSnapshot } from "./useSnapshot";
@@ -356,10 +356,6 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
       processingStatus: "recording",
       audioPath: null,
       updatedAt: new Date().toISOString(),
-      alignmentStatus: "pending",
-      diarizationStatus: "pending",
-      speakerCount: 0,
-      processingError: null,
     } : null;
     return [
       ...optimisticCards.text.filter((c) => !deletedCardIds.has(c.id)).map((card) => ({ type: "text" as const, createdAt: card.createdAt, card })),
@@ -727,7 +723,7 @@ function ImageCardView({ card, readOnly, editing, onEditing, onRefresh, onDelete
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [content, setContent] = useState(card.content);
   const [ocrLoading, setOcrLoading] = useState(false);
-  const [ocrModelOk, setOcrModelOk] = useState(false);
+  const [ocrModelOk] = useState(true);
   const [deleting, setDeleting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const savedRef = useRef(card.content);
@@ -735,7 +731,6 @@ function ImageCardView({ card, readOnly, editing, onEditing, onRefresh, onDelete
   const src = hasImage ? `data:${card.mimeType};base64,${card.data}` : "";
 
   useEffect(() => { setContent(card.content); savedRef.current = card.content; }, [card.id, card.content]);
-  useEffect(() => { void api.modelStatus("RapidOCR").then((status) => setOcrModelOk(status.installed)).catch(() => setOcrModelOk(false)); }, [card.id]);
 
   // auto-save on edit
   useEffect(() => {
@@ -839,7 +834,7 @@ function RecordingCard({ recording, summary, activeElapsed, activeLevel, readOnl
         <IconButton label={expanded ? "收起" : "展开"} onClick={() => setExpanded((value) => !value)}>{expanded ? <ChevronDown /> : <ChevronRight />}</IconButton>
       </div>
     </header>
-    {!expanded && <div className="recording-collapsed" onDoubleClick={() => !readOnly && summary && setEditing(true)}><strong>{summary?.overview || recording.transcript || recording.processingError || "等待生成对接结论"}</strong>{summary?.pendingItems.length ? <ul>{summary.pendingItems.slice(0, 3).map((item) => <li key={item}>{item}</li>)}</ul> : <span>暂无待处理事项</span>}</div>}
+    {!expanded && <div className="recording-collapsed" onDoubleClick={() => !readOnly && summary && setEditing(true)}><strong>{summary?.overview || recording.transcript || recording.errorMessage || "等待生成对接结论"}</strong>{summary?.pendingItems.length ? <ul>{summary.pendingItems.slice(0, 3).map((item) => <li key={item}>{item}</li>)}</ul> : <span>暂无待处理事项</span>}</div>}
     {expanded && <div className="recording-expanded">
       <SummaryView summary={summary} />
       {(summary?.status === "error" || summary?.status === "stale" || !summary) && recording.transcript && <button className="summary-trigger" onClick={() => {
@@ -853,8 +848,8 @@ function RecordingCard({ recording, summary, activeElapsed, activeLevel, readOnl
         }
         void api.retryRecordingSummary(recording.id).then(() => { notify("正在梳理录音"); onRefresh(); }).catch((reason) => notify(String(reason)));
       }}><RefreshCw />{summary?.status === "stale" ? "重新梳理" : "梳理总结"}</button>}
-      {recording.processingError && <p className="error-message"><CircleAlert />{recording.processingError}</p>}
-      <TranscriptTimeline detail={detail} fallback={recording.transcript} />
+      {recording.errorMessage && <p className="error-message"><CircleAlert />{recording.errorMessage}</p>}
+      <SpeakerTranscript detail={detail} fallback={recording.transcript} />
       {audioUrl && <AudioPlayer src={audioUrl} />}
     </div>}
     {editing && summary && <SummaryEditor summary={summary} onClose={() => setEditing(false)} onSave={(next) => void api.updateRecordingSummary(recording.id, next).then(() => { setEditing(false); onRefresh(); }).catch((reason) => notify(String(reason)))} />}
@@ -965,19 +960,14 @@ function AudioPlayer({ src }: { src: string }) {
   </div>;
 }
 
-function TranscriptTimeline({ detail, fallback }: { detail: RecordingDetail | null; fallback: string }) {
-  const [showRaw, setShowRaw] = useState(false);
+function SpeakerTranscript({ detail, fallback }: { detail: RecordingDetail | null; fallback: string }) {
   const hasSegments = !!detail?.segments.length;
   return <section className="transcript-block">
     <div className="transcript-header">
-      <h3>发言人时间轴</h3>
-      {hasSegments && fallback && <button className="transcript-toggle-raw" onClick={() => setShowRaw((v) => !v)}>{showRaw ? "隐藏原始文本" : "显示原始文本"}</button>}
+      <h3>转写文本</h3>
     </div>
     {hasSegments
-      ? <>
-          <div className="timeline-list">{detail!.segments.map((segment) => <div className="timeline-segment" key={segment.id}><time>{formatTimestamp(segment.startMs)}</time><strong>{detail!.speakers.find((speaker) => speaker.speakerId === segment.speakerId)?.displayName ?? "Speaker"}</strong><p>{segment.text}</p></div>)}</div>
-          {showRaw && <div className="transcript-raw"><h4>原始转写文本</h4><p>{fallback}</p></div>}
-        </>
+      ? <div className="speaker-list">{detail!.segments.map((segment, index) => <div className="speaker-segment" key={index}><strong>{segment.speaker}</strong><p>{segment.text}</p></div>)}</div>
       : <p>{fallback || "尚未生成转写内容。"}</p>}
   </section>;
 }
@@ -985,7 +975,6 @@ function TranscriptTimeline({ detail, fallback }: { detail: RecordingDetail | nu
 function displayRecordingStatus(recording: Recording, summary: RecordingSummary | null) {
   if (recording.status === "error" || recording.processingStatus.includes("error")) return { label: "处理失败", tone: "error", loading: false };
   if (recording.processingStatus === "transcribing") return { label: "转写中", tone: "working", loading: true };
-  if (["diarizing", "aligning", "merging"].includes(recording.processingStatus)) return { label: "处理中", tone: "working", loading: true };
   if (summary?.status === "summarizing") return { label: "梳理中", tone: "working", loading: true };
   if (summary?.status === "error") return { label: "梳理失败", tone: "error", loading: false };
   if (summary?.status === "stale") return { label: "需重新梳理", tone: "warning", loading: false };
@@ -1086,7 +1075,7 @@ function TaskOverflowDialog({ tasks, onResolved, notify }: { tasks: Task[]; onRe
 }
 
 function SettingsView({ snapshot, setSnapshot, notify }: { snapshot: Snapshot; setSnapshot: (value: Snapshot) => void; notify: (message: string) => void }) {
-  return <div className="settings-page"><header><small>偏好</small><h1>设置</h1></header><section className="settings-section"><h2>通用</h2><SettingToggle label="开机启动" description="登录后自动启动" checked={snapshot.settings.autostart} onChange={(value) => void api.setAutostart(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><SettingToggle label="宠物悬浮窗" description="桌面悬浮按键与任务列表" checked={snapshot.settings.petVisible} onChange={(value) => void api.setPetVisible(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><SettingToggle label="使用云端API" description="关闭后点击AI总结入口会复制prompt到剪贴板" checked={snapshot.settings.cloudApiEnabled} onChange={(value) => void api.updateSettings({ ...snapshot.settings, cloudApiEnabled: value }).then(setSnapshot).catch((reason) => notify(String(reason)))} /><ShortcutPrefix value={snapshot.settings.shortcuts.taskPrefix} onSaved={setSnapshot} notify={notify} /></section><DeepSeekPanel notify={notify} /><LocalModels notify={notify} /><SnapshotTools setSnapshot={setSnapshot} notify={notify} /></div>;
+  return <div className="settings-page"><header><small>偏好</small><h1>设置</h1></header><section className="settings-section"><h2>通用</h2><SettingToggle label="开机启动" description="登录后自动启动" checked={snapshot.settings.autostart} onChange={(value) => void api.setAutostart(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><SettingToggle label="宠物悬浮窗" description="桌面悬浮按键与任务列表" checked={snapshot.settings.petVisible} onChange={(value) => void api.setPetVisible(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><SettingToggle label="使用云端API" description="关闭后点击AI总结入口会复制prompt到剪贴板" checked={snapshot.settings.cloudApiEnabled} onChange={(value) => void api.updateSettings({ ...snapshot.settings, cloudApiEnabled: value }).then(setSnapshot).catch((reason) => notify(String(reason)))} /><ShortcutPrefix value={snapshot.settings.shortcuts.taskPrefix} onSaved={setSnapshot} notify={notify} /></section><DeepSeekPanel notify={notify} /><LocalModels /><SnapshotTools setSnapshot={setSnapshot} notify={notify} /></div>;
 }
 
 function ShortcutPrefix({ value, onSaved, notify }: { value: string; onSaved: (value: Snapshot) => void; notify: (message: string) => void }) {
@@ -1134,23 +1123,9 @@ function DeepSeekPanel({ notify }: { notify: (message: string) => void }) {
   return <section className="settings-section"><div className="section-heading"><div><h2>云端 AI</h2><p>录音完成后自动梳理结论和待办。</p></div><span className={`status-badge ${settings?.configured ? "success" : "warning"}`}>{settings?.configured ? "已配置" : "未配置"}</span></div><div className="api-row"><KeyRound /><div><strong>DeepSeek</strong><small>{settings?.model ?? "deepseek-v4-flash"}</small></div><input type="password" value={key} placeholder={settings?.configured ? "输入新 Key 替换" : "sk-..."} onChange={(event) => setKey(event.target.value)} /><button className="primary" disabled={!key.trim() || busy} onClick={() => void save()}>保存</button>{settings?.configured && <button disabled={busy} onClick={() => void test()}>测试</button>}{settings?.configured && <IconButton danger label="删除 API Key" onClick={() => void api.deleteDeepSeekApiKey().then(setSettings).then(() => notify("API Key 已删除")).catch((reason) => notify(String(reason)))}><Trash2 /></IconButton>}</div></section>;
 }
 
-function LocalModels({ notify }: { notify: (message: string) => void }) {
-  const models = [{ id: "Qwen3-ASR-1.7B", note: "本地录音转写" }, { id: "Qwen3-ForcedAligner-0.6B", note: "文字时间对齐" }, { id: "3D-Speaker-CAM++", note: "发言人分离" }, { id: "RapidOCR", note: "本地图片文字识别" }];
-  return <section className="settings-section"><div className="section-heading"><div><h2>本地模型</h2><p>录音与转写保留在本机，云端只接收文本。</p></div></div>{models.map((model) => <ModelRow key={model.id} id={model.id} note={model.note} notify={notify} />)}</section>;
-}
-
-function ModelRow({ id, note, notify }: { id: string; note: string; notify: (message: string) => void }) {
-  const [status, setStatus] = useState<ModelStatus | null>(null);
-  const [confirmDelete, setConfirmDelete] = useState(false);
-  useEffect(() => { void api.modelStatus(id).then(setStatus); let stop: (() => void) | undefined; void onModelStatus((value) => { if (value.id === id) setStatus(value); }).then((cleanup) => { stop = cleanup; }); return () => stop?.(); }, [id]);
-  return <div className="model-row"><div><strong>{id}</strong><small>{note}</small>{status?.downloading && <div className={`model-progress-line${status.progressKind !== "download" ? " indeterminate" : ""}`}><progress value={status.progressKind === "download" ? status.progress : undefined} max={100} />{status.detail && <b>{status.detail}</b>}</div>}{status?.error && <small className="model-error-text">{status.error}</small>}</div><span className={`status-badge ${status?.installed ? "success" : status?.error ? "error" : "warning"}`}>{status?.installed ? "已安装" : status?.downloading ? "下载中" : status?.error ? "下载失败" : "未安装"}</span>{status?.installed ? <IconButton danger label="删除模型" onClick={() => setConfirmDelete(true)}><Trash2 /></IconButton> : <button disabled={status?.downloading} onClick={() => void api.downloadModel(id).catch((reason) => notify(String(reason)))}><Download />{status?.error ? "重试" : "下载"}</button>}{confirmDelete && <ConfirmDialog
-    title={`删除 ${id}？`}
-    description="删除后可以重新下载。"
-    confirmLabel="删除"
-    danger
-    onConfirm={() => { setConfirmDelete(false); void api.deleteModel(id).then(() => api.modelStatus(id)).then(setStatus).catch((reason) => notify(String(reason))); }}
-    onCancel={() => setConfirmDelete(false)}
-  />}</div>;
+function LocalModels() {
+  const models = [{ id: "FunASR", note: "本地录音转写、标点与发言人分离" }, { id: "RapidOCR", note: "本地图片文字识别" }];
+  return <section className="settings-section"><div className="section-heading"><div><h2>本地模型</h2><p>模型已内置在安装包中，无需额外下载。</p></div></div>{models.map((model) => <div className="model-row" key={model.id}><div><strong>{model.id}</strong><small>{model.note}</small></div><span className="status-badge success">已内置</span></div>)}</section>;
 }
 
 function SettingToggle({ label, description, checked, onChange }: { label: string; description: string; checked: boolean; onChange: (value: boolean) => void }) { return <label className="setting-toggle"><span><strong>{label}</strong><small>{description}</small></span><input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} /></label>; }
@@ -1184,9 +1159,9 @@ function TaskHudWindow() {
 }
 
 function QuickPanel() {
-  const { snapshot, setSnapshot } = useSnapshot(); const [link, setLink] = useState(""); const [message, setMessage] = useState(""); const [partial, setPartial] = useState("");
+  const { snapshot, setSnapshot } = useSnapshot(); const [link, setLink] = useState(""); const [message, setMessage] = useState("");
   const activeTasks = useMemo(() => sortRecent(snapshot?.tasks.filter((task) => task.status === "active" && task.group === "red") ?? []), [snapshot]);
-  useEffect(() => { const prefill = () => void readText().then((value) => { const url = extractHttpUrl(value); if (url) setLink(url); }); let a: (() => void) | undefined; let b: (() => void) | undefined; let c: (() => void) | undefined; prefill(); void onLinkDrop((url) => setLink(url)).then((stop) => { a = stop; }); void onQuickPanelShown(prefill).then((stop) => { b = stop; }); void onPartialTranscript((value) => setPartial(value.text)).then((stop) => { c = stop; }); return () => { a?.(); b?.(); c?.(); }; }, []);
+  useEffect(() => { const prefill = () => void readText().then((value) => { const url = extractHttpUrl(value); if (url) setLink(url); }); let a: (() => void) | undefined; let b: (() => void) | undefined; prefill(); void onLinkDrop((url) => setLink(url)).then((stop) => { a = stop; }); void onQuickPanelShown(prefill).then((stop) => { b = stop; }); return () => { a?.(); b?.(); }; }, []);
   async function useLink() { const url = extractHttpUrl(link); if (!url) { setMessage("没有识别到有效链接"); return; } try { await api.openConsoleNewTask(url); setLink(""); } catch (reason) { setMessage(String(reason)); } }
   async function selectTask(task: Task) {
     try {
@@ -1197,7 +1172,7 @@ function QuickPanel() {
     }
   }
   if (!snapshot) return <LoadingState />;
-  return <div className="quick-shell"><div className="quick-top"><strong>RedKey</strong><button onClick={() => void api.showConsole()}>打开控制台</button></div><div className="quick-link"><Link2 /><input value={link} placeholder="粘贴任务链接" onChange={(event) => setLink(event.target.value)} /><button onClick={() => void useLink()}><Plus /></button></div>{message && <p className="quick-message">{message}</p>}{snapshot.recordings.some((recording) => recording.status === "recording") && <div className="quick-live"><span /><strong>录音中</strong><p>{partial || "正在聆听…"}</p></div>}<section className="quick-active"><header><strong>进行中</strong><span>{activeTasks.length}</span></header>{activeTasks.map((task) => <button key={task.id} className={task.id === snapshot.currentTaskId ? "active" : ""} onClick={() => void selectTask(task)}><kbd>{slotLabel(task.slot)}</kbd><span><strong>{task.contactName || "未指定"}</strong><small>{task.title}</small></span></button>)}</section></div>;
+  return <div className="quick-shell"><div className="quick-top"><strong>RedKey</strong><button onClick={() => void api.showConsole()}>打开控制台</button></div><div className="quick-link"><Link2 /><input value={link} placeholder="粘贴任务链接" onChange={(event) => setLink(event.target.value)} /><button onClick={() => void useLink()}><Plus /></button></div>{message && <p className="quick-message">{message}</p>}{snapshot.recordings.some((recording) => recording.status === "recording") && <div className="quick-live"><span /><strong>录音中</strong><p>正在聆听…</p></div>}<section className="quick-active"><header><strong>进行中</strong><span>{activeTasks.length}</span></header>{activeTasks.map((task) => <button key={task.id} className={task.id === snapshot.currentTaskId ? "active" : ""} onClick={() => void selectTask(task)}><kbd>{slotLabel(task.slot)}</kbd><span><strong>{task.contactName || "未指定"}</strong><small>{task.title}</small></span></button>)}</section></div>;
 }
 
 function Pet() {

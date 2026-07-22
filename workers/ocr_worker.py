@@ -1,7 +1,8 @@
 """AlphaKey 本地 OCR worker。
 
 协议：每行一个 JSON 请求，输出也是每行一个 JSON。
-与 Qwen ASR worker 使用相同的进程间通信模式。
+使用内置的 PP-OCRv5 模型（随安装包分发）：
+- resources/models/RapidOCR/onnx/PP-OCRv5/
 """
 
 import json
@@ -14,9 +15,29 @@ if sys.platform == "win32":
     sys.stderr.reconfigure(encoding="utf-8")
 
 
+def resource_dir() -> Path:
+    """返回模型资源目录。"""
+    bundled = Path(__file__).resolve().parent.parent / "models"
+    if bundled.exists():
+        return bundled
+    return Path("/models")
+
+
 def emit(value):
     sys.stdout.write(json.dumps(value, ensure_ascii=False) + "\n")
     sys.stdout.flush()
+
+
+def load_engine():
+    model_dir = resource_dir() / "RapidOCR" / "onnx" / "PP-OCRv5"
+    os.environ["RAPIDOCR_HOME"] = str(model_dir)
+    from rapidocr_onnxruntime import RapidOCR
+
+    return RapidOCR(
+        det_model_path=str(model_dir / "det" / "ch_PP-OCRv5_det_server.onnx"),
+        rec_model_path=str(model_dir / "rec" / "ch_PP-OCRv5_rec_server.onnx"),
+        cls_model_path=str(model_dir / "cls" / "ch_PP-LCNet_x0_25_textline_ori_cls_mobile.onnx"),
+    )
 
 
 def main():
@@ -29,11 +50,7 @@ def main():
                 emit({"event": "ready", "backend": "rapidocr"})
                 continue
             if action == "load":
-                model_dir = Path(request["modelPath"])
-                model_dir.mkdir(parents=True, exist_ok=True)
-                os.environ["RAPIDOCR_HOME"] = str(model_dir)
-                from rapidocr_onnxruntime import RapidOCR
-                engine = RapidOCR()
+                engine = load_engine()
                 emit({"event": "loaded"})
                 continue
             if action == "ocr":

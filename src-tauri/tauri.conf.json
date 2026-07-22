@@ -74,10 +74,10 @@
   "bundle": {
     "active": true,
     "resources": {
-      "../workers/qwen_asr_worker.py": "workers/qwen_asr_worker.py",
-      "../workers/diarization_worker.py": "workers/diarization_worker.py",
+      "../workers/funasr_asr_worker.py": "workers/funasr_asr_worker.py",
       "../workers/ocr_worker.py": "workers/ocr_worker.py",
-      "resources/python-embed.zip": "python-embed.zip"
+      "resources/models/FunASR": "models/FunASR",
+      "resources/models/RapidOCR": "models/RapidOCR"
     },
     "targets": ["nsis"],
     "icon": [

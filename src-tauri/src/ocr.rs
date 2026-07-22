@@ -1,5 +1,4 @@
 use crate::no_window;
-use crate::speech::{self, OCR_ID};
 use anyhow::{bail, Context, Result};
 use serde_json::json;
 use std::{
@@ -40,10 +39,9 @@ impl OcrWorker {
         } else {
             "bin/python"
         });
-        if !python.exists() || !speech::status(app, OCR_ID)?.installed {
-            bail!("请先在设置中下载 RapidOCR 识别模型")
+        if !python.exists() {
+            bail!("语音运行环境尚未初始化")
         }
-        let model_dir = speech::model_dir(app, OCR_ID)?;
         let mut child = no_window(
             &mut Command::new(&python)
                 .arg(ocr_worker_path(app)?)
@@ -64,7 +62,7 @@ impl OcrWorker {
             output,
             stderr: Some(stderr),
         };
-        worker.send(json!({"action":"load","modelPath":model_dir,"requestId":"startup"}))?;
+        worker.send(json!({"action":"load","requestId":"startup"}))?;
         let loaded = worker.receive()?;
         if loaded["event"] != "loaded" {
             bail!(
