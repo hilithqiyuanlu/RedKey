@@ -67,6 +67,7 @@ fn vk_to_action(vk: u32) -> Option<AppAction> {
         v if v == 0x38 => Some(AppAction::ActivateSlot { slot: 7 }),
         v if v == 0x39 => Some(AppAction::ActivateSlot { slot: 8 }),
         v if v == 0x30 => Some(AppAction::ActivateSlot { slot: 9 }),
+        v if v == 0x54 => Some(AppAction::ToggleRecording),
         _ => None,
     }
 }

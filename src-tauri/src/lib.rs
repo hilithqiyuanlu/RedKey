@@ -559,6 +559,7 @@ fn keyboard_action(key_code: i64) -> Option<AppAction> {
         21 => AppAction::ActivateSlot { slot: 3 }, 23 => AppAction::ActivateSlot { slot: 4 }, 22 => AppAction::ActivateSlot { slot: 5 },
         26 => AppAction::ActivateSlot { slot: 6 }, 28 => AppAction::ActivateSlot { slot: 7 }, 25 => AppAction::ActivateSlot { slot: 8 },
         29 => AppAction::ActivateSlot { slot: 9 },
+        17 => AppAction::ToggleRecording,
         _ => return None,
     })
 }
@@ -650,12 +651,12 @@ fn set_pet_visible_inner(app: &AppHandle, visible: bool) -> Result<()> {
     Ok(())
 }
 
-fn update_tray_recording_text(app: &AppHandle) {
+fn update_tray_recording_state(app: &AppHandle) {
     let state = app.state::<RuntimeState>();
     let is_recording = state.native_recording.lock().is_some();
     let guard = state.tray_recording_item.lock();
     if let Some(item) = guard.as_ref() {
-        let _ = item.set_text(if is_recording { "停止录音" } else { "开始录音" });
+        let _ = item.set_enabled(!is_recording);
     }
 }
 
@@ -685,16 +686,11 @@ fn setup_tray(app: &tauri::App) -> Result<()> {
             }
             "recording" => {
                 let state = app.state::<RuntimeState>();
-                if state.native_recording.lock().is_some() {
-                    if let Err(e) = stop_native_recording(app.clone()) {
-                        eprintln!("托盘停止录音失败：{e}");
-                    }
-                } else {
+                if state.native_recording.lock().is_none() {
                     if let Err(e) = start_native_recording(app.clone()) {
                         eprintln!("托盘开始录音失败：{e}");
                     }
                 }
-                update_tray_recording_text(app);
             }
             "settings" => {
                 let _ = show_settings_window(app);
@@ -1352,7 +1348,7 @@ fn prepare_native_recording(app: &AppHandle) -> Result<(String, std::path::PathB
 fn finalize_native_recording(app: &AppHandle, recording: NativeRecording) -> String {
     let id = recording.id.clone();
     *app.state::<RuntimeState>().native_recording.lock() = Some(recording);
-    update_tray_recording_text(app);
+    update_tray_recording_state(app);
     id
 }
 
@@ -1419,7 +1415,7 @@ fn stop_native_recording(app: AppHandle) -> Result<Snapshot, String> {
     begin_processing(&app, &recording.id);
     let background_app = app.clone();
     std::thread::spawn(move || run_transcription_pipeline(background_app, recording.path, recording.id));
-    update_tray_recording_text(&app);
+    update_tray_recording_state(&app);
     snapshot(&app).map_err(err)
 }
 
