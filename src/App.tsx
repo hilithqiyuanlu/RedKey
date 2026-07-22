@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow, LogicalPosition } from "@tauri-apps/api/window";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import {
   Archive, Check, ChevronDown, ChevronRight, CircleAlert, CircleCheck, Clipboard, ClipboardPaste, Download, ExternalLink,
@@ -1203,6 +1203,7 @@ function QuickPanel() {
 function Pet() {
   const { currentTask } = useSnapshot(); const [pressed, setPressed] = useState(false);
   const [petMode, setPetMode] = useState<"default" | "edit" | "recording" | "ai-summary">("default");
+  const dragRef = useRef<{ offsetX: number; offsetY: number; raf: number | null; moveListener: ((e: PointerEvent) => void) | null; upListener: ((e: PointerEvent) => void) | null } | null>(null);
   useEffect(() => { document.documentElement.classList.add("hud-document"); return () => { document.documentElement.classList.remove("hud-document"); }; }, []);
   useEffect(() => { const timer = window.setInterval(() => void api.syncHoverState(), 80); return () => window.clearInterval(timer); }, []);
   useEffect(() => {
@@ -1210,18 +1211,48 @@ function Pet() {
     (async () => { unlisten = await onPetMode((mode) => { setPetMode(mode as "default" | "edit" | "recording" | "ai-summary"); }); })();
     return () => { unlisten?.(); };
   }, []);
-  function drag() {
+  async function handlePointerDown(e: React.PointerEvent) {
+    if (e.button !== 0) return;
+    const win = getCurrentWindow();
+    const [pos, scaleFactor] = await Promise.all([win.outerPosition(), win.scaleFactor()]);
+    const winX = pos.x / scaleFactor;
+    const winY = pos.y / scaleFactor;
+    const offsetX = e.screenX - winX;
+    const offsetY = e.screenY - winY;
     setPressed(true);
     void api.setPetDragging(true);
-    const win = getCurrentWindow();
-    void win.startDragging().finally(() => {
+    let pendingX = winX;
+    let pendingY = winY;
+    let rafId: number | null = null;
+    const flush = () => {
+      rafId = null;
+      void win.setPosition(new LogicalPosition(Math.round(pendingX), Math.round(pendingY)));
+    };
+    const handleMove = (ev: PointerEvent) => {
+      pendingX = ev.screenX - offsetX;
+      pendingY = ev.screenY - offsetY;
+      if (rafId === null) {
+        rafId = requestAnimationFrame(flush);
+      }
+    };
+    const handleUp = () => {
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleUp);
       setPressed(false);
       void api.setPetDragging(false);
-    });
+      dragRef.current = null;
+    };
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleUp);
+    dragRef.current = { offsetX, offsetY, raf: null, moveListener: handleMove, upListener: handleUp };
   }
   const imageSrc = petMode === "edit" ? "/pet/edit.png" : petMode === "recording" ? "/pet/recording.png" : petMode === "ai-summary" ? "/pet/ai-summary.png" : "/pet/default.png";
   const state = petState(currentTask);
-  return <div className={`pet-shell ${state} ${pressed ? "pressed" : ""}`} onPointerDown={() => void drag()} onContextMenu={(event) => { event.preventDefault(); void api.showConsole(); }}>
+  return <div className={`pet-shell ${state} ${pressed ? "pressed" : ""}`} onPointerDown={(e) => void handlePointerDown(e)} onContextMenu={(event) => { event.preventDefault(); void api.showConsole(); }}>
     <img className="pet-image" src={imageSrc} alt="Pet" draggable={false} />
   </div>;
 }
