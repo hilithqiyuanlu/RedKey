@@ -41,7 +41,6 @@ extern "C" {
 struct RuntimeState {
     db: Mutex<Option<Database>>,
     tray_icon: Mutex<Option<TrayIcon>>,
-    tray_recording_item: Mutex<Option<MenuItem<tauri::Wry>>>,
     keyboard_monitor: Mutex<Option<KeyboardMonitor>>,
     hover_regions: Mutex<HoverRegions>,
     speech_worker: Mutex<Option<speech::SpeechWorker>>,
@@ -58,7 +57,6 @@ impl Default for RuntimeState {
         Self {
             db: Mutex::new(None),
             tray_icon: Mutex::new(None),
-            tray_recording_item: Mutex::new(None),
             keyboard_monitor: Mutex::new(None),
             hover_regions: Mutex::new(HoverRegions::default()),
             speech_worker: Mutex::new(None),
@@ -651,24 +649,13 @@ fn set_pet_visible_inner(app: &AppHandle, visible: bool) -> Result<()> {
     Ok(())
 }
 
-fn update_tray_recording_state(app: &AppHandle) {
-    let state = app.state::<RuntimeState>();
-    let is_recording = state.native_recording.lock().is_some();
-    let guard = state.tray_recording_item.lock();
-    if let Some(item) = guard.as_ref() {
-        let _ = item.set_enabled(!is_recording);
-    }
-}
-
 fn setup_tray(app: &tauri::App) -> Result<()> {
     let show = MenuItem::with_id(app, "show", "打开控制台", true, None::<&str>)?;
-    let recording = MenuItem::with_id(app, "recording", "开始录音", true, None::<&str>)?;
-    *app.state::<RuntimeState>().tray_recording_item.lock() = Some(recording.clone());
     let pet_visible = app.state::<RuntimeState>().db().settings()?.pet_visible;
     let toggle_pet = MenuItem::with_id(app, "toggle_pet", if pet_visible { "休眠宠物" } else { "唤醒宠物" }, true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &recording, &toggle_pet, &settings, &quit])?;
+    let menu = Menu::with_items(app, &[&show, &toggle_pet, &settings, &quit])?;
     let icon = app
         .default_window_icon()
         .context("应用图标不存在，无法创建菜单栏图标")?
@@ -683,14 +670,6 @@ fn setup_tray(app: &tauri::App) -> Result<()> {
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "show" => {
                 let _ = show_console_window(app);
-            }
-            "recording" => {
-                let state = app.state::<RuntimeState>();
-                if state.native_recording.lock().is_none() {
-                    if let Err(e) = start_native_recording(app.clone()) {
-                        eprintln!("托盘开始录音失败：{e}");
-                    }
-                }
             }
             "settings" => {
                 let _ = show_settings_window(app);
@@ -1348,7 +1327,6 @@ fn prepare_native_recording(app: &AppHandle) -> Result<(String, std::path::PathB
 fn finalize_native_recording(app: &AppHandle, recording: NativeRecording) -> String {
     let id = recording.id.clone();
     *app.state::<RuntimeState>().native_recording.lock() = Some(recording);
-    update_tray_recording_state(app);
     id
 }
 
@@ -1415,7 +1393,6 @@ fn stop_native_recording(app: AppHandle) -> Result<Snapshot, String> {
     begin_processing(&app, &recording.id);
     let background_app = app.clone();
     std::thread::spawn(move || run_transcription_pipeline(background_app, recording.path, recording.id));
-    update_tray_recording_state(&app);
     snapshot(&app).map_err(err)
 }
 
