@@ -73,10 +73,47 @@ fn find_python() -> Result<PathBuf> {
     bail!("未找到 Python 3.10~3.12，请安装 Python 3.11")
 }
 
-fn python_has_venv(python: &Path) -> bool {
-    no_window(Command::new(python).args(["-c", "import venv"]))
+fn python_can_bootstrap(python: &Path) -> bool {
+    no_window(Command::new(python).args(["-c", "import venv, ensurepip"]))
         .output()
         .is_ok_and(|o| o.status.success())
+}
+
+/// Windows embeddable Python 使用 python311._pth 控制 sys.path；
+/// 旧版或配置错误的包里该文件可能没有包含 Lib/site-packages，也没有启用 site，
+/// 导致连标准库都加载不了。这里尝试自动修复。
+fn repair_embed_python(python: &Path) -> Result<()> {
+    let exe_dir = python.parent().context("无法定位便携 Python 目录")?;
+    let pth = exe_dir.join("python311._pth");
+    if !pth.exists() {
+        return Ok(());
+    }
+    let mut contents = fs::read_to_string(&pth).context("读取便携 Python 路径配置失败")?;
+    let mut lines: Vec<String> = contents.lines().map(|s| s.to_string()).collect();
+    for entry in ["Lib", r"Lib\site-packages"] {
+        if !lines.iter().any(|l| l.trim() == entry) {
+            lines.push(entry.to_string());
+        }
+    }
+    let mut has_import_site = false;
+    for line in &mut lines {
+        let trimmed = line.trim();
+        if trimmed == "import site" {
+            has_import_site = true;
+        } else if trimmed == "#import site" {
+            *line = "import site".to_string();
+            has_import_site = true;
+        }
+    }
+    if !has_import_site {
+        lines.push("import site".to_string());
+    }
+    contents = lines.join("\n");
+    if !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    fs::write(&pth, contents).context("修复便携 Python 路径配置失败")?;
+    Ok(())
 }
 
 fn bootstrap_python(app: &AppHandle) -> Result<PathBuf> {
@@ -86,10 +123,22 @@ fn bootstrap_python(app: &AppHandle) -> Result<PathBuf> {
             resource_dir.join("python-embed/python/python.exe"),
             resource_dir.join("python-embed/python.exe"),
         ];
-        for bundled in bundled_paths {
-            if bundled.exists() {
-                return Ok(bundled);
+        let bundled_exists = bundled_paths.iter().any(|p| p.exists());
+        for bundled in bundled_paths.iter().filter(|p| p.exists()) {
+            if python_can_bootstrap(bundled) {
+                return Ok(bundled.clone());
             }
+            // 尝试修复旧版 Windows embeddable Python 的 _pth 配置
+            if repair_embed_python(bundled).is_ok() && python_can_bootstrap(bundled) {
+                return Ok(bundled.clone());
+            }
+        }
+        if bundled_exists {
+            // 便携 Python 损坏或权限不足时，优先回退到系统 Python
+            if let Ok(sys) = find_python() {
+                return Ok(sys);
+            }
+            bail!("打包的便携 Python 无法启动（缺少 venv/ensurepip），且未找到系统 Python 3.10~3.12。建议重新安装新版应用，或先安装 Python 3.11。");
         }
     }
     find_python()
@@ -138,10 +187,13 @@ pub fn ensure_runtime(app: &AppHandle) -> Result<()> {
         let _ = fs::remove_file(&get_pip);
     }
 
-    run_command(
+    // pip 升级可能因嵌入式环境的 resolver bug 失败，降级为警告，不阻塞后续依赖安装
+    if let Err(err) = run_command(
         Command::new(&python).args(["-m", "pip", "install", "--upgrade", "pip"]),
         "升级 pip 失败",
-    )?;
+    ) {
+        eprintln!("warn: 升级 pip 失败，继续使用当前版本：{err}");
+    }
     run_command(
         Command::new(&python).args([
             "-m", "pip", "install",
