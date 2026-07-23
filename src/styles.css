@@ -400,6 +400,24 @@ select:focus-visible {
   border-radius: 0;
   background: var(--bg-secondary);
 }
+
+.toolbar-progress {
+  height: 3px;
+  overflow: hidden;
+  background: var(--border);
+}
+.toolbar-progress-bar {
+  height: 100%;
+  width: 30%;
+  background: var(--accent);
+  animation: toolbar-progress-indeterminate 1.4s ease-in-out infinite;
+}
+
+@keyframes toolbar-progress-indeterminate {
+  0% { transform: translateX(-100%); }
+  50% { transform: translateX(250%); }
+  100% { transform: translateX(400%); }
+}
 .toolbar-side,
 .toolbar-center {
   display: flex;
@@ -455,6 +473,7 @@ select:focus-visible {
   color: #fff;
   background: var(--destructive);
   border-color: var(--destructive);
+  animation: recording-pulse-ring 1.5s ease-in-out infinite;
 }
 .icon-button.danger { color: var(--destructive); }
 .icon-button.danger:hover:not(:disabled) {
@@ -663,6 +682,7 @@ select:focus-visible {
 }
 
 .text-card > p {
+  position: relative;
   min-height: 62px;
   max-height: 120px;
   margin: 0;
@@ -676,9 +696,26 @@ select:focus-visible {
   scrollbar-gutter: stable;
 }
 .text-card > p.placeholder { color: var(--muted-2); }
+.text-card > p.truncated::after {
+  content: "";
+  position: sticky;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  display: block;
+  height: 48px;
+  margin: -20px -18px 0;
+  background: linear-gradient(to top, var(--bg-secondary), transparent);
+  pointer-events: none;
+}
+.text-card > p.truncated:hover {
+  cursor: pointer;
+  border-color: var(--border-l3);
+}
 .text-card.expanded > p {
   max-height: 400px;
 }
+.text-card.expanded > p.truncated::after { display: none; }
 
 .text-card > textarea {
   display: block;
@@ -1124,7 +1161,7 @@ select:focus-visible {
   height: 30px;
   flex-shrink: 0;
   border: none;
-  border-radius: 50%;
+  border-radius: 0;
   background: var(--accent);
   color: #fff;
   cursor: pointer;
@@ -1545,6 +1582,9 @@ button.primary:hover,
   
   animation: fade-in 0.15s ease-out;
 }
+.modal-backdrop.closing {
+  animation: fade-out 0.18s ease-out forwards;
+}
 
 .modal {
   display: grid;
@@ -1558,6 +1598,9 @@ button.primary:hover,
   background: var(--bg-secondary);
   box-shadow: 2px 2px 0 rgba(0,0,0,1);
   animation: modal-in 0.2s ease-out;
+}
+.modal.closing {
+  animation: modal-out 0.18s ease-out forwards;
 }
 .modal > header {
   display: flex;
@@ -2939,6 +2982,11 @@ button.primary:hover,
   to { opacity: 1; }
 }
 
+@keyframes fade-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
 @keyframes modal-in {
   from { opacity: 0; transform: scale(0.96) translateY(4px); }
   to { opacity: 1; transform: scale(1) translateY(0); }
@@ -2976,6 +3024,11 @@ button.primary:hover,
 @keyframes recording-pulse-border {
   0%, 100% { border-color: rgba(239, 68, 68, 0.35); }
   50% { border-color: rgba(239, 68, 68, 0.55); }
+}
+
+@keyframes recording-pulse-ring {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
+  50% { box-shadow: 0 0 0 5px rgba(239, 68, 68, 0); }
 }
 
 /* ----------------------------------------------------------

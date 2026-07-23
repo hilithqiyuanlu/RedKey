@@ -377,21 +377,22 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
     setDeletedCardIds((prev) => { const next = new Set(prev); next.delete(cardId); return next; });
   }
   const activeRecording = document.recordings.find((recording) => recording.status === "recording") ?? (isRecording && !document.recordings.some((r) => r.status === "recording") ? { status: "recording" } as Recording : null);
+  const isAiWorking = useMemo(() => summarizing ||
+    document.recordings.some((r) =>
+      r.processingStatus === "transcribing" ||
+      ["diarizing", "aligning", "merging"].includes(r.processingStatus)
+    ) || document.summaries.some((s) => s.status === "summarizing"),
+  [summarizing, document.recordings, document.summaries]);
 
   useEffect(() => { setTitle(task.title); }, [task.title]);
   useEffect(() => { setEditingTitle(false); setLinkOpen(false); setOptimisticCards({ text: [], image: [] }); setDeletedCardIds(new Set()); }, [task.id]);
   // Sync pet mode: "recording" when actively recording, "edit" when user is editing, "ai-summary" when AI is working, "default" otherwise
   useEffect(() => {
     if (activeRecording) { void api.setPetMode("recording"); return; }
-    if (summarizing) { void api.setPetMode("ai-summary"); return; }
-    const hasAiWork = document.recordings.some((r) =>
-      r.processingStatus === "transcribing" ||
-      ["diarizing", "aligning", "merging"].includes(r.processingStatus)
-    ) || document.summaries.some((s) => s.status === "summarizing");
-    if (hasAiWork) { void api.setPetMode("ai-summary"); return; }
+    if (isAiWorking) { void api.setPetMode("ai-summary"); return; }
     if (editingTitle || editingCardId != null) { void api.setPetMode("edit"); return; }
     void api.setPetMode("default");
-  }, [activeRecording, editingTitle, editingCardId, summarizing, document.recordings, document.summaries]);
+  }, [activeRecording, editingTitle, editingCardId, isAiWorking]);
   // Ctrl+V 粘贴（图片优先，否则粘贴文本；仅进行中任务界面，非输入框时生效）
   useEffect(() => {
     if (readOnly) return;
@@ -532,6 +533,7 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
         {readOnly && <IconButton danger label="删除任务" onClick={() => setConfirmDeleteTask(true)}><Trash2 /></IconButton>}
       </div>
     </header>
+    {isAiWorking && <div className="toolbar-progress"><div className="toolbar-progress-bar" /></div>}
     <section className="document-page">
       <div className="document-identity">
         <ContactPicker
@@ -650,9 +652,20 @@ function TextCardView({ card, readOnly, editing, onEditing, onRefresh, onDelete,
   const [content, setContent] = useState(card.content);
   const [expanded, setExpanded] = useState(false);
   const savedRef = useRef(card.content);
+  const pRef = useRef<HTMLParagraphElement>(null);
+  const [truncated, setTruncated] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
   useEffect(() => { setContent(card.content); savedRef.current = card.content; }, [card.id, card.content]);
+  useEffect(() => {
+    const el = pRef.current;
+    if (!el) return;
+    const check = () => setTruncated(el.scrollHeight > el.clientHeight + 2);
+    check();
+    const observer = new ResizeObserver(check);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [card.content, expanded]);
   useEffect(() => {
     if (!editing || content === savedRef.current) return;
     const timer = window.setTimeout(() => { void api.updateTextCard(card.id, content).then(() => { savedRef.current = content; }).catch((reason) => notify(String(reason))); }, 600);
@@ -678,7 +691,7 @@ function TextCardView({ card, readOnly, editing, onEditing, onRefresh, onDelete,
     onDragStart={(event) => { if (editing) { event.preventDefault(); return; } event.dataTransfer.setData("application/redkey-card", JSON.stringify({ type: "text", id: card.id })); event.dataTransfer.effectAllowed = "move"; }}
   >
     <header onClick={() => !editing && setExpanded((v) => !v)} style={{ cursor: editing ? undefined : "pointer" }}><div className="card-header-title">{formatDate(card.createdAt)}{card.source === "ai" && <span className="ai-badge">AI</span>}</div><div onClick={(e) => e.stopPropagation()}>{!readOnly && <IconButton label="编辑文本" onClick={() => onEditing(editing ? null : card.id)}><Pencil /></IconButton>}{!readOnly && <IconButton danger label="删除文本" onClick={() => setConfirmDelete(true)}><Trash2 /></IconButton>}<IconButton label={expanded ? "收起" : "展开"} onClick={() => setExpanded((v) => !v)}>{expanded ? <ChevronDown /> : <ChevronRight />}</IconButton></div></header>
-    {editing && !readOnly ? <textarea autoFocus value={content} placeholder="输入补充信息…" onChange={(event) => setContent(event.target.value)} onBlur={() => onEditing(null)} /> : <p className={content ? "" : "placeholder"} onDoubleClick={() => !readOnly && onEditing(card.id)}>{content || "点击编辑按钮添加文本内容"}</p>}
+    {editing && !readOnly ? <textarea autoFocus value={content} placeholder="输入补充信息…" onChange={(event) => setContent(event.target.value)} onBlur={() => onEditing(null)} /> : <p ref={pRef} className={`${content ? "" : "placeholder"}${truncated && !expanded ? " truncated" : ""}`} onDoubleClick={() => !readOnly && onEditing(card.id)}>{content || "点击编辑按钮添加文本内容"}</p>}
     {confirmDelete && <ConfirmDialog
       title="删除这张文本卡？"
       description="删除后无法恢复。"
@@ -1294,13 +1307,19 @@ function Pet() {
 function IconButton({ label, children, onClick, disabled, active, danger }: { label: string; children: React.ReactNode; onClick?: () => void; disabled?: boolean; active?: boolean; danger?: boolean }) { return <button type="button" className={`icon-button ${active ? "active" : ""} ${danger ? "danger" : ""}`} title={label} aria-label={label} disabled={disabled} onClick={onClick}>{children}</button>; }
 
 function ConfirmDialog({ title, description, confirmLabel = "确认", cancelLabel = "取消", danger = false, onConfirm, onCancel }: { title: string; description?: string; confirmLabel?: string; cancelLabel?: string; danger?: boolean; onConfirm: () => void; onCancel: () => void; }) {
-  return <div className="modal-backdrop" onClick={onCancel}>
-    <div className="modal confirm-dialog" onClick={(e) => e.stopPropagation()}>
+  const [closing, setClosing] = useState(false);
+  function close(callback: () => void) {
+    if (closing) return;
+    setClosing(true);
+    setTimeout(callback, 180);
+  }
+  return <div className={`modal-backdrop${closing ? " closing" : ""}`} onClick={() => close(onCancel)}>
+    <div className={`modal confirm-dialog${closing ? " closing" : ""}`} onClick={(e) => e.stopPropagation()}>
       <header><div><strong>{title}</strong></div></header>
       {description && <p>{description}</p>}
       <footer>
-        <button onClick={onCancel}>{cancelLabel}</button>
-        <button className={danger ? "danger-action" : "primary"} onClick={onConfirm}>{confirmLabel}</button>
+        <button onClick={() => close(onCancel)}>{cancelLabel}</button>
+        <button className={danger ? "danger-action" : "primary"} onClick={() => close(onConfirm)}>{confirmLabel}</button>
       </footer>
     </div>
   </div>;
