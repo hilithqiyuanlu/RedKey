@@ -18,7 +18,7 @@ import type {
   UpdateTaskInput,
 } from "./types";
 
-const inTauri = () => "__TAURI_INTERNALS__" in window;
+export const inTauri = () => "__TAURI_INTERNALS__" in window;
 
 const EMPTY: Snapshot = {
   tasks: [],
@@ -101,6 +101,8 @@ export const api = {
   getRecordingSummaryPrompt: (recordingId: string) => invoke<string>("get_recording_summary_prompt", { recordingId }),
   updateRecordingSummary: (recordingId: string, summary: RecordingSummary) => invoke<void>("update_recording_summary", { recordingId, summary }),
   retryTranscription: (recordingId: string) => invoke<Snapshot>("retry_transcription", { recordingId }),
+  transcriptionQueueLen: () => invoke<number>("transcription_queue_len"),
+  releaseSpeechWorker: () => invoke<void>("release_speech_worker"),
   exportData: () => invoke<string>("export_data"),
   importData: (payload: string) => invoke<Snapshot>("import_data", { payload }),
   toggleQuickPanel: () => invoke<void>("toggle_quick_panel"),

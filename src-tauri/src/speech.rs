@@ -8,7 +8,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    sync::{Arc, LazyLock, Mutex, atomic::{AtomicBool, Ordering}},
+    sync::{Arc, LazyLock, Mutex, mpsc, atomic::{AtomicBool, Ordering}},
     time::Duration,
 };
 use tauri::{AppHandle, Emitter, Manager};
@@ -86,13 +86,18 @@ fn python_has_venv(python: &Path) -> bool {
 fn bootstrap_python(app: &AppHandle) -> Result<PathBuf> {
     if cfg!(windows) {
         let resource_dir = app.path().resource_dir()?;
-        for bundled in [
+        let bundled_paths = [
             resource_dir.join("python-embed/python/python.exe"),
             resource_dir.join("python-embed/python.exe"),
-        ] {
+        ];
+        let bundled_exists = bundled_paths.iter().any(|p| p.exists());
+        for bundled in bundled_paths {
             if bundled.exists() && python_has_venv(&bundled) {
                 return Ok(bundled);
             }
+        }
+        if bundled_exists {
+            bail!("打包的便携 Python 缺少 venv 模块，无法创建运行环境。建议重新安装新版应用；如需临时使用，请先安装 Python 3.10~3.12。");
         }
     }
     find_python()
@@ -140,9 +145,9 @@ pub fn ensure_runtime(app: &AppHandle) -> Result<()> {
         Command::new(&python).args([
             "-m", "pip", "install",
             "funasr", "torch", "torchaudio", "modelscope",
-            "sentencepiece", "soundfile", "numpy",
+            "sentencepiece", "soundfile", "numpy", "rapidocr_onnxruntime",
         ]),
-        "安装 FunASR 依赖失败",
+        "安装 FunASR/OCR 依赖失败",
     )?;
     Ok(())
 }
@@ -333,11 +338,31 @@ pub async fn download_asr_model(app: AppHandle, id: String) -> Result<(), String
 
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
-        let result = download_and_extract(&app2, &id, url).await;
+        let mut last_error: Option<anyhow::Error> = None;
+        for attempt in 1..=3 {
+            if attempt > 1 {
+                let _ = app2.emit(
+                    "redkey://model-download-progress",
+                    json!({"id": &id, "progress": 0, "stage": format!("第 {attempt} 次重试"), "error": null}),
+                );
+            }
+            match download_and_extract(&app2, &id, url).await {
+                Ok(()) => {
+                    last_error = None;
+                    break;
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    // 清理失败的临时文件，避免下次重试使用脏数据
+                    let data_dir = models_data_dir(&app2).unwrap_or_else(|_| PathBuf::from("."));
+                    let _ = fs::remove_file(data_dir.join(format!("{id}.zip.partial")));
+                }
+            }
+        }
         DOWNLOADING.lock().unwrap().remove(&id);
-        let (progress, stage, error): (u8, String, Option<String>) = match result {
-            Ok(()) => (100u8, "已就绪".into(), None),
-            Err(e) => (0u8, "下载失败".into(), Some(e.to_string())),
+        let (progress, stage, error): (u8, String, Option<String>) = match last_error {
+            None => (100u8, "已就绪".into(), None),
+            Some(e) => (0u8, "下载失败".into(), Some(e.to_string())),
         };
         let _ = app2.emit(
             "redkey://model-download-progress",
@@ -351,8 +376,65 @@ pub async fn download_asr_model(app: AppHandle, id: String) -> Result<(), String
 pub struct SpeechWorker {
     child: Arc<Mutex<Child>>,
     input: ChildStdin,
-    output: BufReader<ChildStdout>,
-    stderr: Option<BufReader<std::process::ChildStderr>>,
+    stdout_rx: mpsc::Receiver<String>,
+}
+
+fn spawn_stdout_reader(stdout: ChildStdout) -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let trimmed = line.trim().to_string();
+                    if !trimmed.is_empty() && tx.send(trimmed).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    rx
+}
+
+fn spawn_stderr_reader(app: &AppHandle, stderr: std::process::ChildStderr) -> Result<()> {
+    let log_dir = app.path().app_data_dir()?.join("logs");
+    fs::create_dir_all(&log_dir).context("无法创建日志目录")?;
+    let log_path = log_dir.join("funasr-worker.log");
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .ok();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        eprintln!("[FunASR] {trimmed}");
+                        if let Some(f) = file.as_mut() {
+                            let _ = writeln!(
+                                f,
+                                "{} [FunASR] {trimmed}",
+                                chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+                            );
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    Ok(())
 }
 
 impl SpeechWorker {
@@ -372,13 +454,14 @@ impl SpeechWorker {
         .spawn()
         .context("无法启动 FunASR worker")?;
         let input = child.stdin.take().context("worker 输入不可用")?;
-        let output = BufReader::new(child.stdout.take().context("worker 输出不可用")?);
-        let stderr = BufReader::new(child.stderr.take().context("worker 错误输出不可用")?);
+        let stdout = child.stdout.take().context("worker 输出不可用")?;
+        let stderr = child.stderr.take().context("worker 错误输出不可用")?;
+        spawn_stderr_reader(app, stderr)?;
+        let stdout_rx = spawn_stdout_reader(stdout);
         let mut worker = Self {
             child: Arc::new(Mutex::new(child)),
             input,
-            output,
-            stderr: Some(stderr),
+            stdout_rx,
         };
         worker.send(json!({"action":"load","requestId":"startup"}))?;
         let loaded = worker.receive()?;
@@ -415,44 +498,21 @@ impl SpeechWorker {
     }
 
     fn receive(&mut self) -> Result<serde_json::Value> {
-        loop {
-            let mut buf: Vec<u8> = Vec::new();
-            let mut byte = [0u8; 1];
-            loop {
-                match self.output.get_mut().read(&mut byte) {
-                    Ok(0) => {
-                        let stderr_msg = self.drain_stderr();
-                        bail!("FunASR worker 已意外退出{stderr_msg}");
-                    }
-                    Ok(1) => {
-                        if byte[0] == b'\n' {
-                            break;
-                        }
-                        buf.push(byte[0]);
-                    }
-                    Err(e) => bail!("读取 FunASR worker 输出失败：{e}"),
-                    _ => unreachable!(),
+        const RECEIVE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+        match self.stdout_rx.recv_timeout(RECEIVE_TIMEOUT) {
+            Ok(line) => {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                    return Ok(value);
                 }
+                bail!("FunASR worker 输出不是有效 JSON：{line}")
             }
-            let line = String::from_utf8_lossy(&buf).trim().to_string();
-            if line.is_empty() {
-                continue;
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                bail!("等待 FunASR worker 响应超时（5 分钟无输出），请检查日志")
             }
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
-                return Ok(value);
-            }
-        }
-    }
-
-    fn drain_stderr(&mut self) -> String {
-        let mut result = String::new();
-        if let Some(stderr) = &mut self.stderr {
-            let mut buf = String::new();
-            if stderr.read_to_string(&mut buf).is_ok() && !buf.is_empty() {
-                result = format!("（错误输出：{}）", buf.trim());
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("FunASR worker 已意外退出，请查看 logs/funasr-worker.log")
             }
         }
-        result
     }
 }
 

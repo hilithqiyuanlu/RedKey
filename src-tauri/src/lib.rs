@@ -3,6 +3,7 @@ mod llm;
 mod models;
 mod ocr;
 mod speech;
+mod transcription;
 
 #[cfg(windows)]
 mod keyboard_windows;
@@ -13,16 +14,13 @@ use crate::db::Database;
 use crate::models::*;
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use std::collections::HashMap;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 #[cfg(target_os = "macos")]
 use std::io::{BufRead, BufReader, Write};
 #[cfg(target_os = "macos")]
 use std::sync::mpsc;
-use std::process::Child;
 #[cfg(target_os = "macos")]
-use std::process::{ChildStdin, Command, Stdio};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::Duration;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
@@ -43,8 +41,8 @@ struct RuntimeState {
     tray_icon: Mutex<Option<TrayIcon>>,
     keyboard_monitor: Mutex<Option<KeyboardMonitor>>,
     hover_regions: Mutex<HoverRegions>,
-    speech_worker: Mutex<Option<speech::SpeechWorker>>,
-    processing_cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    transcription_queue: Mutex<Option<transcription::TranscriptionQueue>>,
+    ocr_worker: Mutex<Option<ocr::OcrWorker>>,
     native_recording: Mutex<Option<NativeRecording>>,
     hud_state: Mutex<HudState>,
     pet_mode: Mutex<String>,
@@ -57,8 +55,8 @@ impl Default for RuntimeState {
             tray_icon: Mutex::new(None),
             keyboard_monitor: Mutex::new(None),
             hover_regions: Mutex::new(HoverRegions::default()),
-            speech_worker: Mutex::new(None),
-            processing_cancellations: Mutex::new(HashMap::new()),
+            transcription_queue: Mutex::new(None),
+            ocr_worker: Mutex::new(None),
             native_recording: Mutex::new(None),
             hud_state: Mutex::new(HudState::default()),
             pet_mode: Mutex::new("default".to_string()),
@@ -87,6 +85,34 @@ impl RuntimeState {
         parking_lot::MutexGuard::map(guard, |opt| {
             opt.as_mut().expect("Database not initialized")
         })
+    }
+
+    fn transcription_queue(
+        &self,
+        app: &AppHandle,
+    ) -> parking_lot::MappedMutexGuard<'_, transcription::TranscriptionQueue> {
+        let mut guard = self.transcription_queue.lock();
+        if guard.is_none() {
+            *guard = Some(transcription::TranscriptionQueue::new(app.clone()));
+        }
+        parking_lot::MutexGuard::map(guard, |opt| {
+            opt.as_mut().expect("transcription queue initialized")
+        })
+    }
+
+    fn ocr_worker(&self, app: &AppHandle) -> Result<parking_lot::MappedMutexGuard<'_, ocr::OcrWorker>, String> {
+        let mut guard = self.ocr_worker.lock();
+        if guard.is_none() {
+            let worker = ocr::OcrWorker::start(app).map_err(|e| e.to_string())?;
+            *guard = Some(worker);
+        }
+        Ok(parking_lot::MutexGuard::map(guard, |opt| {
+            opt.as_mut().expect("ocr worker initialized")
+        }))
+    }
+
+    fn release_ocr_worker(&self) {
+        self.ocr_worker.lock().take();
     }
 }
 
@@ -138,6 +164,37 @@ pub(crate) fn no_window(cmd: &mut std::process::Command) -> &mut std::process::C
 #[cfg(not(windows))]
 pub(crate) fn no_window(cmd: &mut std::process::Command) -> &mut std::process::Command { cmd }
 
+fn ffmpeg_available() -> bool {
+    let mut cmd = std::process::Command::new("ffmpeg");
+    no_window(&mut cmd).arg("-version").output().is_ok()
+}
+
+/// 如果系统安装了 ffmpeg，将 WAV 压缩为 FLAC；失败或无 ffmpeg 时返回原路径。
+fn compress_wav_to_flac(wav_path: &std::path::Path) -> std::path::PathBuf {
+    if !ffmpeg_available() {
+        return wav_path.to_path_buf();
+    }
+    let flac_path = wav_path.with_extension("flac");
+    let mut cmd = std::process::Command::new("ffmpeg");
+    let result = no_window(&mut cmd)
+        .args([
+            "-y",
+            "-i",
+            wav_path.to_string_lossy().as_ref(),
+            "-c:a",
+            "flac",
+            flac_path.to_string_lossy().as_ref(),
+        ])
+        .output();
+    match result {
+        Ok(out) if out.status.success() && flac_path.exists() => {
+            let _ = std::fs::remove_file(wav_path);
+            flac_path
+        }
+        _ => wav_path.to_path_buf(),
+    }
+}
+
 fn snapshot(app: &AppHandle) -> Result<Snapshot> {
     app.state::<RuntimeState>().db().snapshot()
 }
@@ -146,66 +203,6 @@ fn emit_snapshot(app: &AppHandle) -> Result<Snapshot> {
     let value = snapshot(app)?;
     app.emit("redkey://snapshot", &value)?;
     Ok(value)
-}
-
-fn transcribe_with_worker(app: &AppHandle, path: &std::path::Path, request_id: &str) -> Result<Vec<crate::models::SpeakerSegment>> {
-    let state = app.state::<RuntimeState>();
-    let mut guard = state.speech_worker.lock();
-    if guard.is_none() {
-        let worker = speech::SpeechWorker::start(app)?;
-        *guard = Some(worker);
-    }
-    if processing_cancelled(app, request_id) {
-        *guard = None;
-        return Err(anyhow::anyhow!("录音处理已取消"));
-    }
-    match guard.as_mut().unwrap().transcribe(path) {
-        Ok(segments) => Ok(segments),
-        Err(error) => { *guard = None; Err(error) }
-    }
-}
-
-fn begin_processing(app: &AppHandle, recording_id: &str) -> Arc<AtomicBool> {
-    let token = Arc::new(AtomicBool::new(false));
-    app.state::<RuntimeState>().processing_cancellations.lock().insert(recording_id.into(), token.clone());
-    token
-}
-
-fn processing_cancelled(app: &AppHandle, recording_id: &str) -> bool {
-    app.state::<RuntimeState>().processing_cancellations.lock().get(recording_id).is_some_and(|token| token.load(Ordering::Acquire))
-}
-
-fn finish_processing(app: &AppHandle, recording_id: &str) {
-    app.state::<RuntimeState>().processing_cancellations.lock().remove(recording_id);
-}
-
-fn cancel_processing(app: &AppHandle, recording_id: &str) {
-    if let Some(token) = app.state::<RuntimeState>().processing_cancellations.lock().get(recording_id) {
-        token.store(true, Ordering::Release);
-    }
-    app.state::<RuntimeState>().speech_worker.lock().take();
-}
-
-fn run_transcription_pipeline(app: AppHandle, path: std::path::PathBuf, recording_id: String) {
-    if processing_cancelled(&app, &recording_id) { finish_processing(&app, &recording_id); return; }
-    app.state::<RuntimeState>().db().set_processing_status(&recording_id, "transcribing", None).ok();
-    let _ = emit_snapshot(&app);
-    let result = transcribe_with_worker(&app, &path, &recording_id);
-    if processing_cancelled(&app, &recording_id) { finish_processing(&app, &recording_id); return; }
-    match result {
-        Ok(segments) => {
-            let text = segments.iter().map(|s| format!("{}: {}", s.speaker, s.text)).collect::<Vec<_>>().join("\n");
-            let raw = segments.iter().map(|s| s.text.clone()).collect::<Vec<_>>().join("\n");
-            if app.state::<RuntimeState>().db().complete_transcription(&recording_id, &raw, &text, &segments).is_ok() && !processing_cancelled(&app, &recording_id) {
-                spawn_recording_summary(&app, &recording_id);
-            }
-        }
-        Err(error) => {
-            if !processing_cancelled(&app, &recording_id) { let _ = app.state::<RuntimeState>().db().fail_recording(&recording_id, &error.to_string()); }
-        }
-    }
-    finish_processing(&app, &recording_id);
-    let _ = emit_snapshot(&app);
 }
 
 fn spawn_recording_summary(app: &AppHandle, recording_id: &str) {
@@ -783,7 +780,9 @@ fn clear_all_data(app: AppHandle) -> Result<Snapshot, String> {
     if app.state::<RuntimeState>().native_recording.lock().is_some() || app.state::<RuntimeState>().db().snapshot().map_err(err)?.recordings.iter().any(|recording| recording.status == "recording") {
         return Err("录音进行中，无法清除数据".into());
     }
+    let audio_paths: Vec<String> = app.state::<RuntimeState>().db().snapshot().map_err(err)?.recordings.iter().filter_map(|r| r.audio_path.clone()).collect();
     app.state::<RuntimeState>().db().clear_all_data().map_err(err)?;
+    for path in audio_paths { let _ = std::fs::remove_file(&path); }
     let settings = app.state::<RuntimeState>().db().settings().map_err(err)?;
     if settings.autostart { app.autolaunch().enable().map_err(|error| format!("无法恢复开机启动：{error}"))?; }
     emit_snapshot(&app).map_err(err)
@@ -1185,11 +1184,10 @@ fn stop_native_recording(app: AppHandle) -> Result<Snapshot, String> {
         recording.stop().map_err(err)?;
     }
     let duration = recording.started.elapsed().as_secs_f64();
-    app.state::<RuntimeState>().db().finish_recording(&recording.id, duration, &recording.path.to_string_lossy()).map_err(err)?;
+    let audio_path = compress_wav_to_flac(recording.path.as_path());
+    app.state::<RuntimeState>().db().finish_recording(&recording.id, duration, &audio_path.to_string_lossy()).map_err(err)?;
     emit_snapshot(&app).map_err(err)?;
-    begin_processing(&app, &recording.id);
-    let background_app = app.clone();
-    std::thread::spawn(move || run_transcription_pipeline(background_app, recording.path, recording.id));
+    app.state::<RuntimeState>().transcription_queue(&app).enqueue(recording.id.clone(), audio_path).map_err(err)?;
     snapshot(&app).map_err(err)
 }
 
@@ -1222,11 +1220,10 @@ fn finish_recording(app: AppHandle, recording_id: String, audio: Vec<u8>, durati
     std::fs::create_dir_all(&recordings_dir).map_err(err)?;
     let path = recordings_dir.join(format!("{recording_id}.wav"));
     std::fs::write(&path, audio).map_err(err)?;
-    app.state::<RuntimeState>().db().finish_recording(&recording_id, duration, &path.to_string_lossy()).map_err(err)?;
+    let audio_path = compress_wav_to_flac(&path);
+    app.state::<RuntimeState>().db().finish_recording(&recording_id, duration, &audio_path.to_string_lossy()).map_err(err)?;
     emit_snapshot(&app).map_err(err)?;
-    begin_processing(&app, &recording_id);
-    let background_app = app.clone();
-    std::thread::spawn(move || run_transcription_pipeline(background_app, path, recording_id));
+    app.state::<RuntimeState>().transcription_queue(&app).enqueue(recording_id, audio_path).map_err(err)?;
     snapshot(&app).map_err(err)
 }
 
@@ -1238,9 +1235,11 @@ fn fail_recording(app: AppHandle, recording_id: String, message: String) -> Resu
 
 #[tauri::command]
 fn delete_recording(app: AppHandle, recording_id: String) -> Result<Snapshot, String> {
-    cancel_processing(&app, &recording_id);
-    let path = app.path().app_data_dir().map_err(err)?.join("recordings").join(format!("{recording_id}.wav"));
-    let _ = std::fs::remove_file(path);
+    app.state::<RuntimeState>().transcription_queue(&app).cancel(&recording_id);
+    let recording = snapshot(&app).map_err(err)?.recordings.into_iter().find(|item| item.id == recording_id);
+    if let Some(path) = recording.and_then(|r| r.audio_path) {
+        let _ = std::fs::remove_file(&path);
+    }
     app.state::<RuntimeState>().db().delete_recording(&recording_id).map_err(err)?;
     emit_snapshot(&app).map_err(err)
 }
@@ -1250,10 +1249,20 @@ fn retry_transcription(app: AppHandle, recording_id: String) -> Result<Snapshot,
     let recording = snapshot(&app).map_err(err)?.recordings.into_iter().find(|item| item.id == recording_id).ok_or("录音记录不存在")?;
     let path = recording.audio_path.map(std::path::PathBuf::from).ok_or("录音文件不存在")?;
     app.state::<RuntimeState>().db().finish_recording(&recording_id, recording.duration, &path.to_string_lossy()).map_err(err)?;
-    begin_processing(&app, &recording_id);
-    let background_app = app.clone();
-    std::thread::spawn(move || run_transcription_pipeline(background_app, path, recording_id));
+    app.state::<RuntimeState>().transcription_queue(&app).enqueue(recording_id, path).map_err(err)?;
     emit_snapshot(&app).map_err(err)
+}
+
+#[tauri::command]
+fn transcription_queue_len(app: AppHandle) -> Result<usize, String> {
+    Ok(app.state::<RuntimeState>().transcription_queue(&app).queue_len())
+}
+
+#[tauri::command]
+fn release_speech_worker(app: AppHandle) -> Result<(), String> {
+    app.state::<RuntimeState>().transcription_queue(&app).release_worker();
+    app.state::<RuntimeState>().release_ocr_worker();
+    Ok(())
 }
 
 #[tauri::command]
@@ -1530,6 +1539,8 @@ pub fn run() {
             get_recording_detail,
             recording_audio_data,
             retry_transcription,
+            transcription_queue_len,
+            release_speech_worker,
             export_data,
             import_data,
             toggle_quick_panel,
@@ -1549,7 +1560,17 @@ pub fn run() {
     let app = builder
         .build(context)
         .expect("failed to build RedKey");
-    app.run(|_app, event| if matches!(event, RunEvent::ExitRequested { .. }) {});
+    app.run(|app, event| {
+        if matches!(event, RunEvent::ExitRequested { .. }) {
+            // 退出前停止正在进行的录音，确保 WAV 正常收尾
+            if let Some(mut recording) = app.state::<RuntimeState>().native_recording.lock().take() {
+                let _ = recording.stop();
+            }
+            // 优雅关闭 SpeechWorker/OCR worker，触发子进程 shutdown 而非被系统强制终止
+            app.state::<RuntimeState>().transcription_queue(app.app_handle()).release_worker();
+            app.state::<RuntimeState>().release_ocr_worker();
+        }
+    });
 }
 
 #[cfg(test)]

@@ -6,7 +6,7 @@ import {
   FileImage, FileText, KeyRound, Link2, ListTodo, LoaderCircle, Mic, MicOff, Pause, Pencil, Play,
   Plus, RefreshCw, RotateCcw, Settings as SettingsIcon, Sparkles, Trash2, UserRound, X,
 } from "lucide-react";
-import { api, onAsrModelDownloadProgress, onLinkDrop, onNewTask, onPetMode, onQuickPanelShown, onRecordingToggle, onTaskHud } from "./api";
+import { api, inTauri, onAsrModelDownloadProgress, onLinkDrop, onNewTask, onPetMode, onQuickPanelShown, onRecordingToggle, onTaskHud } from "./api";
 import { extractHttpUrl, petState, slotLabel } from "./domain";
 import type {
   AsrModelStatus, DeepSeekSettings, ImageCard, Recording, RecordingDetail, RecordingSummary, Settings,
@@ -43,6 +43,7 @@ function ConsoleApp() {
   const [recordingElapsed, setRecordingElapsed] = useState(0);
   const [recordingLevel, setRecordingLevel] = useState(0);
   const [isRecording, setIsRecording] = useState(false);
+  const [queueLen, setQueueLen] = useState(0);
   const clockRef = useRef<number | null>(null);
 
   const activeTasks = useMemo(() => sortRecent(snapshot?.tasks.filter((task) => task.status === "active" && task.group === "red") ?? []), [snapshot]);
@@ -78,6 +79,17 @@ function ConsoleApp() {
   }, [selectedTask?.id, selectedTask?.status]);
 
   useEffect(() => () => { stopClock(); }, []);
+
+  useEffect(() => {
+    let active = true;
+    const tick = async () => {
+      if (!active || !inTauri()) return;
+      try { setQueueLen(await api.transcriptionQueueLen()); } catch { setQueueLen(0); }
+    };
+    tick();
+    const timer = window.setInterval(tick, 2000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, []);
 
   function notify(message: string) {
     setNotice(message);
@@ -188,6 +200,7 @@ function ConsoleApp() {
     </main>
     {creating && <CreateTaskDialog snapshot={snapshot} setSnapshot={setSnapshot} initialUrl={prefillUrl} initialSlot={prefillSlot} onClose={() => { setCreating(false); setPrefillSlot(null); }} onCreated={(next) => { setSnapshot(next); setCreating(false); setPrefillUrl(""); setPrefillSlot(null); setView("active"); setSelectedId(next.currentTaskId); }} notify={notify} />}
     {overflowTasks.length > 10 && <TaskOverflowDialog tasks={overflowTasks} onResolved={(next) => { setSnapshot(next); setView("active"); setSelectedId(next.currentTaskId); }} notify={notify} />}
+    {queueLen > 0 && <div className="toast queue-toast">转写排队中：{queueLen} 个录音</div>}
     {notice && <div className="toast">{notice}</div>}
   </div>;
 }
@@ -934,6 +947,7 @@ function SpeakerTranscript({ detail, fallback }: { detail: RecordingDetail | nul
 
 function displayRecordingStatus(recording: Recording, summary: RecordingSummary | null) {
   if (recording.status === "error" || recording.processingStatus.includes("error")) return { label: "处理失败", tone: "error", loading: false };
+  if (recording.processingStatus === "queued") return { label: "排队中", tone: "muted", loading: true };
   if (recording.processingStatus === "transcribing") return { label: "转写中", tone: "working", loading: true };
   if (summary?.status === "summarizing") return { label: "梳理中", tone: "working", loading: true };
   if (summary?.status === "error") return { label: "梳理失败", tone: "error", loading: false };
@@ -1035,7 +1049,7 @@ function TaskOverflowDialog({ tasks, onResolved, notify }: { tasks: Task[]; onRe
 }
 
 function SettingsView({ snapshot, setSnapshot, notify }: { snapshot: Snapshot; setSnapshot: (value: Snapshot) => void; notify: (message: string) => void }) {
-  return <div className="settings-page"><header><small>偏好</small><h1>设置</h1></header><section className="settings-section"><h2>通用</h2><SettingToggle label="开机启动" description="登录后自动启动" checked={snapshot.settings.autostart} onChange={(value) => void api.setAutostart(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><SettingToggle label="宠物悬浮窗" description="桌面悬浮按键与任务列表" checked={snapshot.settings.petVisible} onChange={(value) => void api.setPetVisible(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><SettingToggle label="使用云端API" description="关闭后点击AI总结入口会复制prompt到剪贴板" checked={snapshot.settings.cloudApiEnabled} onChange={(value) => void api.updateSettings({ ...snapshot.settings, cloudApiEnabled: value }).then(setSnapshot).catch((reason) => notify(String(reason)))} /><ShortcutPrefix value={snapshot.settings.shortcuts.taskPrefix} onSaved={setSnapshot} notify={notify} /></section><DeepSeekPanel notify={notify} /><LocalModels /><SnapshotTools setSnapshot={setSnapshot} notify={notify} /></div>;
+  return <div className="settings-page"><header><small>偏好</small><h1>设置</h1></header><section className="settings-section"><h2>通用</h2><SettingToggle label="开机启动" description="登录后自动启动" checked={snapshot.settings.autostart} onChange={(value) => void api.setAutostart(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><SettingToggle label="宠物悬浮窗" description="桌面悬浮按键与任务列表" checked={snapshot.settings.petVisible} onChange={(value) => void api.setPetVisible(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><SettingToggle label="使用云端API" description="关闭后点击AI总结入口会复制prompt到剪贴板" checked={snapshot.settings.cloudApiEnabled} onChange={(value) => void api.updateSettings({ ...snapshot.settings, cloudApiEnabled: value }).then(setSnapshot).catch((reason) => notify(String(reason)))} /><ShortcutPrefix value={snapshot.settings.shortcuts.taskPrefix} onSaved={setSnapshot} notify={notify} /></section><DeepSeekPanel notify={notify} /><LocalModels notify={notify} /><SnapshotTools setSnapshot={setSnapshot} notify={notify} /></div>;
 }
 
 function ShortcutPrefix({ value, onSaved, notify }: { value: string; onSaved: (value: Snapshot) => void; notify: (message: string) => void }) {
@@ -1083,9 +1097,17 @@ function DeepSeekPanel({ notify }: { notify: (message: string) => void }) {
   return <section className="settings-section"><div className="section-heading"><div><h2>云端 AI</h2><p>录音完成后自动梳理结论和待办。</p></div><span className={`status-badge ${settings?.configured ? "success" : "warning"}`}>{settings?.configured ? "已配置" : "未配置"}</span></div><div className="api-row"><KeyRound /><div><strong>DeepSeek</strong><small>{settings?.model ?? "deepseek-v4-flash"}</small></div><input type="password" value={key} placeholder={settings?.configured ? "输入新 Key 替换" : "sk-..."} onChange={(event) => setKey(event.target.value)} /><button className="primary" disabled={!key.trim() || busy} onClick={() => void save()}>保存</button>{settings?.configured && <button disabled={busy} onClick={() => void test()}>测试</button>}{settings?.configured && <IconButton danger label="删除 API Key" onClick={() => void api.deleteDeepSeekApiKey().then(setSettings).then(() => notify("API Key 已删除")).catch((reason) => notify(String(reason)))}><Trash2 /></IconButton>}</div></section>;
 }
 
-function LocalModels() {
+function LocalModels({ notify }: { notify: (message: string) => void }) {
   const [models, setModels] = useState<AsrModelStatus[]>([]);
   const [loading, setLoading] = useState(false);
+  const [releasing, setReleasing] = useState(false);
+
+  async function releaseModels() {
+    setReleasing(true);
+    try { await api.releaseSpeechWorker(); notify("已释放语音/OCR 模型内存"); }
+    catch (reason) { notify(String(reason)); }
+    finally { setReleasing(false); }
+  }
 
   async function refresh() {
     setLoading(true);
@@ -1129,9 +1151,14 @@ function LocalModels() {
           <h2>本地模型</h2>
           <p>FunASR 大模型首次使用前需下载，小模型与 OCR 已内置。</p>
         </div>
-        <button className="icon-button" title="刷新状态" onClick={() => void refresh()} disabled={loading}>
-          <RefreshCw className={loading ? "spin" : ""} />
-        </button>
+        <div className="section-actions">
+          <button className="icon-button" title="释放模型内存" onClick={() => void releaseModels()} disabled={releasing}>
+            {releasing ? <LoaderCircle className="spin" /> : <X />}
+          </button>
+          <button className="icon-button" title="刷新状态" onClick={() => void refresh()} disabled={loading}>
+            <RefreshCw className={loading ? "spin" : ""} />
+          </button>
+        </div>
       </div>
       {models.map((model) => (
         <div className="model-row" key={model.id}>

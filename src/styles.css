@@ -383,8 +383,6 @@ select:focus-visible {
 .document-shell {
   display: flex;
   flex-direction: column;
-  height: calc(100% - 86px);
-  overflow-y: auto;
 }
 
 .document-toolbar {

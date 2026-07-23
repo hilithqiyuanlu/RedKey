@@ -212,6 +212,10 @@ impl Database {
             "UPDATE recordings SET status='error', processing_status='error', error_message='应用退出前录音未正常结束，原录音未保存', processing_error='应用退出前录音未正常结束', updated_at=?1 WHERE status='recording'",
             [now()],
         )?;
+        self.conn.execute(
+            "UPDATE recordings SET status='error', processing_status='error', error_message='应用退出前转写未完成，请重试', processing_error='应用退出前转写被中断', updated_at=?1 WHERE processing_status IN ('transcribing','queued')",
+            [now()],
+        )?;
         Ok(())
     }
 
@@ -411,7 +415,7 @@ impl Database {
 
     pub fn finish_recording(&self, id: &str, duration: f64, audio_path: &str) -> Result<()> {
         let changed = self.conn.execute(
-            "UPDATE recordings SET duration=?2,status='transcribing',processing_status='transcribing',audio_path=?3,error_message=NULL,updated_at=?4 WHERE id=?1",
+            "UPDATE recordings SET duration=?2,status='completed',processing_status='queued',audio_path=?3,error_message=NULL,updated_at=?4 WHERE id=?1",
             params![id, duration.max(0.0), audio_path, now()],
         )?;
         anyhow::ensure!(changed == 1, "录音记录不存在");

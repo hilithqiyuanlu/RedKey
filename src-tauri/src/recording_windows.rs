@@ -27,6 +27,14 @@ pub struct NativeRecording {
     level: Arc<parking_lot::Mutex<f32>>,
 }
 
+impl Drop for NativeRecording {
+    fn drop(&mut self) {
+        if let Err(e) = self.stop() {
+            eprintln!("NativeRecording 析构时停止录音失败: {e}");
+        }
+    }
+}
+
 impl NativeRecording {
     pub fn level(&self) -> f32 {
         *self.level.lock()

@@ -153,6 +153,13 @@ pub fn perform_ocr(app: AppHandle, image_path: String) -> Result<String, String>
     if !path.exists() {
         return Err("图片文件不存在".into());
     }
-    let mut worker = OcrWorker::start(&app).map_err(|e| e.to_string())?;
-    worker.ocr(&path).map_err(|e| e.to_string())
+    let state = app.state::<crate::RuntimeState>();
+    let result = {
+        let mut worker = state.ocr_worker(&app).map_err(|e| e.to_string())?;
+        worker.ocr(&path)
+    };
+    if result.is_err() {
+        state.release_ocr_worker();
+    }
+    result.map_err(|e| e.to_string())
 }
