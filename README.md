@@ -115,11 +115,8 @@ npm run tauri build -- --bundles nsis
 │   │   └── ocr.rs          # OCR 图片识别 (RapidOCR worker 管理)
 │   └── tauri.conf.json     # Tauri 配置（窗口、打包、权限）
 ├── workers/                # Python 语音与图像 worker
-│   ├── qwen_asr_worker.py          # SenseVoice 实时转写
-│   ├── diarization_worker.py       # 3D-Speaker 发言人分离
+│   ├── funasr_asr_worker.py        # SenseVoice 实时转写 + CAM++ 发言人分离
 │   └── ocr_worker.py               # RapidOCR 图片文字识别
-└── docs/
-    └── MEETING_COPILOT_ARCHITECTURE.md  # 录音与会议副驾架构设计
 ```
 
 ### 窗口说明

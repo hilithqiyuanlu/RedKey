@@ -67,6 +67,15 @@ impl Default for RuntimeState {
 }
 
 impl RuntimeState {
+    fn with_db(database: Database) -> Self {
+        Self {
+            db: Mutex::new(Some(database)),
+            ..Default::default()
+        }
+    }
+}
+
+impl RuntimeState {
     fn db(&self) -> parking_lot::MappedMutexGuard<'_, Database> {
         let mut guard = self.db.lock();
         if guard.is_none() {
@@ -1387,8 +1396,25 @@ fn humanize_title(value: &str) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let context = tauri::generate_context!();
+    let data_dir = dirs::data_local_dir()
+        .or_else(dirs::data_dir)
+        .unwrap_or_else(|| std::env::temp_dir())
+        .join(context.config().identifier.clone());
+    let database = match Database::open(&data_dir.join("redkey.sqlite3")) {
+        Ok(db) => {
+            eprintln!("Database opened successfully from {:?}", data_dir.join("redkey.sqlite3"));
+            db
+        }
+        Err(e) => {
+            eprintln!("Failed to open database: {e}");
+            Database::memory()
+                .context("无法创建内存数据库")
+                .expect("failed to create memory database")
+        }
+    };
     let builder = tauri::Builder::default()
-        .manage(RuntimeState::default())
+        .manage(RuntimeState::with_db(database))
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             let _ = show_console_window(app);
         }))
@@ -1406,20 +1432,8 @@ pub fn run() {
             tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec!["--background"]))
         })
         .setup(|app| {
-            let data_dir = app.path().app_data_dir().context("无法获取应用数据目录")?;
-            let database = match Database::open(&data_dir.join("redkey.sqlite3")) {
-                Ok(db) => {
-                    eprintln!("Database opened successfully from {:?}", data_dir.join("redkey.sqlite3"));
-                    db
-                }
-                Err(e) => {
-                    eprintln!("Failed to open database: {e}");
-                    Database::memory().context("无法创建内存数据库")?
-                }
-            };
-            let settings = database.settings().unwrap_or_default();
+            let settings = app.state::<RuntimeState>().db().settings().unwrap_or_default();
             if settings.autostart { let _ = app.autolaunch().enable(); }
-            *app.state::<RuntimeState>().db.lock() = Some(database);
             eprintln!("Database initialized, emitting snapshot");
             let _ = emit_snapshot(app.handle());
             eprintln!("Snapshot emitted successfully");
@@ -1533,7 +1547,7 @@ pub fn run() {
         ]);
 
     let app = builder
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("failed to build RedKey");
     app.run(|_app, event| if matches!(event, RunEvent::ExitRequested { .. }) {});
 }

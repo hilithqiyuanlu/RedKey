@@ -381,14 +381,17 @@ select:focus-visible {
    ---------------------------------------------------------- */
 
 .document-shell {
-  display: grid;
-  grid-template-rows: 58px minmax(0, 1fr);
+  display: flex;
+  flex-direction: column;
   height: calc(100% - 86px);
+  overflow-y: auto;
 }
 
 .document-toolbar {
-  position: relative;
+  position: sticky;
+  top: 0;
   z-index: 6;
+  flex-shrink: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;
@@ -471,10 +474,10 @@ select:focus-visible {
 
 .document-page {
   width: 100%;
+  flex-shrink: 0;
   min-height: 0;
   margin: 18px 0 0;
   padding: 20px 0 72px;
-  overflow-y: auto;
   border: 0;
   background: transparent;
   box-shadow: none;
@@ -1149,6 +1152,7 @@ select:focus-visible {
   opacity: 0.4;
 }
 .audio-seek-fill {
+  display: block;
   height: 100%;
   background: var(--accent);
 }

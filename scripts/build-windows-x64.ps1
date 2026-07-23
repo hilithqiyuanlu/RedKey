@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path | Join-Path -ChildPath ".."
@@ -42,7 +42,7 @@ $pythonExe = Join-Path $pythonEmbedDir "python/python.exe"
 if (-not (Test-Path $pythonExe -PathType Leaf)) {
     Info "下载 Windows 便携 Python..."
     New-Item -ItemType Directory -Force -Path $pythonEmbedDir | Out-Null
-    $url = "https://github.com/astral-sh/python-build-standalone/releases/download/20250808/cpython-3.11.13%2B20250808-x86_64-pc-windows-msvc-install_only_stripped.tar.gz"
+    $url = "https://github.com/astral-sh/python-build-standalone/releases/download/20250808/cpython-3.11.13%2B20250808-x86_64-pc-windows-msvc-install_only.tar.gz"
     $tar = Join-Path $env:TEMP "cpython-3.11.13-windows.tar.gz"
     Invoke-WebRequest -Uri $url -OutFile $tar -UseBasicParsing
     Info "解压便携 Python..."

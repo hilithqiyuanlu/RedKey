@@ -62,7 +62,12 @@ fn find_input_device() -> Result<cpal::Device> {
 fn compute_rms(samples: &[i16]) -> f32 {
     if samples.is_empty() { return 0.0; }
     let sum: f64 = samples.iter().map(|&s| (s as f64).powi(2)).sum();
-    (sum / samples.len() as f64).sqrt() as f32 / i16::MAX as f32
+    let rms = (sum / samples.len() as f64).sqrt() as f32 / i16::MAX as f32;
+    // Convert linear RMS to dB-scaled level for visual meter display.
+    // Typical speech ranges from -40dB to -12dB; map -60dB..0dB to 0.0..1.0.
+    if rms < 1e-6 { return 0.0; }
+    let db = 20.0 * rms.log10();
+    ((db + 60.0) / 60.0).clamp(0.0, 1.0)
 }
 
 pub fn start_recording(id: String, path: PathBuf) -> Result<NativeRecording> {

@@ -8,7 +8,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}},
+    sync::{Arc, LazyLock, Mutex, atomic::{AtomicBool, Ordering}},
     time::Duration,
 };
 use tauri::{AppHandle, Emitter, Manager};
@@ -77,11 +77,22 @@ fn find_python() -> Result<PathBuf> {
     bail!("未找到 Python 3.10~3.12，请安装 Python 3.11")
 }
 
+fn python_has_venv(python: &Path) -> bool {
+    no_window(Command::new(python).args(["-c", "import venv"]))
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
 fn bootstrap_python(app: &AppHandle) -> Result<PathBuf> {
     if cfg!(windows) {
-        let bundled = app.path().resource_dir()?.join("python-embed/python/python.exe");
-        if bundled.exists() {
-            return Ok(bundled);
+        let resource_dir = app.path().resource_dir()?;
+        for bundled in [
+            resource_dir.join("python-embed/python/python.exe"),
+            resource_dir.join("python-embed/python.exe"),
+        ] {
+            if bundled.exists() && python_has_venv(&bundled) {
+                return Ok(bundled);
+            }
         }
     }
     find_python()
@@ -91,11 +102,15 @@ fn run_command(
     command: &mut Command,
     error_msg: &str,
 ) -> Result<()> {
-    let status = no_window(command)
-        .status()
+    let output = no_window(command)
+        .output()
         .with_context(|| format!("{error_msg}（无法启动进程）"))?;
-    if !status.success() {
-        bail!("{error_msg}（退出码 {:?}）", status.code())
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let details = if stderr.is_empty() { stdout } else { stderr };
+        let details = if details.is_empty() { "无输出".into() } else { details };
+        bail!("{error_msg}（退出码 {:?}）：{details}", output.status.code())
     }
     Ok(())
 }
@@ -175,7 +190,7 @@ pub fn status(app: &AppHandle, id: &str) -> Result<ModelStatus> {
     bail!("未知模型：{id}")
 }
 
-static DOWNLOADING: Mutex<HashMap<String, Arc<AtomicBool>>> = Mutex::new(HashMap::new());
+static DOWNLOADING: LazyLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn model_dir_and_marker(app: &AppHandle, id: &str) -> Result<(PathBuf, &'static str)> {
     let bundled = bundled_models_dir(app)?;
@@ -260,7 +275,7 @@ async fn download_and_extract(app: &AppHandle, id: &str, url: &str) -> Result<()
 
     let _ = app.emit(
         "redkey://model-download-progress",
-        json!({"id": id, "progress": 0, "stage": "连接中", "error": null::<String>}),
+        json!({"id": id, "progress": 0, "stage": "连接中", "error": null}),
     );
 
     let client = reqwest::Client::new();
@@ -284,7 +299,7 @@ async fn download_and_extract(app: &AppHandle, id: &str, url: &str) -> Result<()
         let progress = if total > 0 { (downloaded * 100 / total) as u8 } else { 0 };
         let _ = app.emit(
             "redkey://model-download-progress",
-            json!({"id": id, "progress": progress, "stage": "下载中", "error": null::<String>}),
+            json!({"id": id, "progress": progress, "stage": "下载中", "error": null}),
         );
     }
     file.flush().await.context("刷新临时文件失败")?;
@@ -293,7 +308,7 @@ async fn download_and_extract(app: &AppHandle, id: &str, url: &str) -> Result<()
 
     let _ = app.emit(
         "redkey://model-download-progress",
-        json!({"id": id, "progress": 100, "stage": "解压中", "error": null::<String>}),
+        json!({"id": id, "progress": 100, "stage": "解压中", "error": null}),
     );
     extract_zip(&final_zip, &data_dir).await.context("解压模型失败")?;
     fs::remove_file(&final_zip).context("删除 zip 失败")?;
@@ -313,14 +328,14 @@ pub async fn download_asr_model(app: AppHandle, id: String) -> Result<(), String
 
     let _ = app.emit(
         "redkey://model-download-progress",
-        json!({"id": &id, "progress": 0, "stage": "准备中", "error": null::<String>}),
+        json!({"id": &id, "progress": 0, "stage": "准备中", "error": null}),
     );
 
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
         let result = download_and_extract(&app2, &id, url).await;
         DOWNLOADING.lock().unwrap().remove(&id);
-        let (progress, stage, error) = match result {
+        let (progress, stage, error): (u8, String, Option<String>) = match result {
             Ok(()) => (100u8, "已就绪".into(), None),
             Err(e) => (0u8, "下载失败".into(), Some(e.to_string())),
         };

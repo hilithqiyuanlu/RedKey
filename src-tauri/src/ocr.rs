@@ -1,4 +1,5 @@
 use crate::no_window;
+use crate::speech::ensure_runtime;
 use anyhow::{bail, Context, Result};
 use serde_json::json;
 use std::{
@@ -29,6 +30,7 @@ pub struct OcrWorker {
 
 impl OcrWorker {
     pub fn start(app: &AppHandle) -> Result<Self> {
+        ensure_runtime(app)?;
         let runtime = app
             .path()
             .app_data_dir()

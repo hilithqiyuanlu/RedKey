@@ -15,7 +15,6 @@ import type {
 import { useSnapshot } from "./useSnapshot";
 
 type View = "active" | "completed" | "settings";
-type RecorderHandle = { stop: () => Promise<Uint8Array>; snapshot: () => Uint8Array };
 
 function windowView() { return new URLSearchParams(window.location.search).get("view") ?? "console"; }
 function initialView(): View { return windowView() === "settings" ? "settings" : "active"; }
@@ -38,7 +37,6 @@ function ConsoleApp() {
   const [notice, setNotice] = useState("");
   const [documentVersion, setDocumentVersion] = useState(0);
   const noticeTimer = useRef<number | null>(null);
-  const recorderRef = useRef<RecorderHandle | null>(null);
   const recordingIdRef = useRef<string | null>(null);
   const recordingStartedRef = useRef(0);
   const nativeRecordingRef = useRef(false);
@@ -79,7 +77,7 @@ function ConsoleApp() {
     return () => cleanup?.();
   }, [selectedTask?.id, selectedTask?.status]);
 
-  useEffect(() => () => { void recorderRef.current?.stop(); stopClock(); }, []);
+  useEffect(() => () => { stopClock(); }, []);
 
   function notify(message: string) {
     setNotice(message);
@@ -115,16 +113,6 @@ function ConsoleApp() {
       try { setSnapshot(await api.stopNativeRecording()); notify("录音已保存，正在处理"); }
       catch (reason) { notify(String(reason)); }
       nativeRecordingRef.current = false; recordingIdRef.current = null; setDocumentVersion((value) => value + 1); return;
-    }
-    if (recorderRef.current) {
-      const recorder = recorderRef.current; recorderRef.current = null; stopClock();
-      setIsRecording(false);
-      try {
-        const bytes = await recorder.stop();
-        if (recordingIdRef.current) setSnapshot(await api.finishRecording(recordingIdRef.current, bytes, (Date.now() - recordingStartedRef.current) / 1000));
-        notify("录音已保存，正在处理");
-      } catch (reason) { notify(String(reason)); }
-      recordingIdRef.current = null; setDocumentVersion((value) => value + 1); return;
     }
     try {
       if (taskId) setSnapshot(await api.setCurrentTask(taskId, false));
@@ -304,7 +292,11 @@ function SlotNavBar({ tasks, currentId, onSelect, onEmptySlot, onDropCard, onSwa
         draggable={Boolean(task)}
         onDragStart={(event) => { if (!task) { event.preventDefault(); return; } dragSlot.current = index; event.dataTransfer.setData("application/redkey-slot", String(index)); event.dataTransfer.effectAllowed = "move"; }}
         onDragEnd={() => { dragSlot.current = null; }}
-        onDragOver={(event) => { event.preventDefault(); setDragOverSlot(index); }}
+        onDragOver={(event) => {
+          event.preventDefault();
+          event.dataTransfer.dropEffect = "move";
+          setDragOverSlot(index);
+        }}
         onDragLeave={() => setDragOverSlot((current) => current === index ? null : current)}
         onDrop={(event) => {
           event.preventDefault();
@@ -333,7 +325,6 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
   const readOnly = task.status === "completed";
   const [editingTitle, setEditingTitle] = useState(false);
   const [title, setTitle] = useState(task.title);
-  const [contactOpen, setContactOpen] = useState(false);
   const [linkOpen, setLinkOpen] = useState(false);
   const [editingCardId, setEditingCardId] = useState<string | null>(null);
   const [confirmDeleteTask, setConfirmDeleteTask] = useState(false);
@@ -358,13 +349,13 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
       updatedAt: new Date().toISOString(),
     } : null;
     return [
-      ...optimisticCards.text.filter((c) => !deletedCardIds.has(c.id)).map((card) => ({ type: "text" as const, createdAt: card.createdAt, card })),
-      ...optimisticCards.image.filter((c) => !deletedCardIds.has(c.id)).map((card) => ({ type: "image" as const, createdAt: card.createdAt, card })),
-      ...document.textCards.filter((c) => !deletedCardIds.has(c.id)).map((card) => ({ type: "text" as const, createdAt: card.createdAt, card })),
-      ...document.imageCards.filter((c) => !deletedCardIds.has(c.id)).map((card) => ({ type: "image" as const, createdAt: card.createdAt, card })),
-      ...(optimisticRecording ? [{ type: "recording" as const, createdAt: optimisticRecording.createdAt, recording: optimisticRecording, optimistic: true }] : []),
-      ...document.recordings.map((recording) => ({ type: "recording" as const, createdAt: recording.createdAt, recording, optimistic: false })),
-    ].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+      ...optimisticCards.text.filter((c) => !deletedCardIds.has(c.id)).map((card) => ({ type: "text" as const, updatedAt: card.updatedAt, card })),
+      ...optimisticCards.image.filter((c) => !deletedCardIds.has(c.id)).map((card) => ({ type: "image" as const, updatedAt: card.updatedAt, card })),
+      ...document.textCards.filter((c) => !deletedCardIds.has(c.id)).map((card) => ({ type: "text" as const, updatedAt: card.updatedAt, card })),
+      ...document.imageCards.filter((c) => !deletedCardIds.has(c.id)).map((card) => ({ type: "image" as const, updatedAt: card.updatedAt, card })),
+      ...(optimisticRecording ? [{ type: "recording" as const, updatedAt: optimisticRecording.updatedAt, recording: optimisticRecording, optimistic: true }] : []),
+      ...document.recordings.map((recording) => ({ type: "recording" as const, updatedAt: recording.updatedAt, recording, optimistic: false })),
+    ].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }, [document, optimisticCards, deletedCardIds, isRecording]);
   function optimisticDelete(cardId: string) {
     setDeletedCardIds((prev) => new Set(prev).add(cardId));
@@ -375,7 +366,7 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
   const activeRecording = document.recordings.find((recording) => recording.status === "recording") ?? (isRecording && !document.recordings.some((r) => r.status === "recording") ? { status: "recording" } as Recording : null);
 
   useEffect(() => { setTitle(task.title); }, [task.title]);
-  useEffect(() => { setEditingTitle(false); setContactOpen(false); setLinkOpen(false); setOptimisticCards({ text: [], image: [] }); setDeletedCardIds(new Set()); }, [task.id]);
+  useEffect(() => { setEditingTitle(false); setLinkOpen(false); setOptimisticCards({ text: [], image: [] }); setDeletedCardIds(new Set()); }, [task.id]);
   // Sync pet mode: "recording" when actively recording, "edit" when user is editing, "ai-summary" when AI is working, "default" otherwise
   useEffect(() => {
     if (activeRecording) { void api.setPetMode("recording"); return; }
@@ -530,10 +521,13 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
     </header>
     <section className="document-page">
       <div className="document-identity">
-        <div className="contact-control">
-          <button disabled={readOnly} onClick={() => setContactOpen((value) => !value)}><UserRound />{task.contactName || "选择联系人"}<ChevronDown /></button>
-          {contactOpen && <ContactMenu contacts={snapshot.contacts} task={task} setSnapshot={setSnapshot} onClose={() => setContactOpen(false)} notify={notify} />}
-        </div>
+        <ContactPicker
+          contacts={snapshot.contacts}
+          selectedId={task.contactId}
+          onSelect={(contactId) => void api.updateTaskContact(task.id, contactId).then(setSnapshot).catch((reason) => notify(String(reason)))}
+          setSnapshot={setSnapshot}
+          notify={notify}
+        />
         {editingTitle ? <input className="title-input" autoFocus value={title} maxLength={80} onChange={(event) => setTitle(event.target.value)} onBlur={() => void saveTitle()} onKeyDown={(event) => { if (event.key === "Enter") void saveTitle(); if (event.key === "Escape") { setTitle(task.title); setEditingTitle(false); } }} /> : <button className="document-title" disabled={readOnly} onClick={() => setEditingTitle(true)}>{task.title}{!readOnly && <Pencil />}</button>}
       </div>
       <div className="document-rule" />
@@ -597,42 +591,7 @@ function LinkPopover({ task, readOnly, setSnapshot, onClose, notify }: { task: T
   </div>;
 }
 
-function ContactMenu({ contacts, task, setSnapshot, onClose, notify }: { contacts: Snapshot["contacts"]; task: Task; setSnapshot: (value: Snapshot) => void; onClose: () => void; notify: (message: string) => void }) {
-  const [newName, setNewName] = useState("");
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [editName, setEditName] = useState("");
-  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
-  const ref = useRef<HTMLDivElement>(null);
-  useClickOutside(ref, onClose);
-  const select = (contactId: string | null) => void api.updateTaskContact(task.id, contactId).then(setSnapshot).then(onClose).catch((reason) => notify(String(reason)));
-  const commitRename = (id: string) => {
-    const next = editName.trim();
-    if (!next) { setEditingId(null); return; }
-    void api.renameContact(id, next).then(setSnapshot).then(() => setEditingId(null)).catch((reason) => notify(String(reason)));
-  };
-  return <div className="popover contact-popover" ref={ref}>
-    <button type="button" className={!task.contactId ? "selected" : ""} onClick={() => select(null)}>未指定联系人</button>
-    {contacts.map((contact) => <div className="contact-item-row" key={contact.id}>
-      {editingId === contact.id ? <div className="contact-add contact-add-inline">
-        <input autoFocus value={editName} onChange={(event) => setEditName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") commitRename(contact.id); if (event.key === "Escape") setEditingId(null); }} />
-        <button type="button" className="icon-button" disabled={!editName.trim()} onClick={() => commitRename(contact.id)}><Check /></button>
-        <button type="button" className="icon-button" onClick={() => setEditingId(null)}><X /></button>
-      </div>
-      : confirmDeleteId === contact.id ? <div className="contact-confirm-row">
-        <span>删除「{contact.name}」？</span>
-        <button type="button" className="icon-button danger" onClick={() => void api.removeContact(contact.id).then(setSnapshot).then(() => setConfirmDeleteId(null)).catch((reason) => notify(String(reason)))}><Trash2 /></button>
-        <button type="button" className="icon-button" onClick={() => setConfirmDeleteId(null)}><X /></button>
-      </div>
-      : <>
-        <button type="button" className={task.contactId === contact.id ? "selected" : ""} onClick={() => select(contact.id)}>{contact.name}</button>
-        <IconButton label="编辑" onClick={() => { setEditingId(contact.id); setEditName(contact.name); }}><Pencil /></IconButton>
-        <IconButton label="删除" danger onClick={() => setConfirmDeleteId(contact.id)}><Trash2 /></IconButton>
-      </>}
-    </div>)}
-    <div className="contact-add"><input value={newName} placeholder="新增联系人" onChange={(event) => setNewName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && newName.trim()) void api.addContact(newName).then(setSnapshot).then(() => setNewName("")).catch((reason) => notify(String(reason))); }} /><button type="button" disabled={!newName.trim()} onClick={() => void api.addContact(newName).then(setSnapshot).then(() => setNewName("")).catch((reason) => notify(String(reason)))}><Plus /></button></div>
-  </div>;
-}
-function CreateContactMenu({ contacts, selectedId, onSelect, setSnapshot, notify }: { contacts: Snapshot["contacts"]; selectedId: string; onSelect: (id: string) => void; setSnapshot: (value: Snapshot) => void; notify: (message: string) => void }) {
+function ContactPicker({ contacts, selectedId, onSelect, setSnapshot, notify }: { contacts: Snapshot["contacts"]; selectedId: string | null; onSelect: (id: string | null) => void; setSnapshot: (value: Snapshot) => void; notify: (message: string) => void }) {
   const [open, setOpen] = useState(false);
   const [newName, setNewName] = useState("");
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -642,6 +601,7 @@ function CreateContactMenu({ contacts, selectedId, onSelect, setSnapshot, notify
   const popoverRef = useRef<HTMLDivElement>(null);
   const selected = contacts.find((c) => c.id === selectedId);
   useClickOutside(popoverRef, () => { if (open) setOpen(false); }, containerRef);
+  const select = (contactId: string | null) => { onSelect(contactId); setOpen(false); };
   const commitRename = (id: string) => {
     const next = editName.trim();
     if (!next) { setEditingId(null); return; }
@@ -650,7 +610,7 @@ function CreateContactMenu({ contacts, selectedId, onSelect, setSnapshot, notify
   return <div className="contact-control" ref={containerRef}>
     <button type="button" onClick={() => setOpen((value) => !value)}><UserRound />{selected?.name || "选择联系人"}<ChevronDown /></button>
     {open && <div className="popover contact-popover" ref={popoverRef}>
-      <button type="button" className={!selectedId ? "selected" : ""} onClick={() => { onSelect(""); setOpen(false); }}>未指定联系人</button>
+      <button type="button" className={!selectedId ? "selected" : ""} onClick={() => select(null)}>未指定联系人</button>
       {contacts.map((contact) => <div className="contact-item-row" key={contact.id}>
         {editingId === contact.id ? <div className="contact-add contact-add-inline">
           <input autoFocus value={editName} onChange={(event) => setEditName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") commitRename(contact.id); if (event.key === "Escape") setEditingId(null); }} />
@@ -663,7 +623,7 @@ function CreateContactMenu({ contacts, selectedId, onSelect, setSnapshot, notify
           <button type="button" className="icon-button" onClick={() => setConfirmDeleteId(null)}><X /></button>
         </div>
         : <>
-          <button type="button" className={selectedId === contact.id ? "selected" : ""} onClick={() => { onSelect(contact.id); setOpen(false); }}>{contact.name}</button>
+          <button type="button" className={selectedId === contact.id ? "selected" : ""} onClick={() => select(contact.id)}>{contact.name}</button>
           <IconButton label="编辑" onClick={() => { setEditingId(contact.id); setEditName(contact.name); }}><Pencil /></IconButton>
           <IconButton label="删除" danger onClick={() => setConfirmDeleteId(contact.id)}><Trash2 /></IconButton>
         </>}
@@ -1034,7 +994,7 @@ function CreateTaskDialog({ snapshot, setSnapshot, initialUrl, initialSlot, onCl
     <header><strong>新建</strong><IconButton label="关闭" onClick={onClose}><X /></IconButton></header>
     <label>链接<input autoFocus required value={url} disabled={resolving} onPaste={pasteLink} onChange={(event) => setUrl(event.target.value)} placeholder="https://figma.com/..." /></label>
     <label>标题<input required maxLength={80} value={title} onChange={(event) => { setTitle(event.target.value); setSourceTitle(null); }} placeholder={resolving ? "正在根据链接生成标题…" : "根据链接自动生成"} /></label>
-    <label>联系人<CreateContactMenu contacts={snapshot.contacts} selectedId={contactId} onSelect={setContactId} setSnapshot={setSnapshot} notify={notify} /></label>
+    <label>联系人<ContactPicker contacts={snapshot.contacts} selectedId={contactId || null} onSelect={(id) => setContactId(id ?? "")} setSnapshot={setSnapshot} notify={notify} /></label>
     <div className="slot-blocks">
       <span className="slot-blocks-label">数字键</span>
       <div className="slot-blocks-grid">
@@ -1340,54 +1300,3 @@ function formatRelative(value: string | null) {
 }
 function formatDuration(seconds: number) { return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`; }
 function formatTimestamp(milliseconds: number) { return formatDuration(Math.floor(milliseconds / 1000)); }
-
-const PARTIAL_WINDOW_SECONDS = 20;
-
-function downsampleToWav(chunks: Float32Array[], sourceSampleRate: number) {
-  const length = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-  const input = new Float32Array(length);
-  let offset = 0;
-  for (const chunk of chunks) { input.set(chunk, offset); offset += chunk.length; }
-  const ratio = sourceSampleRate / 16000;
-  const samples = new Int16Array(Math.floor(input.length / ratio));
-  for (let index = 0; index < samples.length; index++) {
-    const start = Math.floor(index * ratio);
-    const end = Math.min(Math.floor((index + 1) * ratio), input.length);
-    let sum = 0;
-    for (let sourceIndex = start; sourceIndex < end; sourceIndex++) sum += input[sourceIndex];
-    const value = Math.max(-1, Math.min(1, sum / Math.max(1, end - start)));
-    samples[index] = value < 0 ? value * 0x8000 : value * 0x7fff;
-  }
-  return encodeWav(samples, 16000);
-}
-
-async function startPcmRecorder(stream: MediaStream, onLevel: (level: number) => void): Promise<RecorderHandle> {
-  const context = new AudioContext();
-  const source = context.createMediaStreamSource(stream);
-  const processor = context.createScriptProcessor(4096, 1, 1);
-  // Full history is only encoded once, when the recording stops.
-  const chunks: Float32Array[] = [];
-  // Partial transcription only needs a bounded trailing window, so its cost
-  // stays constant instead of growing with the meeting length.
-  const windowChunks: Float32Array[] = [];
-  let windowSamples = 0;
-  const maxWindowSamples = PARTIAL_WINDOW_SECONDS * context.sampleRate;
-  processor.onaudioprocess = (event) => {
-    const input = event.inputBuffer.getChannelData(0);
-    const copy = new Float32Array(input);
-    chunks.push(copy);
-    windowChunks.push(copy);
-    windowSamples += copy.length;
-    while (windowSamples > maxWindowSamples && windowChunks.length > 1) {
-      windowSamples -= windowChunks.shift()!.length;
-    }
-    let sum = 0;
-    for (let index = 0; index < input.length; index++) sum += input[index] * input[index];
-    onLevel(Math.min(1, Math.sqrt(sum / input.length) * 5));
-  };
-  source.connect(processor); processor.connect(context.destination);
-  const snapshot = () => downsampleToWav(windowChunks, context.sampleRate);
-  return { snapshot, stop: async () => { processor.disconnect(); source.disconnect(); stream.getTracks().forEach((track) => track.stop()); const bytes = downsampleToWav(chunks, context.sampleRate); await context.close(); onLevel(0); return bytes; } };
-}
-
-function encodeWav(samples: Int16Array, sampleRate: number) { const buffer = new ArrayBuffer(44 + samples.byteLength); const view = new DataView(buffer); const write = (offset: number, value: string) => Array.from(value).forEach((char, index) => view.setUint8(offset + index, char.charCodeAt(0))); write(0, "RIFF"); view.setUint32(4, 36 + samples.byteLength, true); write(8, "WAVE"); write(12, "fmt "); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true); view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true); write(36, "data"); view.setUint32(40, samples.byteLength, true); new Int16Array(buffer, 44).set(samples); return new Uint8Array(buffer); }

@@ -9,3 +9,15 @@ coverage/
 workers/__pycache__/
 *.py[cod]
 *.pfx
+
+# 本地构建产物与测试安装目录
+.trae/
+installed/
+installed2/
+installed3/
+src-tauri/resources/python-embed/python/
+*.exe
+*.msi
+*.dmg
+*.zip
+tar.gz

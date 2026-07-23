@@ -157,26 +157,53 @@ impl Database {
             std::fs::create_dir_all(parent).context("无法创建 RedKey 数据目录")?;
         }
         let conn = Connection::open(path).context("无法打开 RedKey 数据库")?;
-        Self::initialize(conn)
+        Self::initialize_file(conn)
     }
 
     pub fn memory() -> Result<Self> {
-        Self::initialize(Connection::open_in_memory()?)
+        Self::initialize_memory(Connection::open_in_memory()?)
     }
 
-    fn initialize(conn: Connection) -> Result<Self> {
-        conn.execute_batch(
-            "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
-        )?;
+    fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(MIGRATION_1)?;
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, ?1)",
             [now()],
         )?;
+        Ok(())
+    }
+
+    fn finish_initialization(&self) -> Result<()> {
+        self.ensure_schema_compatibility()?;
+        self.ensure_defaults()?;
+        self.recover_interrupted_recordings()?;
+        Ok(())
+    }
+
+    fn initialize_file(conn: Connection) -> Result<Self> {
+        // WAL 持久化数据库的性能更好；如果该文件系统不支持 WAL（极少见），
+        // 回退到 DELETE 日志模式，保证应用仍能启动。
+        let init_result = conn.execute_batch(
+            "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
+        );
+        if init_result.is_err() {
+            eprintln!("WAL mode unavailable for file database, falling back to DELETE journal mode");
+            conn.execute_batch(
+                "PRAGMA foreign_keys=ON; PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
+            )?;
+        }
+        Self::run_migrations(&conn)?;
         let database = Self { conn };
-        database.ensure_schema_compatibility()?;
-        database.ensure_defaults()?;
-        database.recover_interrupted_recordings()?;
+        database.finish_initialization()?;
+        Ok(database)
+    }
+
+    fn initialize_memory(conn: Connection) -> Result<Self> {
+        // 内存数据库不支持 WAL，直接启用外键与忙等待即可。
+        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
+        Self::run_migrations(&conn)?;
+        let database = Self { conn };
+        database.finish_initialization()?;
         Ok(database)
     }
 
@@ -253,6 +280,7 @@ impl Database {
             ("raw_transcript", "ALTER TABLE recordings ADD COLUMN raw_transcript TEXT NOT NULL DEFAULT ''"),
             ("speaker_segments", "ALTER TABLE recordings ADD COLUMN speaker_segments TEXT NOT NULL DEFAULT '[]'"),
             ("processing_error", "ALTER TABLE recordings ADD COLUMN processing_error TEXT"),
+            ("error_message", "ALTER TABLE recordings ADD COLUMN error_message TEXT"),
             ("updated_at", "ALTER TABLE recordings ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''"),
         ] {
             let exists: bool = self.conn.query_row(
@@ -443,8 +471,8 @@ impl Database {
             anyhow::ensure!(active, "只能切换到进行中的任务");
         }
         let changed = self.conn.execute(
-            "UPDATE recordings SET task_id=?2 WHERE id=?1",
-            params![recording_id, task_id],
+            "UPDATE recordings SET task_id=?2, updated_at=?3 WHERE id=?1",
+            params![recording_id, task_id, now()],
         )?;
         anyhow::ensure!(changed == 1, "录音记录不存在");
         Ok(())
@@ -1664,7 +1692,7 @@ mod tests {
         conn.execute_batch("CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, title_mode TEXT, source_title TEXT, url TEXT NOT NULL, color TEXT, contact_id TEXT, priority INTEGER, pinned INTEGER, archived_at TEXT, manual_order INTEGER NOT NULL, last_opened_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
           INSERT INTO tasks(id,title,title_mode,url,color,priority,pinned,archived_at,manual_order,last_opened_at,created_at,updated_at) VALUES('old','旧任务','title','https://example.com','blue',2,0,'now',0,NULL,'now','now');")
             .unwrap();
-        let db = Database::initialize(conn).unwrap();
+        let db = Database::initialize_memory(conn).unwrap();
         assert!(db.snapshot().unwrap().tasks.is_empty());
         let archived_column: bool = db.conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name='archived_at')", [], |row| row.get(0)).unwrap();
         assert!(!archived_column);
@@ -1717,7 +1745,7 @@ mod tests {
         db.set_processing_status(&recording_id, "transcribing", None).unwrap();
         let detail = db.recording_detail(&recording_id).unwrap();
         assert_eq!(detail.recording.processing_status, "transcribing");
-        assert_eq!(detail.recording.processing_error, None);
+        assert_eq!(detail.recording.error_message, None);
         assert!(detail.segments.is_empty());
     }
 
