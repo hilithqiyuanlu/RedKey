@@ -173,27 +173,30 @@ pub fn ensure_runtime(app: &AppHandle) -> Result<()> {
     }
     fs::create_dir_all(&runtime)?;
 
-    // portable Python may lack pip/ensurepip; bootstrap pip via get-pip.py
-    let has_pip = no_window(Command::new(&python).args(["-m", "pip", "--version"]))
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if !has_pip {
+    // 检查 pip 是否健康（不仅是存在），防止嵌入式 Python 自带的 pip
+    // 因 vendored 模块版本不匹配在 install 时才崩溃
+    let pip_ok = pip_is_healthy(&python);
+    if !pip_ok {
+        eprintln!("pip 不健康或缺失，正在重装...");
+        // 彻底清除可能已损坏的 pip / setuptools / wheel
+        let _ = purge_corrupted_pip(&python);
         let get_pip = runtime.join("get-pip.py");
         download_get_pip(&get_pip)?;
         run_command(
-            Command::new(&python).arg(&get_pip).arg("--no-warn-script-location"),
+            Command::new(&python)
+                .arg(&get_pip)
+                .arg("--no-warn-script-location"),
             "安装 pip 失败",
         )?;
         let _ = fs::remove_file(&get_pip);
+        // 重装后再次确认 pip 健康
+        if !pip_is_healthy(&python) {
+            bail!("重装 pip 后仍然不健康，无法继续安装依赖");
+        }
     }
 
-    // pip 升级可能因嵌入式环境的 resolver bug 失败，降级为警告，不阻塞后续依赖安装
-    if let Err(err) = run_command(
-        Command::new(&python).args(["-m", "pip", "install", "--upgrade", "pip"]),
-        "升级 pip 失败",
-    ) {
-        eprintln!("warn: 升级 pip 失败，继续使用当前版本：{err}");
-    }
+    // 不再执行 pip 自升级：嵌入式 Python 的 pip 自升级容易造成
+    // vendored 模块版本不匹配，get-pip.py 安装的版本已经足够新
     run_command(
         Command::new(&python).args([
             "-m", "pip", "install",
@@ -203,6 +206,53 @@ pub fn ensure_runtime(app: &AppHandle) -> Result<()> {
         "安装 FunASR/OCR 依赖失败",
     )?;
     fs::write(&marker, b"ok")?;
+    Ok(())
+}
+
+/// 检测 pip 是否能正常工作（验证 resolvelib 等关键模块可导入）。
+/// 嵌入式 Python 自带的 pip 可能出现 vendored 模块版本不匹配，导致
+/// `pip install` 时才崩溃。此函数用于提前探测。
+fn pip_is_healthy(python: &Path) -> bool {
+    no_window(Command::new(python).args([
+        "-c",
+        "import pip._vendor.resolvelib.structs; \
+         pip._vendor.resolvelib.structs.RequirementInformation",
+    ]))
+    .output()
+    .is_ok_and(|o| o.status.success())
+}
+
+/// 彻底清除嵌入式 Python 中已损坏的 pip 安装，为重装做准备。
+/// 仅在嵌入式 Python（存在 _pth 配置文件）上执行，避免误删系统 Python 的 pip。
+fn purge_corrupted_pip(python: &Path) -> Result<()> {
+    let exe_dir = python.parent().context("无法定位 Python 安装目录")?;
+    let has_pth = exe_dir.join("python311._pth").exists()
+        || exe_dir.join("python310._pth").exists()
+        || exe_dir.join("python312._pth").exists();
+    if !has_pth {
+        // 系统 Python 不做清理，交给 pip 自身处理
+        return Ok(());
+    }
+    let site_packages = exe_dir.join("Lib").join("site-packages");
+    if let Ok(entries) = fs::read_dir(&site_packages) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("pip")
+                || name_str.starts_with("pip-")
+                || name_str.starts_with("setuptools")
+                || name_str.starts_with("wheel")
+                || name_str.starts_with("_distutils_hack")
+            {
+                let path = entry.path();
+                if path.is_dir() {
+                    let _ = fs::remove_dir_all(&path);
+                } else {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+    }
     Ok(())
 }
 
