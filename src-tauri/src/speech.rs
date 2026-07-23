@@ -42,11 +42,7 @@ fn runtime_dir(app: &AppHandle) -> Result<PathBuf> {
 }
 
 fn python_path(app: &AppHandle) -> Result<PathBuf> {
-    Ok(runtime_dir(app)?.join(if cfg!(windows) {
-        "Scripts/python.exe"
-    } else {
-        "bin/python"
-    }))
+    bootstrap_python(app)
 }
 
 fn worker_path(app: &AppHandle) -> Result<PathBuf> {
@@ -90,14 +86,10 @@ fn bootstrap_python(app: &AppHandle) -> Result<PathBuf> {
             resource_dir.join("python-embed/python/python.exe"),
             resource_dir.join("python-embed/python.exe"),
         ];
-        let bundled_exists = bundled_paths.iter().any(|p| p.exists());
         for bundled in bundled_paths {
-            if bundled.exists() && python_has_venv(&bundled) {
+            if bundled.exists() {
                 return Ok(bundled);
             }
-        }
-        if bundled_exists {
-            bail!("打包的便携 Python 缺少 venv 模块，无法创建运行环境。建议重新安装新版应用；如需临时使用，请先安装 Python 3.10~3.12。");
         }
     }
     find_python()
@@ -121,24 +113,33 @@ fn run_command(
 }
 
 pub fn ensure_runtime(app: &AppHandle) -> Result<()> {
-    let python = python_path(app)?;
-    if python.exists() {
+    let python = bootstrap_python(app)?;
+    let runtime = runtime_dir(app)?;
+    let marker = runtime.join("pip-deps-ready");
+    if marker.exists() {
         return Ok(());
     }
-    let runtime = runtime_dir(app)?;
     if runtime.exists() {
         fs::remove_dir_all(&runtime)?;
     }
     fs::create_dir_all(&runtime)?;
-    let bootstrap = bootstrap_python(app)?;
+
+    // portable Python may lack pip/ensurepip; bootstrap pip via get-pip.py
+    let has_pip = no_window(Command::new(&python).args(["-m", "pip", "--version"]))
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !has_pip {
+        let get_pip = runtime.join("get-pip.py");
+        download_get_pip(&get_pip)?;
+        run_command(
+            Command::new(&python).arg(&get_pip).arg("--no-warn-script-location"),
+            "安装 pip 失败",
+        )?;
+        let _ = fs::remove_file(&get_pip);
+    }
+
     run_command(
-        Command::new(&bootstrap).args(["-m", "venv"]).arg(&runtime),
-        "创建语音运行环境失败",
-    )?;
-    run_command(
-        Command::new(&python).args([
-            "-m", "pip", "install", "--upgrade", "pip",
-        ]),
+        Command::new(&python).args(["-m", "pip", "install", "--upgrade", "pip"]),
         "升级 pip 失败",
     )?;
     run_command(
@@ -149,11 +150,23 @@ pub fn ensure_runtime(app: &AppHandle) -> Result<()> {
         ]),
         "安装 FunASR/OCR 依赖失败",
     )?;
+    fs::write(&marker, b"ok")?;
+    Ok(())
+}
+
+fn download_get_pip(dest: &Path) -> Result<()> {
+    let url = "https://bootstrap.pypa.io/get-pip.py";
+    let response = reqwest::blocking::get(url).context("下载 get-pip.py 失败，请检查网络连接")?;
+    if !response.status().is_success() {
+        bail!("下载 get-pip.py 失败，HTTP {}", response.status());
+    }
+    let bytes = response.bytes().context("读取 get-pip.py 响应失败")?;
+    fs::write(dest, &bytes).context("写入 get-pip.py 失败")?;
     Ok(())
 }
 
 pub fn runtime_ready(app: &AppHandle) -> bool {
-    python_path(app).is_ok_and(|p| p.exists())
+    runtime_dir(app).is_ok_and(|d| d.join("pip-deps-ready").exists())
 }
 
 /// 给前端返回的模型状态。ASR 与 OCR 模型均已内置，这里仅保留 OCR 的下载状态接口兼容。

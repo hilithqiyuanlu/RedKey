@@ -1165,11 +1165,11 @@ function LocalModels({ notify }: { notify: (message: string) => void }) {
           <p>FunASR 大模型首次使用前需下载，小模型与 OCR 已内置。</p>
         </div>
         <div className="section-actions">
-          <button className="icon-button" title="释放模型内存" onClick={() => void releaseModels()} disabled={releasing}>
-            {releasing ? <LoaderCircle className="spin" /> : <X />}
+          <button onClick={() => void releaseModels()} disabled={releasing}>
+            {releasing ? "释放中…" : "释放内存"}
           </button>
-          <button className="icon-button" title="刷新状态" onClick={() => void refresh()} disabled={loading}>
-            <RefreshCw className={loading ? "spin" : ""} />
+          <button onClick={() => void refresh()} disabled={loading}>
+            刷新
           </button>
         </div>
       </div>
