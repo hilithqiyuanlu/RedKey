@@ -12,8 +12,9 @@ RedKey 是一个跨平台的桌面工作台，用键盘快捷键将需求任务�
 | 数据库 | SQLite |
 | 录音 (macOS) | Swift AVFoundation helper |
 | 录音 (Windows) | cpal + hound (WAV) |
+| Python 运行时 | 便携式 embeddable Python（内置模型，免安装） |
 | 全局快捷键 (macOS) | CoreGraphics Event Tap |
-| 全局快捷键 (Windows) | SetWindowsHookExW + WH_KEYBOARD_LL |
+| 全局快捷键 (Windows) | GetAsyncKeyState polling (50Hz) |
 | 实时转写 | SenseVoice-Small (Python worker) |
 | 发言人分离 | 3D-Speaker / CAM++ (Python worker) |
 | OCR 图片识别 | RapidOCR (Python worker) |
@@ -88,8 +89,8 @@ cd src-tauri && cargo test
 # macOS 构建
 npm run tauri build -- --bundles app
 
-# Windows 构建 (NSIS 安装包)
-npm run tauri build -- --bundles nsis
+# Windows 构建 (NSIS 安装包，含便携 Python 和模型)
+.\scripts\build-windows-x64.ps1
 ```
 
 构建产物位于 `src-tauri/target/release/bundle/`。
@@ -112,11 +113,16 @@ npm run tauri build -- --bundles nsis
 │   │   ├── llm.rs          # DeepSeek API 调用
 │   │   ├── keyboard_windows.rs   # Windows 全局键盘钩子
 │   │   ├── recording_windows.rs  # Windows 原生录音 (cpal)
-│   │   └── ocr.rs          # OCR 图片识别 (RapidOCR worker 管理)
+│   │   ├── ocr.rs               # OCR 图片识别 (RapidOCR worker 管理)
+│   │   └── transcription.rs     # 转写文本数据结构与处理
 │   └── tauri.conf.json     # Tauri 配置（窗口、打包、权限）
 ├── workers/                # Python 语音与图像 worker
 │   ├── funasr_asr_worker.py        # SenseVoice 实时转写 + CAM++ 发言人分离
 │   └── ocr_worker.py               # RapidOCR 图片文字识别
+├── scripts/                # 构建脚本
+│   ├── build-windows-x64.ps1       # Windows 构建（含便携 Python 打包）
+│   ├── build-macos-aarch64.sh      # macOS 构建
+│   └── download_python.ps1         # 便携 Python 下载脚本
 ```
 
 ### 窗口说明
