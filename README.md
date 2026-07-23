@@ -56,7 +56,18 @@ RedKey 是一个跨平台的桌面工作台，用键盘快捷键将需求任务�
 - 开机启动
 - Figma URL 自动提取标题
 
+## 安装与使用
+
+下载对应平台的安装包，双击安装即可使用，无需安装任何依赖。
+
+- **Windows**：`AlphaKey_0.1.0_x64-setup.exe`（NSIS 安装包）
+- **macOS**：`AlphaKey.app`（拖入 Applications 文件夹）
+
+首次启动时会自动初始化 Python 运行环境（约 1-2 分钟），后续启动无需等待。语音识别所需的 SenseVoiceSmall 和 CT-Transformer 模型需在设置中首次下载（约 500MB），之后的录音转写全程离线运行。
+
 ## 本地开发
+
+> 以下仅面向开发者，普通用户无需关注。
 
 ### 环境要求
 
