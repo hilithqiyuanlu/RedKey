@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path | Join-Path -ChildPath ".."
@@ -64,10 +64,18 @@ if (-not (Test-Path $runtimeStamp -PathType Leaf)) {
     & $pythonExe -m pip install --disable-pip-version-check --no-input --no-cache-dir -r $requirements
     if ($LASTEXITCODE -ne 0) { ErrorExit "安装固定 Python 依赖失败" }
     & $pythonExe -c "import funasr, torch, torchaudio, modelscope, sentencepiece, soundfile, numpy, rapidocr_onnxruntime"
-    if ($LASTEXITCODE -ne 0) { ErrorExit "Python 依赖健康检查失败" }
-    Get-ChildItem (Join-Path $pythonEmbedDir "python/.dependencies-*") -Force -ErrorAction SilentlyContinue | Remove-Item -Force
-    Get-ChildItem (Join-Path $pythonEmbedDir "python/.alphakey-runtime-*") -Force -ErrorAction SilentlyContinue | Remove-Item -Force
+    if ($LASTEXITCODE -ne 0) { ErrorExit "Python dep health check failed" }
+
     New-Item -ItemType File -Force -Path $runtimeStamp | Out-Null
+
+    Info "Cleaning Python runtime build residues"
+    $pyDir = Join-Path $pythonEmbedDir "python"
+    Get-ChildItem $pyDir -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    Get-ChildItem (Join-Path $pyDir "Lib\site-packages") -Recurse -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq "tests" -or $_.Name -eq "test" } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    Get-ChildItem $pyDir -Recurse -File -Filter "*.lib" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    if (Test-Path (Join-Path $pyDir "include")) { Remove-Item (Join-Path $pyDir "include") -Recurse -Force -ErrorAction SilentlyContinue }
+    if (Test-Path (Join-Path $pyDir "libs")) { Remove-Item (Join-Path $pyDir "libs") -Recurse -Force -ErrorAction SilentlyContinue }
+    Info "Cleanup done"
 } else {
     Info "固定 Python 依赖已就绪"
 }
