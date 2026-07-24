@@ -164,37 +164,6 @@ pub(crate) fn no_window(cmd: &mut std::process::Command) -> &mut std::process::C
 #[cfg(not(windows))]
 pub(crate) fn no_window(cmd: &mut std::process::Command) -> &mut std::process::Command { cmd }
 
-fn ffmpeg_available() -> bool {
-    let mut cmd = std::process::Command::new("ffmpeg");
-    no_window(&mut cmd).arg("-version").output().is_ok()
-}
-
-/// 如果系统安装了 ffmpeg，将 WAV 压缩为 FLAC；失败或无 ffmpeg 时返回原路径。
-fn compress_wav_to_flac(wav_path: &std::path::Path) -> std::path::PathBuf {
-    if !ffmpeg_available() {
-        return wav_path.to_path_buf();
-    }
-    let flac_path = wav_path.with_extension("flac");
-    let mut cmd = std::process::Command::new("ffmpeg");
-    let result = no_window(&mut cmd)
-        .args([
-            "-y",
-            "-i",
-            wav_path.to_string_lossy().as_ref(),
-            "-c:a",
-            "flac",
-            flac_path.to_string_lossy().as_ref(),
-        ])
-        .output();
-    match result {
-        Ok(out) if out.status.success() && flac_path.exists() => {
-            let _ = std::fs::remove_file(wav_path);
-            flac_path
-        }
-        _ => wav_path.to_path_buf(),
-    }
-}
-
 fn snapshot(app: &AppHandle) -> Result<Snapshot> {
     app.state::<RuntimeState>().db().snapshot()
 }
@@ -729,8 +698,19 @@ fn ocr_image_card(app: AppHandle, card_id: String) -> Result<String, String> {
     let ext = if card.mime_type == "image/png" { "png" } else { "jpg" };
     let tmp = std::env::temp_dir().join(format!("redkey_ocr_{}.{}", card.id, ext));
     std::fs::write(&tmp, &bytes).map_err(|e| format!("写入临时文件失败：{e}"))?;
-    let text = crate::ocr::OcrWorker::start(&app).and_then(|mut worker| worker.ocr(&tmp)).map_err(|e| e.to_string())?;
+    let state = app.state::<RuntimeState>();
+    let result = state
+        .ocr_worker(&app)
+        .map_err(|error| anyhow::anyhow!(error))
+        .and_then(|mut worker| worker.ocr(&tmp));
     let _ = std::fs::remove_file(&tmp);
+    let text = match result {
+        Ok(text) => text,
+        Err(error) => {
+            state.release_ocr_worker();
+            return Err(error.to_string());
+        }
+    };
     app.state::<RuntimeState>().db().update_image_card(&card.id, &card.filename, &card.mime_type, &card.data, &text).map_err(err)?;
     let _ = emit_snapshot(&app);
     Ok(text)
@@ -1181,13 +1161,25 @@ fn stop_native_recording(app: AppHandle) -> Result<Snapshot, String> {
     }
     #[cfg(windows)]
     {
-        recording.stop().map_err(err)?;
+        if let Err(error) = recording
+            .stop()
+            .and_then(|_| recording_windows::normalize_wav(&recording.path))
+        {
+            let message = format!("录音保存失败：{error}");
+            let _ = app.state::<RuntimeState>().db().fail_recording(&recording.id, &message);
+            let _ = emit_snapshot(&app);
+            return Err(message);
+        }
     }
     let duration = recording.started.elapsed().as_secs_f64();
-    let audio_path = compress_wav_to_flac(recording.path.as_path());
+    let audio_path = recording.path.clone();
     app.state::<RuntimeState>().db().finish_recording(&recording.id, duration, &audio_path.to_string_lossy()).map_err(err)?;
     emit_snapshot(&app).map_err(err)?;
-    app.state::<RuntimeState>().transcription_queue(&app).enqueue(recording.id.clone(), audio_path).map_err(err)?;
+    if let Err(error) = app.state::<RuntimeState>().transcription_queue(&app).enqueue(recording.id.clone(), audio_path) {
+        let _ = app.state::<RuntimeState>().db().fail_recording(&recording.id, &error);
+        let _ = emit_snapshot(&app);
+        return Err(error);
+    }
     snapshot(&app).map_err(err)
 }
 
@@ -1220,10 +1212,16 @@ fn finish_recording(app: AppHandle, recording_id: String, audio: Vec<u8>, durati
     std::fs::create_dir_all(&recordings_dir).map_err(err)?;
     let path = recordings_dir.join(format!("{recording_id}.wav"));
     std::fs::write(&path, audio).map_err(err)?;
-    let audio_path = compress_wav_to_flac(&path);
+    #[cfg(windows)]
+    recording_windows::normalize_wav(&path).map_err(err)?;
+    let audio_path = path;
     app.state::<RuntimeState>().db().finish_recording(&recording_id, duration, &audio_path.to_string_lossy()).map_err(err)?;
     emit_snapshot(&app).map_err(err)?;
-    app.state::<RuntimeState>().transcription_queue(&app).enqueue(recording_id, audio_path).map_err(err)?;
+    if let Err(error) = app.state::<RuntimeState>().transcription_queue(&app).enqueue(recording_id.clone(), audio_path) {
+        let _ = app.state::<RuntimeState>().db().fail_recording(&recording_id, &error);
+        let _ = emit_snapshot(&app);
+        return Err(error);
+    }
     snapshot(&app).map_err(err)
 }
 
@@ -1249,7 +1247,10 @@ fn retry_transcription(app: AppHandle, recording_id: String) -> Result<Snapshot,
     let recording = snapshot(&app).map_err(err)?.recordings.into_iter().find(|item| item.id == recording_id).ok_or("录音记录不存在")?;
     let path = recording.audio_path.map(std::path::PathBuf::from).ok_or("录音文件不存在")?;
     app.state::<RuntimeState>().db().finish_recording(&recording_id, recording.duration, &path.to_string_lossy()).map_err(err)?;
-    app.state::<RuntimeState>().transcription_queue(&app).enqueue(recording_id, path).map_err(err)?;
+    if let Err(error) = app.state::<RuntimeState>().transcription_queue(&app).enqueue(recording_id.clone(), path) {
+        let _ = app.state::<RuntimeState>().db().fail_recording(&recording_id, &error);
+        return Err(error);
+    }
     emit_snapshot(&app).map_err(err)
 }
 
@@ -1564,7 +1565,14 @@ pub fn run() {
         if matches!(event, RunEvent::ExitRequested { .. }) {
             // 退出前停止正在进行的录音，确保 WAV 正常收尾
             if let Some(mut recording) = app.state::<RuntimeState>().native_recording.lock().take() {
+                #[cfg(windows)]
                 let _ = recording.stop();
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = writeln!(recording.input, "stop");
+                    let _ = recording.input.flush();
+                    let _ = recording.child.wait();
+                }
             }
             // 优雅关闭 SpeechWorker/OCR worker，触发子进程 shutdown 而非被系统强制终止
             app.state::<RuntimeState>().transcription_queue(app.app_handle()).release_worker();

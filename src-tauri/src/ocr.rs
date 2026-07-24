@@ -1,20 +1,26 @@
 use crate::no_window;
-use crate::speech::ensure_runtime;
+use crate::speech::{append_log, ensure_runtime, python_path};
 use anyhow::{bail, Context, Result};
 use serde_json::json;
 use std::{
-    io::{BufReader, Read, Write},
+    fs,
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    sync::Arc,
+    sync::{atomic::{AtomicU64, Ordering}, mpsc, Arc},
+    time::{Duration, Instant},
 };
 use tauri::{AppHandle, Manager};
 
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_request_id(prefix: &str) -> String {
+    let number = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{number}")
+}
+
 pub fn ocr_worker_path(app: &AppHandle) -> Result<PathBuf> {
-    let bundled = app
-        .path()
-        .resource_dir()?
-        .join("workers/ocr_worker.py");
+    let bundled = app.path().resource_dir()?.join("workers/ocr_worker.py");
     if bundled.exists() {
         return Ok(bundled);
     }
@@ -22,32 +28,80 @@ pub fn ocr_worker_path(app: &AppHandle) -> Result<PathBuf> {
 }
 
 pub struct OcrWorker {
+    app: AppHandle,
     child: Arc<parking_lot::Mutex<Child>>,
     input: ChildStdin,
-    output: BufReader<ChildStdout>,
-    stderr: Option<BufReader<std::process::ChildStderr>>,
+    stdout_rx: mpsc::Receiver<String>,
+}
+
+fn spawn_stdout_reader(stdout: ChildStdout) -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut bytes = Vec::new();
+        loop {
+            bytes.clear();
+            match reader.read_until(b'\n', &mut bytes) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let line = String::from_utf8_lossy(&bytes).trim().to_string();
+                    if !line.is_empty() && tx.send(line).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    rx
+}
+
+fn spawn_stderr_reader(app: &AppHandle, stderr: std::process::ChildStderr) -> Result<()> {
+    let log_dir = app.path().app_data_dir()?.join("logs");
+    fs::create_dir_all(&log_dir).context("无法创建日志目录")?;
+    let log_path = log_dir.join("ocr-worker.log");
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut bytes = Vec::new();
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .ok();
+        loop {
+            bytes.clear();
+            match reader.read_until(b'\n', &mut bytes) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let line = String::from_utf8_lossy(&bytes).trim().to_string();
+                    if !line.is_empty() {
+                        eprintln!("[OCR] {line}");
+                        if let Some(file) = file.as_mut() {
+                            let _ = writeln!(
+                                file,
+                                "{} [OCR] {line}",
+                                chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+);
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    Ok(())
 }
 
 impl OcrWorker {
     pub fn start(app: &AppHandle) -> Result<Self> {
         ensure_runtime(app)?;
-        let runtime = app
-            .path()
-            .app_data_dir()
-            .context("无法获取应用数据目录")?
-            .join("speech-runtime");
-        let python = runtime.join(if cfg!(windows) {
-            "Scripts/python.exe"
-        } else {
-            "bin/python"
-        });
-        if !python.exists() {
-            bail!("语音运行环境尚未初始化")
-        }
+        let python = python_path(app)?;
         let mut child = no_window(
             &mut Command::new(&python)
                 .arg(ocr_worker_path(app)?)
                 .env("PYTHONIOENCODING", "utf-8")
+                .env("PYTHONUTF8", "1")
+                .env("PYTHONUNBUFFERED", "1")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped()),
@@ -55,40 +109,35 @@ impl OcrWorker {
         .spawn()
         .context("无法启动 OCR worker")?;
         let input = child.stdin.take().context("worker 输入不可用")?;
-        let output =
-            BufReader::new(child.stdout.take().context("worker 输出不可用")?);
-        let stderr = BufReader::new(child.stderr.take().context("worker 错误输出不可用")?);
+        let stdout = child.stdout.take().context("worker 输出不可用")?;
+        let stderr = child.stderr.take().context("worker 错误输出不可用")?;
+        spawn_stderr_reader(app, stderr)?;
         let mut worker = Self {
+            app: app.clone(),
             child: Arc::new(parking_lot::Mutex::new(child)),
             input,
-            output,
-            stderr: Some(stderr),
+            stdout_rx: spawn_stdout_reader(stdout),
         };
-        worker.send(json!({"action":"load","requestId":"startup"}))?;
-        let loaded = worker.receive()?;
+        let request_id = next_request_id("startup");
+        worker.send(json!({"action":"load","requestId":request_id}))?;
+        let loaded = worker.receive(&request_id)?;
         if loaded["event"] != "loaded" {
             bail!(
                 "{}",
-                loaded["message"]
-                    .as_str()
-                    .unwrap_or("OCR 模型加载失败")
+                loaded["message"].as_str().unwrap_or("OCR 模型加载失败")
             )
         }
         Ok(worker)
     }
 
     pub fn ocr(&mut self, image_path: &Path) -> Result<String> {
-        self.send(
-            json!({"action":"ocr","imagePath":image_path,"requestId":"ocr"}),
-        )?;
-        let value = self.receive()?;
+        let request_id = next_request_id("ocr");
+        self.send(json!({"action":"ocr","imagePath":image_path,"requestId":request_id}))?;
+        let value = self.receive(&request_id)?;
         if value["event"] == "final" {
             return Ok(value["text"].as_str().unwrap_or_default().to_string());
         }
-        bail!(
-            "{}",
-            value["message"].as_str().unwrap_or("OCR 识别失败")
-        )
+        bail!("{}", value["message"].as_str().unwrap_or("OCR 识别失败"))
     }
 
     fn send(&mut self, value: serde_json::Value) -> Result<()> {
@@ -97,50 +146,52 @@ impl OcrWorker {
         Ok(())
     }
 
-    fn receive(&mut self) -> Result<serde_json::Value> {
+    fn receive(&mut self, expected_request_id: &str) -> Result<serde_json::Value> {
+        const RECEIVE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+        let deadline = Instant::now() + RECEIVE_TIMEOUT;
         loop {
-            let mut buf: Vec<u8> = Vec::new();
-            let mut byte = [0u8; 1];
-            loop {
-                match self.output.get_mut().read(&mut byte) {
-                    Ok(0) => {
-                        let stderr_msg = self.drain_stderr();
-                        bail!("OCR worker 已意外退出{}", stderr_msg);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("等待 OCR worker 响应超时，请检查 logs/ocr-worker.log")
+            }
+            match self
+                .stdout_rx
+                .recv_timeout(remaining.min(Duration::from_millis(250)))
+            {
+                Ok(line) => {
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                        append_log(
+                            &self.app,
+                            "ocr-worker.log",
+                            &format!("ignored non-JSON stdout: {line}"),
+                        );
+                        continue;
+                    };
+                    if value.get("requestId").and_then(|id| id.as_str())
+                        != Some(expected_request_id)
+                    {
+                        append_log(
+                            &self.app,
+                            "ocr-worker.log",
+                            &format!("ignored response with unexpected requestId: {line}"),
+                        );
+                        continue;
                     }
-                    Ok(1) => {
-                        if byte[0] == b'\n' { break; }
-                        buf.push(byte[0]);
-                    }
-                    Err(e) => {
-                        bail!("读取 OCR worker 输出失败：{e}");
-                    }
-                    _ => unreachable!(),
+                    return Ok(value);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("OCR worker 已意外退出，请检查 logs/ocr-worker.log")
                 }
             }
-            let line = String::from_utf8_lossy(&buf).trim().to_string();
-            if line.is_empty() { continue; }
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
-                return Ok(value);
-            }
         }
-    }
-
-    fn drain_stderr(&mut self) -> String {
-        use std::io::Read;
-        let mut result = String::new();
-        if let Some(stderr) = &mut self.stderr {
-            let mut buf = String::new();
-            if stderr.read_to_string(&mut buf).is_ok() && !buf.is_empty() {
-                result = format!("（错误输出：{}）", buf.trim());
-            }
-        }
-        result
     }
 }
 
 impl Drop for OcrWorker {
     fn drop(&mut self) {
-        let _ = self.send(json!({"action":"shutdown","requestId":"shutdown"}));
+        let request_id = next_request_id("shutdown");
+        let _ = self.send(json!({"action":"shutdown","requestId":request_id}));
         let mut child = self.child.lock();
         let _ = child.kill();
         let _ = child.wait();

@@ -11,8 +11,11 @@
 import json
 import os
 import sys
+from contextlib import redirect_stdout
 from pathlib import Path
 
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
 
 def resource_dir() -> Path:
     """返回模型资源目录。开发时从项目 resources 读取，打包后从 app 资源目录读取。"""
@@ -47,7 +50,8 @@ def check_models(dirs):
         raise FileNotFoundError(f"缺少模型：{', '.join(missing)}，请前往设置页下载")
 
 
-def emit(value):
+def emit(request, value):
+    value["requestId"] = request.get("requestId")
     sys.stdout.write(json.dumps(value, ensure_ascii=False) + "\n")
     sys.stdout.flush()
 
@@ -99,30 +103,33 @@ def format_speaker_segments(result):
 def main():
     model = None
     for line in sys.stdin:
+        request = {}
         try:
             request = json.loads(line)
             action = request.get("action")
             if action == "health":
-                emit({"event": "ready", "backend": "funasr"})
+                emit(request, {"event": "ready", "backend": "funasr"})
                 continue
             if action == "load":
-                model = load_model()
-                emit({"event": "loaded"})
+                with redirect_stdout(sys.stderr):
+                    model = load_model()
+                emit(request, {"event": "loaded"})
                 continue
             if action == "transcribe":
                 if model is None:
                     raise RuntimeError("ASR 模型尚未加载")
                 audio_path = request["audioPath"]
-                result = model.generate(input=audio_path, batch_size_s=300)
+                with redirect_stdout(sys.stderr):
+                    result = model.generate(input=audio_path, batch_size_s=300)
                 segments = format_speaker_segments(result)
-                emit({"event": "final", "segments": segments})
+                emit(request, {"event": "final", "segments": segments})
                 continue
             if action == "shutdown":
-                emit({"event": "stopped"})
+                emit(request, {"event": "stopped"})
                 return
             raise ValueError(f"未知操作: {action}")
         except Exception as error:
-            emit({"event": "error", "message": str(error)})
+            emit(request, {"event": "error", "message": str(error)})
 
 
 if __name__ == "__main__":

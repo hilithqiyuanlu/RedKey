@@ -11,6 +11,7 @@ use std::time::Duration;
 
 pub const MODEL: &str = "deepseek-v4-flash";
 const KEY_SERVICE: &str = "com.hilith.redkey";
+const KEY_ACCOUNT: &str = "deepseek-api-key";
 const PROMPT_VERSION: &str = "recording-summary-v2";
 
 const RECORDING_SYSTEM: &str = r#"从对话转写中提取待办事项和关键信息。

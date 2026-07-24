@@ -5,17 +5,27 @@ use serde_json::json;
 use std::{
     collections::HashMap,
     fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    sync::{Arc, LazyLock, Mutex, mpsc, atomic::{AtomicBool, Ordering}},
-    time::Duration,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc, LazyLock, Mutex,
+    },
+    time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager};
 
 pub const ASR_ID: &str = "FunASR";
 pub const OCR_ID: &str = "RapidOCR";
-const RUNTIME_DIR: &str = "speech-runtime";
+const RUNTIME_IMPORT_CHECK: &str = "import funasr, torch, torchaudio, modelscope, sentencepiece, soundfile, numpy, rapidocr_onnxruntime";
+const RUNTIME_MARKER: &str = ".alphakey-runtime-v1";
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_request_id(prefix: &str) -> String {
+    let number = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{number}")
+}
 
 /// 内置 ASR 模型：(目录名, 显示名, 关键文件)
 const BUNDLED_ASR_MODELS: &[(&str, &str, &str)] = &[
@@ -37,16 +47,15 @@ fn model_download_url(id: &str) -> Option<&'static str> {
     }
 }
 
-fn runtime_dir(app: &AppHandle) -> Result<PathBuf> {
-    Ok(app.path().app_data_dir()?.join(RUNTIME_DIR))
-}
-
-fn python_path(app: &AppHandle) -> Result<PathBuf> {
+pub(crate) fn python_path(app: &AppHandle) -> Result<PathBuf> {
     bootstrap_python(app)
 }
 
 fn worker_path(app: &AppHandle) -> Result<PathBuf> {
-    let bundled = app.path().resource_dir()?.join("workers/funasr_asr_worker.py");
+    let bundled = app
+        .path()
+        .resource_dir()?
+        .join("workers/funasr_asr_worker.py");
     if bundled.exists() {
         return Ok(bundled);
     }
@@ -62,9 +71,19 @@ fn models_data_dir(app: &AppHandle) -> Result<PathBuf> {
 }
 
 fn find_python() -> Result<PathBuf> {
-    for cmd in ["python3.12", "python3.11", "python3.10", "python3", "python"] {
-        if let Ok(output) = Command::new(cmd).args(["--version"]).output() {
-            let version = String::from_utf8_lossy(&output.stdout);
+    for cmd in [
+        "python3.12",
+        "python3.11",
+        "python3.10",
+        "python3",
+        "python",
+    ] {
+        if let Ok(output) = no_window(Command::new(cmd).args(["--version"])).output() {
+            let version = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             if version.contains("3.10") || version.contains("3.11") || version.contains("3.12") {
                 return Ok(PathBuf::from(cmd));
             }
@@ -73,202 +92,106 @@ fn find_python() -> Result<PathBuf> {
     bail!("未找到 Python 3.10~3.12，请安装 Python 3.11")
 }
 
-fn python_can_bootstrap(python: &Path) -> bool {
-    no_window(Command::new(python).args(["-c", "import venv, ensurepip"]))
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
-
-/// Windows embeddable Python 使用 python311._pth 控制 sys.path；
-/// 旧版或配置错误的包里该文件可能没有包含 Lib/site-packages，也没有启用 site，
-/// 导致连标准库都加载不了。这里尝试自动修复。
-fn repair_embed_python(python: &Path) -> Result<()> {
-    let exe_dir = python.parent().context("无法定位便携 Python 目录")?;
-    let pth = exe_dir.join("python311._pth");
-    if !pth.exists() {
-        return Ok(());
-    }
-    let mut contents = fs::read_to_string(&pth).context("读取便携 Python 路径配置失败")?;
-    let mut lines: Vec<String> = contents.lines().map(|s| s.to_string()).collect();
-    for entry in ["Lib", r"Lib\site-packages"] {
-        if !lines.iter().any(|l| l.trim() == entry) {
-            lines.push(entry.to_string());
-        }
-    }
-    let mut has_import_site = false;
-    for line in &mut lines {
-        let trimmed = line.trim();
-        if trimmed == "import site" {
-            has_import_site = true;
-        } else if trimmed == "#import site" {
-            *line = "import site".to_string();
-            has_import_site = true;
-        }
-    }
-    if !has_import_site {
-        lines.push("import site".to_string());
-    }
-    contents = lines.join("\n");
-    if !contents.ends_with('\n') {
-        contents.push('\n');
-    }
-    fs::write(&pth, contents).context("修复便携 Python 路径配置失败")?;
-    Ok(())
-}
-
 fn bootstrap_python(app: &AppHandle) -> Result<PathBuf> {
-    if cfg!(windows) {
-        let resource_dir = app.path().resource_dir()?;
-        let bundled_paths = [
+    let resource_dir = app.path().resource_dir()?;
+    let candidates = if cfg!(windows) {
+        vec![
             resource_dir.join("python-embed/python/python.exe"),
             resource_dir.join("python-embed/python.exe"),
-        ];
-        let bundled_exists = bundled_paths.iter().any(|p| p.exists());
-        for bundled in bundled_paths.iter().filter(|p| p.exists()) {
-            if python_can_bootstrap(bundled) {
-                return Ok(bundled.clone());
-            }
-            // 尝试修复旧版 Windows embeddable Python 的 _pth 配置
-            if repair_embed_python(bundled).is_ok() && python_can_bootstrap(bundled) {
-                return Ok(bundled.clone());
-            }
-        }
-        if bundled_exists {
-            // 便携 Python 损坏或权限不足时，优先回退到系统 Python
-            if let Ok(sys) = find_python() {
-                return Ok(sys);
-            }
-            bail!("打包的便携 Python 无法启动（缺少 venv/ensurepip），且未找到系统 Python 3.10~3.12。建议重新安装新版应用，或先安装 Python 3.11。");
+        ]
+    } else {
+        vec![
+            resource_dir.join("python-embed/python/bin/python3"),
+            resource_dir.join("python-embed/python/bin/python"),
+        ]
+    };
+    for candidate in candidates {
+        if candidate.is_file() {
+            return Ok(candidate);
         }
     }
-    find_python()
+
+    if cfg!(debug_assertions) {
+        return find_python();
+    }
+    bail!("安装包缺少本地模型运行环境，请重新安装 AlphaKey")
 }
 
-fn run_command(
-    command: &mut Command,
-    error_msg: &str,
-) -> Result<()> {
-    let output = no_window(command)
-        .output()
-        .with_context(|| format!("{error_msg}（无法启动进程）"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let details = if stderr.is_empty() { stdout } else { stderr };
-        let details = if details.is_empty() { "无输出".into() } else { details };
-        bail!("{error_msg}（退出码 {:?}）：{details}", output.status.code())
+pub(crate) fn append_log(app: &AppHandle, filename: &str, message: &str) {
+    let Ok(log_dir) = app.path().app_data_dir().map(|path| path.join("logs")) else {
+        return;
+    };
+    if fs::create_dir_all(&log_dir).is_err() {
+        return;
     }
-    Ok(())
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join(filename))
+    {
+        let _ = writeln!(
+            file,
+            "{} {message}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+        );
+    }
+}
+
+fn runtime_health(app: &AppHandle, python: &Path) -> Result<()> {
+    let bundled_root = app.path().resource_dir()?.join("python-embed");
+    if python.starts_with(&bundled_root) {
+        let runtime_root = python
+            .parent()
+            .and_then(Path::parent)
+            .filter(|path| path.file_name().and_then(|name| name.to_str()) == Some("python"))
+            .or_else(|| python.parent())
+            .context("内置 Python 路径无效")?;
+        let marker = runtime_root.join(RUNTIME_MARKER);
+        if !marker.is_file() {
+            append_log(
+                app,
+                "runtime.log",
+                &format!("runtime marker missing: {}", marker.display()),
+            );
+            bail!("本地模型运行环境版本不匹配，请重新安装 AlphaKey")
+        }
+    }
+    let output = no_window(
+        Command::new(python)
+            .args(["-c", RUNTIME_IMPORT_CHECK])
+            .env("PYTHONUTF8", "1")
+            .env("PYTHONIOENCODING", "utf-8")
+            .env("PYTHONUNBUFFERED", "1"),
+    )
+    .output()
+    .context("无法启动内置 Python")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    append_log(
+        app,
+        "runtime.log",
+        &format!(
+            "runtime health check failed: status={:?}; stderr={}; stdout={}",
+            output.status.code(),
+            stderr.trim(),
+            stdout.trim()
+        ),
+    );
+    bail!("本地模型运行环境不完整，请重新安装 AlphaKey")
 }
 
 pub fn ensure_runtime(app: &AppHandle) -> Result<()> {
-    let python = bootstrap_python(app)?;
-    let runtime = runtime_dir(app)?;
-    let marker = runtime.join("pip-deps-ready");
-    if marker.exists() {
-        return Ok(());
-    }
-    if runtime.exists() {
-        fs::remove_dir_all(&runtime)?;
-    }
-    fs::create_dir_all(&runtime)?;
-
-    // 检查 pip 是否健康（不仅是存在），防止嵌入式 Python 自带的 pip
-    // 因 vendored 模块版本不匹配在 install 时才崩溃
-    let pip_ok = pip_is_healthy(&python);
-    if !pip_ok {
-        eprintln!("pip 不健康或缺失，正在重装...");
-        // 彻底清除可能已损坏的 pip / setuptools / wheel
-        let _ = purge_corrupted_pip(&python);
-        let get_pip = runtime.join("get-pip.py");
-        download_get_pip(&get_pip)?;
-        run_command(
-            Command::new(&python)
-                .arg(&get_pip)
-                .arg("--no-warn-script-location"),
-            "安装 pip 失败",
-        )?;
-        let _ = fs::remove_file(&get_pip);
-        // 重装后再次确认 pip 健康
-        if !pip_is_healthy(&python) {
-            bail!("重装 pip 后仍然不健康，无法继续安装依赖");
-        }
-    }
-
-    // 不再执行 pip 自升级：嵌入式 Python 的 pip 自升级容易造成
-    // vendored 模块版本不匹配，get-pip.py 安装的版本已经足够新
-    run_command(
-        Command::new(&python).args([
-            "-m", "pip", "install",
-            "funasr", "torch", "torchaudio", "modelscope",
-            "sentencepiece", "soundfile", "numpy", "rapidocr_onnxruntime",
-        ]),
-        "安装 FunASR/OCR 依赖失败",
-    )?;
-    fs::write(&marker, b"ok")?;
-    Ok(())
-}
-
-/// 检测 pip 是否能正常工作（验证 resolvelib 等关键模块可导入）。
-/// 嵌入式 Python 自带的 pip 可能出现 vendored 模块版本不匹配，导致
-/// `pip install` 时才崩溃。此函数用于提前探测。
-fn pip_is_healthy(python: &Path) -> bool {
-    no_window(Command::new(python).args([
-        "-c",
-        "import pip._vendor.resolvelib.structs; \
-         pip._vendor.resolvelib.structs.RequirementInformation",
-    ]))
-    .output()
-    .is_ok_and(|o| o.status.success())
-}
-
-/// 彻底清除嵌入式 Python 中已损坏的 pip 安装，为重装做准备。
-/// 仅在嵌入式 Python（存在 _pth 配置文件）上执行，避免误删系统 Python 的 pip。
-fn purge_corrupted_pip(python: &Path) -> Result<()> {
-    let exe_dir = python.parent().context("无法定位 Python 安装目录")?;
-    let has_pth = exe_dir.join("python311._pth").exists()
-        || exe_dir.join("python310._pth").exists()
-        || exe_dir.join("python312._pth").exists();
-    if !has_pth {
-        // 系统 Python 不做清理，交给 pip 自身处理
-        return Ok(());
-    }
-    let site_packages = exe_dir.join("Lib").join("site-packages");
-    if let Ok(entries) = fs::read_dir(&site_packages) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with("pip")
-                || name_str.starts_with("pip-")
-                || name_str.starts_with("setuptools")
-                || name_str.starts_with("wheel")
-                || name_str.starts_with("_distutils_hack")
-            {
-                let path = entry.path();
-                if path.is_dir() {
-                    let _ = fs::remove_dir_all(&path);
-                } else {
-                    let _ = fs::remove_file(&path);
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn download_get_pip(dest: &Path) -> Result<()> {
-    let url = "https://bootstrap.pypa.io/get-pip.py";
-    let response = reqwest::blocking::get(url).context("下载 get-pip.py 失败，请检查网络连接")?;
-    if !response.status().is_success() {
-        bail!("下载 get-pip.py 失败，HTTP {}", response.status());
-    }
-    let bytes = response.bytes().context("读取 get-pip.py 响应失败")?;
-    fs::write(dest, &bytes).context("写入 get-pip.py 失败")?;
-    Ok(())
+    let python = python_path(app)?;
+    runtime_health(app, &python)
 }
 
 pub fn runtime_ready(app: &AppHandle) -> bool {
-    runtime_dir(app).is_ok_and(|d| d.join("pip-deps-ready").exists())
+    python_path(app)
+        .and_then(|python| runtime_health(app, &python))
+        .is_ok()
 }
 
 /// 给前端返回的模型状态。ASR 与 OCR 模型均已内置，这里仅保留 OCR 的下载状态接口兼容。
@@ -280,13 +203,21 @@ pub fn status(app: &AppHandle, id: &str) -> Result<ModelStatus> {
             installed,
             downloading: false,
             progress: if installed { 100 } else { 0 },
-            stage: if installed { "已就绪".into() } else { "运行环境未就绪".into() },
+            stage: if installed {
+                "已就绪".into()
+            } else {
+                "运行环境未就绪".into()
+            },
             error: None,
             size_bytes: 0,
             downloaded_bytes: 0,
             total_bytes: None,
             progress_kind: "idle".into(),
-            detail: if installed { "模型已内置，运行环境就绪".into() } else { "首次启动时会自动初始化运行环境".into() },
+            detail: if installed {
+                "模型已内置，运行环境就绪".into()
+            } else {
+                "安装包中的本地模型运行环境不完整".into()
+            },
             verified: installed,
         });
     }
@@ -297,20 +228,29 @@ pub fn status(app: &AppHandle, id: &str) -> Result<ModelStatus> {
             installed,
             downloading: false,
             progress: if installed { 100 } else { 0 },
-            stage: if installed { "已就绪".into() } else { "运行环境未就绪".into() },
+            stage: if installed {
+                "已就绪".into()
+            } else {
+                "运行环境未就绪".into()
+            },
             error: None,
             size_bytes: 0,
             downloaded_bytes: 0,
             total_bytes: None,
             progress_kind: "idle".into(),
-            detail: if installed { "PP-OCRv5 模型已内置，运行环境就绪".into() } else { "首次启动时会自动初始化运行环境".into() },
+            detail: if installed {
+                "PP-OCRv5 模型已内置，运行环境就绪".into()
+            } else {
+                "安装包中的本地模型运行环境不完整".into()
+            },
             verified: installed,
         });
     }
     bail!("未知模型：{id}")
 }
 
-static DOWNLOADING: LazyLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static DOWNLOADING: LazyLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn model_dir_and_marker(app: &AppHandle, id: &str) -> Result<(PathBuf, &'static str)> {
     let bundled = bundled_models_dir(app)?;
@@ -343,7 +283,10 @@ fn is_downloading(id: &str) -> bool {
 #[tauri::command]
 pub fn asr_model_statuses(app: AppHandle) -> Result<Vec<AsrModelStatus>, String> {
     let mut out = Vec::new();
-    for (id, name, _) in BUNDLED_ASR_MODELS.iter().chain(DOWNLOADABLE_ASR_MODELS.iter()) {
+    for (id, name, _) in BUNDLED_ASR_MODELS
+        .iter()
+        .chain(DOWNLOADABLE_ASR_MODELS.iter())
+    {
         let ready = model_ready(&app, id);
         let downloading = is_downloading(id);
         out.push(AsrModelStatus {
@@ -399,13 +342,12 @@ async fn download_and_extract(app: &AppHandle, id: &str, url: &str) -> Result<()
     );
 
     let client = reqwest::Client::new();
-    let mut response = client
-        .get(url)
-        .send()
-        .await
-        .context("无法连接下载服务器")?;
+    let mut response = client.get(url).send().await.context("无法连接下载服务器")?;
     if !response.status().is_success() {
-        bail!("下载服务器返回 {}：请检查 release 是否存在", response.status());
+        bail!(
+            "下载服务器返回 {}：请检查 release 是否存在",
+            response.status()
+        );
     }
     let total = response.content_length().unwrap_or(0);
 
@@ -416,21 +358,72 @@ async fn download_and_extract(app: &AppHandle, id: &str, url: &str) -> Result<()
     while let Some(chunk) = response.chunk().await.context("下载中断")? {
         file.write_all(&chunk).await.context("写入临时文件失败")?;
         downloaded += chunk.len() as u64;
-        let progress = if total > 0 { (downloaded * 100 / total) as u8 } else { 0 };
+        let progress = if total > 0 {
+            (downloaded * 100 / total) as u8
+        } else {
+            0
+        };
         let _ = app.emit(
             "redkey://model-download-progress",
             json!({"id": id, "progress": progress, "stage": "下载中", "error": null}),
         );
     }
+    if total > 0 && downloaded != total {
+        bail!("模型下载不完整：预期 {total} 字节，实际 {downloaded} 字节")
+    }
     file.flush().await.context("刷新临时文件失败")?;
     drop(file);
+    if final_zip.exists() {
+        fs::remove_file(&final_zip).context("清理旧模型压缩包失败")?;
+    }
     fs::rename(&partial, &final_zip).context("重命名临时文件失败")?;
 
     let _ = app.emit(
         "redkey://model-download-progress",
         json!({"id": id, "progress": 100, "stage": "解压中", "error": null}),
     );
-    extract_zip(&final_zip, &data_dir).await.context("解压模型失败")?;
+    let staging = data_dir.join(format!(".{id}.extracting"));
+    let destination = data_dir.join(id);
+    let previous = data_dir.join(format!(".{id}.previous"));
+    let marker = DOWNLOADABLE_ASR_MODELS
+        .iter()
+        .find(|(model_id, _, _)| *model_id == id)
+        .map(|(_, _, marker)| *marker)
+        .context("未知的可下载模型")?;
+    if staging.exists() {
+        fs::remove_dir_all(&staging).context("清理旧模型临时目录失败")?;
+    }
+    fs::create_dir_all(&staging).context("创建模型临时目录失败")?;
+    extract_zip(&final_zip, &staging)
+        .await
+        .context("解压模型失败")?;
+    let staged_model = if staging.join(id).is_dir() {
+        staging.join(id)
+    } else {
+        staging.clone()
+    };
+    let marker_path = staged_model.join(marker);
+    if !marker_path.is_file() || marker_path.metadata().map(|meta| meta.len()).unwrap_or(0) == 0 {
+        bail!("模型压缩包缺少必要文件：{marker}")
+    }
+    if previous.exists() {
+        fs::remove_dir_all(&previous).context("清理旧模型备份失败")?;
+    }
+    if destination.exists() {
+        fs::rename(&destination, &previous).context("备份旧模型失败")?;
+    }
+    if let Err(error) = fs::rename(&staged_model, &destination) {
+        if previous.exists() {
+            let _ = fs::rename(&previous, &destination);
+        }
+        return Err(error).context("启用新模型失败");
+    }
+    if previous.exists() {
+        fs::remove_dir_all(&previous).context("删除旧模型备份失败")?;
+    }
+    if staging.exists() {
+        fs::remove_dir_all(&staging).context("清理模型临时目录失败")?;
+    }
     fs::remove_file(&final_zip).context("删除 zip 失败")?;
     Ok(())
 }
@@ -471,6 +464,8 @@ pub async fn download_asr_model(app: AppHandle, id: String) -> Result<(), String
                     // 清理失败的临时文件，避免下次重试使用脏数据
                     let data_dir = models_data_dir(&app2).unwrap_or_else(|_| PathBuf::from("."));
                     let _ = fs::remove_file(data_dir.join(format!("{id}.zip.partial")));
+                    let _ = fs::remove_file(data_dir.join(format!("{id}.zip")));
+                    let _ = fs::remove_dir_all(data_dir.join(format!(".{id}.extracting")));
                 }
             }
         }
@@ -489,6 +484,7 @@ pub async fn download_asr_model(app: AppHandle, id: String) -> Result<(), String
 }
 
 pub struct SpeechWorker {
+    app: AppHandle,
     child: Arc<Mutex<Child>>,
     input: ChildStdin,
     stdout_rx: mpsc::Receiver<String>,
@@ -498,13 +494,13 @@ fn spawn_stdout_reader(stdout: ChildStdout) -> mpsc::Receiver<String> {
     let (tx, rx) = mpsc::channel::<String>();
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
+        let mut bytes = Vec::new();
         loop {
-            line.clear();
-            match reader.read_line(&mut line) {
+            bytes.clear();
+            match reader.read_until(b'\n', &mut bytes) {
                 Ok(0) => break,
                 Ok(_) => {
-                    let trimmed = line.trim().to_string();
+                    let trimmed = String::from_utf8_lossy(&bytes).trim().to_string();
                     if !trimmed.is_empty() && tx.send(trimmed).is_err() {
                         break;
                     }
@@ -522,18 +518,18 @@ fn spawn_stderr_reader(app: &AppHandle, stderr: std::process::ChildStderr) -> Re
     let log_path = log_dir.join("funasr-worker.log");
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
-        let mut line = String::new();
+        let mut bytes = Vec::new();
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&log_path)
             .ok();
         loop {
-            line.clear();
-            match reader.read_line(&mut line) {
+            bytes.clear();
+            match reader.read_until(b'\n', &mut bytes) {
                 Ok(0) => break,
                 Ok(_) => {
-                    let trimmed = line.trim();
+                    let trimmed = String::from_utf8_lossy(&bytes).trim().to_string();
                     if !trimmed.is_empty() {
                         eprintln!("[FunASR] {trimmed}");
                         if let Some(f) = file.as_mut() {
@@ -560,6 +556,8 @@ impl SpeechWorker {
             Command::new(&python)
                 .arg(worker_path(app)?)
                 .env("PYTHONIOENCODING", "utf-8")
+                .env("PYTHONUTF8", "1")
+                .env("PYTHONUNBUFFERED", "1")
                 .env("BUNDLE_MODEL_DIR", bundled_models_dir(app)?)
                 .env("DATA_MODEL_DIR", models_data_dir(app)?)
                 .stdin(Stdio::piped())
@@ -574,12 +572,14 @@ impl SpeechWorker {
         spawn_stderr_reader(app, stderr)?;
         let stdout_rx = spawn_stdout_reader(stdout);
         let mut worker = Self {
+            app: app.clone(),
             child: Arc::new(Mutex::new(child)),
             input,
             stdout_rx,
         };
-        worker.send(json!({"action":"load","requestId":"startup"}))?;
-        let loaded = worker.receive()?;
+        let request_id = next_request_id("startup");
+        worker.send(json!({"action":"load","requestId":request_id}))?;
+        let loaded = worker.receive(&request_id)?;
         if loaded["event"] != "loaded" {
             bail!(
                 "{}",
@@ -590,20 +590,14 @@ impl SpeechWorker {
     }
 
     pub fn transcribe(&mut self, audio_path: &Path) -> Result<Vec<SpeakerSegment>> {
-        self.send(
-            json!({"action":"transcribe","audioPath":audio_path,"requestId":"transcribe"}),
-        )?;
-        let value = self.receive()?;
+        let request_id = next_request_id("transcribe");
+        self.send(json!({"action":"transcribe","audioPath":audio_path,"requestId":request_id}))?;
+        let value = self.receive(&request_id)?;
         if value["event"] == "final" {
-            let segments: Vec<SpeakerSegment> = serde_json::from_value(
-                value["segments"].clone(),
-            )?;
+            let segments: Vec<SpeakerSegment> = serde_json::from_value(value["segments"].clone())?;
             return Ok(segments);
         }
-        bail!(
-            "{}",
-            value["message"].as_str().unwrap_or("转写失败")
-        )
+        bail!("{}", value["message"].as_str().unwrap_or("转写失败"))
     }
 
     fn send(&mut self, value: serde_json::Value) -> Result<()> {
@@ -612,20 +606,43 @@ impl SpeechWorker {
         Ok(())
     }
 
-    fn receive(&mut self) -> Result<serde_json::Value> {
+    fn receive(&mut self, expected_request_id: &str) -> Result<serde_json::Value> {
         const RECEIVE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-        match self.stdout_rx.recv_timeout(RECEIVE_TIMEOUT) {
-            Ok(line) => {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+        let deadline = Instant::now() + RECEIVE_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("等待 FunASR worker 响应超时（5 分钟无输出），请检查 logs/funasr-worker.log")
+            }
+            match self
+                .stdout_rx
+                .recv_timeout(remaining.min(Duration::from_millis(250)))
+            {
+                Ok(line) => {
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                        append_log(
+                            &self.app,
+                            "funasr-worker.log",
+                            &format!("ignored non-JSON stdout: {line}"),
+                        );
+                        continue;
+                    };
+                    if value.get("requestId").and_then(|id| id.as_str())
+                        != Some(expected_request_id)
+                    {
+                        append_log(
+                            &self.app,
+                            "funasr-worker.log",
+                            &format!("ignored response with unexpected requestId: {line}"),
+                        );
+                        continue;
+                    }
                     return Ok(value);
                 }
-                bail!("FunASR worker 输出不是有效 JSON：{line}")
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                bail!("等待 FunASR worker 响应超时（5 分钟无输出），请检查日志")
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                bail!("FunASR worker 已意外退出，请查看 logs/funasr-worker.log")
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("FunASR worker 已意外退出，请查看 logs/funasr-worker.log")
+                }
             }
         }
     }
@@ -633,7 +650,8 @@ impl SpeechWorker {
 
 impl Drop for SpeechWorker {
     fn drop(&mut self) {
-        let _ = self.send(json!({"action":"shutdown","requestId":"shutdown"}));
+        let request_id = next_request_id("shutdown");
+        let _ = self.send(json!({"action":"shutdown","requestId":request_id}));
         let mut child = self.child.lock().unwrap();
         let _ = child.kill();
         let _ = child.wait();

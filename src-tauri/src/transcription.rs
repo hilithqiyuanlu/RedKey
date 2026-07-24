@@ -59,24 +59,28 @@ impl TranscriptionQueue {
         }
     }
 
-    pub fn enqueue(
-        &self,
-        recording_id: String,
-        path: PathBuf,
-    ) -> Result<Arc<AtomicBool>, String> {
+    pub fn enqueue(&self, recording_id: String, path: PathBuf) -> Result<Arc<AtomicBool>, String> {
         let token = Arc::new(AtomicBool::new(false));
         let item = QueueItem {
             recording_id: recording_id.clone(),
             path,
             cancel_token: token.clone(),
         };
-        self.sender
-            .try_send(item)
-            .map_err(|_| "转写队列已满，请稍后再试")?;
-        let mut states = self.states.lock();
-        states.insert(recording_id.clone(), TaskState::Pending);
-        let mut tokens = self.tokens.lock();
-        tokens.insert(recording_id, token.clone());
+        {
+            let mut states = self.states.lock();
+            if states.contains_key(&recording_id) {
+                return Err("该录音已经在转写队列中".into());
+            }
+            states.insert(recording_id.clone(), TaskState::Pending);
+            self.tokens
+                .lock()
+                .insert(recording_id.clone(), token.clone());
+        }
+        if self.sender.try_send(item).is_err() {
+            self.states.lock().remove(&recording_id);
+            self.tokens.lock().remove(&recording_id);
+            return Err("转写队列已满，请稍后再试".into());
+        }
         Ok(token)
     }
 
@@ -152,12 +156,18 @@ fn start_worker(
 
             if worker.is_none() {
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                    eprintln!("[Transcription] 连续 {consecutive_failures} 次失败，退避 {} 秒", FAILURE_BACKOFF.as_secs());
+                    eprintln!(
+                        "[Transcription] 连续 {consecutive_failures} 次失败，退避 {} 秒",
+                        FAILURE_BACKOFF.as_secs()
+                    );
                     std::thread::sleep(FAILURE_BACKOFF);
                     consecutive_failures = 0;
                 }
                 match crate::speech::SpeechWorker::start(&app) {
-                    Ok(w) => { worker = Some(w); consecutive_failures = 0; }
+                    Ok(w) => {
+                        worker = Some(w);
+                        consecutive_failures = 0;
+                    }
                     Err(e) => {
                         consecutive_failures += 1;
                         let _ = app
@@ -171,10 +181,11 @@ fn start_worker(
                 }
             }
 
-            let _ = app
-                .state::<RuntimeState>()
-                .db()
-                .set_processing_status(&item.recording_id, "transcribing", None);
+            let _ = app.state::<RuntimeState>().db().set_processing_status(
+                &item.recording_id,
+                "transcribing",
+                None,
+            );
             let _ = emit_snapshot(&app);
 
             let result = worker.as_mut().unwrap().transcribe(&item.path);
@@ -199,10 +210,12 @@ fn start_worker(
                         .map(|s| s.text.clone())
                         .collect::<Vec<_>>()
                         .join("\n");
-                    let _ = app
-                        .state::<RuntimeState>()
-                        .db()
-                        .complete_transcription(&item.recording_id, &raw, &text, &segments);
+                    let _ = app.state::<RuntimeState>().db().complete_transcription(
+                        &item.recording_id,
+                        &raw,
+                        &text,
+                        &segments,
+                    );
                     spawn_recording_summary(&app, &item.recording_id);
                 }
                 Err(e) => {

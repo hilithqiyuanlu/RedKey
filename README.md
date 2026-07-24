@@ -63,7 +63,7 @@ RedKey 是一个跨平台的桌面工作台，用键盘快捷键将需求任务�
 - **Windows**：`AlphaKey_0.1.0_x64-setup.exe`（NSIS 安装包）
 - **macOS**：`AlphaKey.app`（拖入 Applications 文件夹）
 
-首次启动时会自动初始化 Python 运行环境（约 1-2 分钟），后续启动无需等待。语音识别所需的 SenseVoiceSmall 和 CT-Transformer 模型需在设置中首次下载（约 500MB），之后的录音转写全程离线运行。
+安装包已内置固定版本的 Python 运行环境和 OCR/语音处理依赖，用户端不需要安装 Python、pip 或 ffmpeg。语音识别所需的 SenseVoiceSmall 和 CT-Transformer 模型需在设置中首次下载（约 500MB），下载完成后录音转写全程离线运行。
 
 ## 本地开发
 
@@ -134,7 +134,9 @@ npm run tauri build -- --bundles app
 ├── scripts/                # 构建脚本
 │   ├── build-windows-x64.ps1       # Windows 构建（含便携 Python 打包）
 │   ├── build-macos-aarch64.sh      # macOS 构建
-│   └── download_python.ps1         # 便携 Python 下载脚本
+│   └── download_python.ps1         # 旧版 Python 下载脚本（仅供兼容）
+├── runtime/                        # 构建阶段使用的固定 Python 依赖清单
+│   └── requirements.lock
 ```
 
 ### 窗口说明

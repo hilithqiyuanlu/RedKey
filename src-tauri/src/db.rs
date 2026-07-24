@@ -415,7 +415,7 @@ impl Database {
 
     pub fn finish_recording(&self, id: &str, duration: f64, audio_path: &str) -> Result<()> {
         let changed = self.conn.execute(
-            "UPDATE recordings SET duration=?2,status='completed',processing_status='queued',audio_path=?3,error_message=NULL,updated_at=?4 WHERE id=?1",
+            "UPDATE recordings SET duration=?2,status='completed',processing_status='queued',audio_path=?3,transcript='',raw_transcript='',speaker_segments='[]',error_message=NULL,processing_error=NULL,updated_at=?4 WHERE id=?1",
             params![id, duration.max(0.0), audio_path, now()],
         )?;
         anyhow::ensure!(changed == 1, "录音记录不存在");
@@ -442,6 +442,13 @@ impl Database {
     }
 
     pub fn set_processing_status(&self, id: &str, status: &str, error: Option<&str>) -> Result<()> {
+        if status == "transcribing" {
+            self.conn.execute(
+                "UPDATE recordings SET processing_status=?2,processing_error=NULL,transcript='',raw_transcript='',speaker_segments='[]',error_message=NULL,updated_at=?3 WHERE id=?1",
+                params![id, status, now()],
+            )?;
+            return Ok(());
+        }
         self.conn.execute(
             "UPDATE recordings SET processing_status=?2,processing_error=?3,updated_at=?4 WHERE id=?1",
             params![id, status, error, now()],

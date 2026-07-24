@@ -370,7 +370,7 @@ mod tests {
     #[test]
     fn default_shortcuts_use_task_prefix() {
         let shortcuts = ShortcutSettings::default();
-        assert_eq!(shortcuts.task_prefix, "Control+Alt");
+        assert_eq!(shortcuts.task_prefix, "CapsLock+Alt");
         assert!(shortcuts.validate().is_ok());
     }
 

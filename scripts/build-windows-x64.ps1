@@ -17,8 +17,8 @@ if (-not (Get-Command node -ErrorAction SilentlyContinue)) { ErrorExit "未找�
 if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { ErrorExit "未找到 npm" }
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) { ErrorExit "未找到 cargo，请先安装 Rust（https://rustup.rs）" }
 if (-not (Get-Command rustc -ErrorAction SilentlyContinue)) { ErrorExit "未找到 rustc" }
-$cargoTauri = cargo tauri --version 2>&1
-if ($LASTEXITCODE -ne 0) { ErrorExit "未找到 cargo tauri，请运行：cargo install tauri-cli" }
+$tauriCli = npx tauri --version 2>&1
+if ($LASTEXITCODE -ne 0) { ErrorExit "未找到项目内 Tauri CLI，请先运行 npm ci" }
 
 # 确保目标平台已安装
 rustup target add x86_64-pc-windows-msvc | Out-Null
@@ -36,7 +36,7 @@ foreach ($m in $models) {
     if (-not (Test-Path $m -PathType Leaf)) { ErrorExit "缺少模型文件：$m" }
 }
 
-# 准备 Windows 便携 Python（python-build-standalone）
+# 准备 Windows 便携 Python 和固定本地模型依赖（仅构建机联网）
 $pythonEmbedDir = "src-tauri/resources/python-embed"
 $pythonExe = Join-Path $pythonEmbedDir "python/python.exe"
 if (-not (Test-Path $pythonExe -PathType Leaf)) {
@@ -54,6 +54,24 @@ if (-not (Test-Path $pythonExe -PathType Leaf)) {
     Info "Windows 便携 Python 已存在"
 }
 
+$requirements = Join-Path $root "runtime/requirements.lock"
+if (-not (Test-Path $requirements -PathType Leaf)) { ErrorExit "缺少固定依赖清单：$requirements" }
+$runtimeStamp = Join-Path $pythonEmbedDir "python/.alphakey-runtime-v1"
+if (-not (Test-Path $runtimeStamp -PathType Leaf)) {
+    Info "在构建机安装固定 Python 依赖..."
+    & $pythonExe -m pip --version
+    if ($LASTEXITCODE -ne 0) { ErrorExit "便携 Python 缺少 pip，请重新下载完整 runtime" }
+    & $pythonExe -m pip install --disable-pip-version-check --no-input --no-cache-dir -r $requirements
+    if ($LASTEXITCODE -ne 0) { ErrorExit "安装固定 Python 依赖失败" }
+    & $pythonExe -c "import funasr, torch, torchaudio, modelscope, sentencepiece, soundfile, numpy, rapidocr_onnxruntime"
+    if ($LASTEXITCODE -ne 0) { ErrorExit "Python 依赖健康检查失败" }
+    Get-ChildItem (Join-Path $pythonEmbedDir "python/.dependencies-*") -Force -ErrorAction SilentlyContinue | Remove-Item -Force
+    Get-ChildItem (Join-Path $pythonEmbedDir "python/.alphakey-runtime-*") -Force -ErrorAction SilentlyContinue | Remove-Item -Force
+    New-Item -ItemType File -Force -Path $runtimeStamp | Out-Null
+} else {
+    Info "固定 Python 依赖已就绪"
+}
+
 Info "安装前端依赖..."
 npm install
 
@@ -61,7 +79,7 @@ Info "构建前端..."
 npm run build
 
 Info "构建 Windows x64 安装包..."
-cargo tauri build --target x86_64-pc-windows-msvc
+npx tauri build --target x86_64-pc-windows-msvc
 
 $exe = Get-ChildItem "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe" | Select-Object -First 1
 if (-not $exe) { ErrorExit "未找到构建产物 .exe" }
