@@ -4,6 +4,7 @@ import type {
   AppAction,
   AsrModelStatus,
   CreateTaskInput,
+  RuntimeStatus,
   Settings,
   Snapshot,
   ShortcutSettings,
@@ -115,6 +116,10 @@ export const api = {
   openConsoleNewTask: (url: string) => invoke<void>("open_console_new_task", { url }),
   asrModelStatuses: () => invoke<AsrModelStatus[]>("asr_model_statuses"),
   downloadAsrModel: (id: string) => invoke<void>("download_asr_model", { id }),
+  runtimeStatus: () => invoke<RuntimeStatus>("runtime_status"),
+  downloadRuntime: () => invoke<void>("download_runtime"),
+  cancelRuntimeDownload: () => invoke<void>("cancel_runtime_download"),
+  importRuntime: (zipPath: string) => invoke<void>("import_runtime", { zipPath }),
 };
 
 export async function onSnapshot(callback: (snapshot: Snapshot) => void): Promise<UnlistenFn> {
@@ -164,4 +169,11 @@ export async function onAsrModelDownloadProgress(
 ): Promise<UnlistenFn> {
   if (!inTauri()) return () => undefined;
   return listen<AsrModelDownloadProgress>("redkey://model-download-progress", ({ payload }) => callback(payload));
+}
+
+export async function onRuntimeProgress(
+  callback: (payload: RuntimeStatus) => void,
+): Promise<UnlistenFn> {
+  if (!inTauri()) return () => undefined;
+  return listen<RuntimeStatus>("redkey://runtime-progress", ({ payload }) => callback(payload));
 }

@@ -6,10 +6,11 @@ import {
   FileImage, FileText, KeyRound, Link2, ListTodo, LoaderCircle, Mic, MicOff, Pause, Pencil, Play,
   Plus, RefreshCw, RotateCcw, Settings as SettingsIcon, Sparkles, Trash2, UserRound, X,
 } from "lucide-react";
-import { api, inTauri, onAsrModelDownloadProgress, onLinkDrop, onNewTask, onPetMode, onQuickPanelShown, onRecordingToggle, onTaskHud } from "./api";
+import { api, inTauri, onAsrModelDownloadProgress, onLinkDrop, onNewTask, onPetMode, onQuickPanelShown, onRecordingToggle, onRuntimeProgress, onTaskHud } from "./api";
+import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { extractHttpUrl, petState, slotLabel } from "./domain";
 import type {
-  AsrModelStatus, DeepSeekSettings, ImageCard, Recording, RecordingDetail, RecordingSummary, Settings,
+  AsrModelStatus, DeepSeekSettings, ImageCard, Recording, RecordingDetail, RecordingSummary, RuntimeStatus, Settings,
   Snapshot, Task, TaskDocument, TaskHudPayload, TextCard,
 } from "./types";
 import { useSnapshot } from "./useSnapshot";
@@ -65,6 +66,14 @@ function ConsoleApp() {
     }
     setSelectedId(candidates[0].id);
   }, [snapshot, view, selectedId, activeTasks, completedTasks]);
+
+  useEffect(() => {
+    if (!inTauri()) return;
+    // 首次启动自动拉取本地模型运行时（不阻塞基础录音）。
+    void api.runtimeStatus().then((status) => {
+      if (!status.ready && !status.downloading) void api.downloadRuntime().catch(() => undefined);
+    }).catch(() => undefined);
+  }, []);
 
   useEffect(() => {
     let cleanup: (() => void) | undefined;
@@ -1062,7 +1071,7 @@ function TaskOverflowDialog({ tasks, onResolved, notify }: { tasks: Task[]; onRe
 }
 
 function SettingsView({ snapshot, setSnapshot, notify }: { snapshot: Snapshot; setSnapshot: (value: Snapshot) => void; notify: (message: string) => void }) {
-  return <div className="settings-page"><header><small>偏好</small><h1>设置</h1></header><section className="settings-section"><h2>通用</h2><SettingToggle label="开机启动" description="登录后自动启动" checked={snapshot.settings.autostart} onChange={(value) => void api.setAutostart(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><SettingToggle label="宠物悬浮窗" description="桌面悬浮按键与任务列表" checked={snapshot.settings.petVisible} onChange={(value) => void api.setPetVisible(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><SettingToggle label="使用云端API" description="关闭后点击AI总结入口会复制prompt到剪贴板" checked={snapshot.settings.cloudApiEnabled} onChange={(value) => void api.updateSettings({ ...snapshot.settings, cloudApiEnabled: value }).then(setSnapshot).catch((reason) => notify(String(reason)))} /><ShortcutPrefix value={snapshot.settings.shortcuts.taskPrefix} onSaved={setSnapshot} notify={notify} /></section><DeepSeekPanel notify={notify} /><LocalModels notify={notify} /><SnapshotTools setSnapshot={setSnapshot} notify={notify} /></div>;
+  return <div className="settings-page"><header><small>偏好</small><h1>设置</h1></header><section className="settings-section"><h2>通用</h2><SettingToggle label="开机启动" description="登录后自动启动" checked={snapshot.settings.autostart} onChange={(value) => void api.setAutostart(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><SettingToggle label="宠物悬浮窗" description="桌面悬浮按键与任务列表" checked={snapshot.settings.petVisible} onChange={(value) => void api.setPetVisible(value).then(setSnapshot).catch((reason) => notify(String(reason)))} /><SettingToggle label="使用云端API" description="关闭后点击AI总结入口会复制prompt到剪贴板" checked={snapshot.settings.cloudApiEnabled} onChange={(value) => void api.updateSettings({ ...snapshot.settings, cloudApiEnabled: value }).then(setSnapshot).catch((reason) => notify(String(reason)))} /><ShortcutPrefix value={snapshot.settings.shortcuts.taskPrefix} onSaved={setSnapshot} notify={notify} /></section><DeepSeekPanel notify={notify} /><RuntimeManager notify={notify} /><LocalModels notify={notify} /><SnapshotTools setSnapshot={setSnapshot} notify={notify} /></div>;
 }
 
 function ShortcutPrefix({ value, onSaved, notify }: { value: string; onSaved: (value: Snapshot) => void; notify: (message: string) => void }) {
@@ -1108,6 +1117,77 @@ function DeepSeekPanel({ notify }: { notify: (message: string) => void }) {
   async function save() { setBusy(true); try { setSettings(await api.saveDeepSeekApiKey(key)); setKey(""); notify("API Key 已保存到系统钥匙串"); } catch (reason) { notify(String(reason)); } finally { setBusy(false); } }
   async function test() { setBusy(true); try { await api.testDeepSeekConnection(); notify("DeepSeek 连接正常"); } catch (reason) { notify(String(reason)); } finally { setBusy(false); } }
   return <section className="settings-section"><div className="section-heading"><div><h2>云端 AI</h2><p>录音完成后自动梳理结论和待办。</p></div><span className={`status-badge ${settings?.configured ? "success" : "warning"}`}>{settings?.configured ? "已配置" : "未配置"}</span></div><div className="api-row"><KeyRound /><div><strong>DeepSeek</strong><small>{settings?.model ?? "deepseek-v4-flash"}</small></div><input type="password" value={key} placeholder={settings?.configured ? "输入新 Key 替换" : "sk-..."} onChange={(event) => setKey(event.target.value)} /><button className="primary" disabled={!key.trim() || busy} onClick={() => void save()}>保存</button>{settings?.configured && <button disabled={busy} onClick={() => void test()}>测试</button>}{settings?.configured && <IconButton danger label="删除 API Key" onClick={() => void api.deleteDeepSeekApiKey().then(setSettings).then(() => notify("API Key 已删除")).catch((reason) => notify(String(reason)))}><Trash2 /></IconButton>}</div></section>;
+}
+
+function RuntimeManager({ notify }: { notify: (message: string) => void }) {
+  const [status, setStatus] = useState<RuntimeStatus | null>(null);
+
+  useEffect(() => {
+    void api.runtimeStatus().then(setStatus).catch(() => undefined);
+    let cleanup: (() => void) | undefined;
+    void onRuntimeProgress(setStatus).then((stop) => { cleanup = stop; });
+    return () => cleanup?.();
+  }, []);
+
+  async function refresh() {
+    try { setStatus(await api.runtimeStatus()); } catch { /* ignore */ }
+  }
+
+  async function importLocal() {
+    try {
+      const picked = await openFileDialog({ multiple: false, filters: [{ name: "运行时压缩包", extensions: ["zip"] }] });
+      if (typeof picked === "string") await api.importRuntime(picked);
+    } catch (reason) { notify(String(reason)); }
+  }
+
+  const ready = status?.ready ?? false;
+  const downloading = status?.downloading ?? false;
+  const progress = status?.progress ?? 0;
+  const mb = (n: number) => (n / 1024 / 1024).toFixed(0);
+
+  return (
+    <section className="settings-section">
+      <div className="section-heading">
+        <div>
+          <h2>本地运行时</h2>
+          <p>OCR 与语音转写需要 Python 运行时；首次启动会自动下载。基础录音不受影响。</p>
+        </div>
+        <div className="section-actions">
+          <button onClick={() => void refresh()}>刷新</button>
+          {ready ? (
+            <span className="status-badge success"><CircleCheck size={14} /> 已就绪</span>
+          ) : downloading ? (
+            <button onClick={() => void api.cancelRuntimeDownload()}>取消</button>
+          ) : (
+            <button className="primary" onClick={() => void api.downloadRuntime()}>
+              {status?.error ? "重试下载" : "下载运行时"}
+            </button>
+          )}
+        </div>
+      </div>
+      {downloading && (
+        <div className="model-progress">
+          <span>
+            {status?.stage} {progress}%
+            {status?.totalBytes ? ` · ${mb(status.downloadedBytes)}/${mb(status.totalBytes)} MB` : ""}
+          </span>
+          <div className="progress-bar"><div style={{ width: `${progress}%` }} /></div>
+        </div>
+      )}
+      {!ready && !downloading && status?.error && (
+        <small className="model-error">{status.error}</small>
+      )}
+      {!downloading && (
+        <div className="model-row">
+          <div>
+            <strong>离线导入</strong>
+            <small>已有 python-runtime-win-x64-v1.zip 时可直接导入，仍会校验 SHA-256</small>
+          </div>
+          <button onClick={() => void importLocal()} disabled={ready}>选择文件…</button>
+        </div>
+      )}
+    </section>
+  );
 }
 
 function LocalModels({ notify }: { notify: (message: string) => void }) {

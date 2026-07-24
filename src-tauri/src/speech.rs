@@ -18,8 +18,6 @@ use tauri::{AppHandle, Emitter, Manager};
 
 pub const ASR_ID: &str = "FunASR";
 pub const OCR_ID: &str = "RapidOCR";
-const RUNTIME_IMPORT_CHECK: &str = "import funasr, torch, torchaudio, modelscope, sentencepiece, soundfile, numpy, rapidocr_onnxruntime";
-const RUNTIME_MARKER: &str = ".alphakey-runtime-v1";
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_request_id(prefix: &str) -> String {
@@ -48,7 +46,7 @@ fn model_download_url(id: &str) -> Option<&'static str> {
 }
 
 pub(crate) fn python_path(app: &AppHandle) -> Result<PathBuf> {
-    bootstrap_python(app)
+    crate::runtime::python_path(app)
 }
 
 fn worker_path(app: &AppHandle) -> Result<PathBuf> {
@@ -68,53 +66,6 @@ fn bundled_models_dir(app: &AppHandle) -> Result<PathBuf> {
 
 fn models_data_dir(app: &AppHandle) -> Result<PathBuf> {
     Ok(app.path().app_data_dir()?.join("models/FunASR"))
-}
-
-fn find_python() -> Result<PathBuf> {
-    for cmd in [
-        "python3.12",
-        "python3.11",
-        "python3.10",
-        "python3",
-        "python",
-    ] {
-        if let Ok(output) = no_window(Command::new(cmd).args(["--version"])).output() {
-            let version = format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            if version.contains("3.10") || version.contains("3.11") || version.contains("3.12") {
-                return Ok(PathBuf::from(cmd));
-            }
-        }
-    }
-    bail!("未找到 Python 3.10~3.12，请安装 Python 3.11")
-}
-
-fn bootstrap_python(app: &AppHandle) -> Result<PathBuf> {
-    let resource_dir = app.path().resource_dir()?;
-    let candidates = if cfg!(windows) {
-        vec![
-            resource_dir.join("python-embed/python/python.exe"),
-            resource_dir.join("python-embed/python.exe"),
-        ]
-    } else {
-        vec![
-            resource_dir.join("python-embed/python/bin/python3"),
-            resource_dir.join("python-embed/python/bin/python"),
-        ]
-    };
-    for candidate in candidates {
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-
-    if cfg!(debug_assertions) {
-        return find_python();
-    }
-    bail!("安装包缺少本地模型运行环境，请重新安装 AlphaKey")
 }
 
 pub(crate) fn append_log(app: &AppHandle, filename: &str, message: &str) {
@@ -137,61 +88,12 @@ pub(crate) fn append_log(app: &AppHandle, filename: &str, message: &str) {
     }
 }
 
-fn runtime_health(app: &AppHandle, python: &Path) -> Result<()> {
-    let bundled_root = app.path().resource_dir()?.join("python-embed");
-    if python.starts_with(&bundled_root) {
-        let runtime_root = python
-            .parent()
-            .and_then(Path::parent)
-            .filter(|path| path.file_name().and_then(|name| name.to_str()) == Some("python"))
-            .or_else(|| python.parent())
-            .context("内置 Python 路径无效")?;
-        let marker = runtime_root.join(RUNTIME_MARKER);
-        if !marker.is_file() {
-            append_log(
-                app,
-                "runtime.log",
-                &format!("runtime marker missing: {}", marker.display()),
-            );
-            bail!("本地模型运行环境版本不匹配，请重新安装 AlphaKey")
-        }
-    }
-    let output = no_window(
-        Command::new(python)
-            .args(["-c", RUNTIME_IMPORT_CHECK])
-            .env("PYTHONUTF8", "1")
-            .env("PYTHONIOENCODING", "utf-8")
-            .env("PYTHONUNBUFFERED", "1"),
-    )
-    .output()
-    .context("无法启动内置 Python")?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    append_log(
-        app,
-        "runtime.log",
-        &format!(
-            "runtime health check failed: status={:?}; stderr={}; stdout={}",
-            output.status.code(),
-            stderr.trim(),
-            stdout.trim()
-        ),
-    );
-    bail!("本地模型运行环境不完整，请重新安装 AlphaKey")
-}
-
 pub fn ensure_runtime(app: &AppHandle) -> Result<()> {
-    let python = python_path(app)?;
-    runtime_health(app, &python)
+    crate::runtime::ensure_ready(app)
 }
 
 pub fn runtime_ready(app: &AppHandle) -> bool {
-    python_path(app)
-        .and_then(|python| runtime_health(app, &python))
-        .is_ok()
+    crate::runtime::is_ready(app)
 }
 
 /// 给前端返回的模型状态。ASR 与 OCR 模型均已内置，这里仅保留 OCR 的下载状态接口兼容。

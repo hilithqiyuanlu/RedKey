@@ -2,6 +2,7 @@ mod db;
 mod llm;
 mod models;
 mod ocr;
+mod runtime;
 mod speech;
 mod transcription;
 
@@ -1429,6 +1430,7 @@ pub fn run() {
             let _ = show_console_window(app);
         }))
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_window_state::Builder::default()
                 // The HUD's visibility is purely a transient reflection of the
@@ -1556,6 +1558,10 @@ pub fn run() {
             crate::ocr::perform_ocr,
             speech::asr_model_statuses,
             speech::download_asr_model,
+            runtime::runtime_status,
+            runtime::download_runtime,
+            runtime::cancel_runtime_download,
+            runtime::import_runtime,
         ]);
 
     let app = builder

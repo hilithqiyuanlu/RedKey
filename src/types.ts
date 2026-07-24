@@ -118,6 +118,18 @@ export interface AsrModelStatus {
   error: string | null;
 }
 
+export interface RuntimeStatus {
+  ready: boolean;
+  version: string;
+  downloading: boolean;
+  phase: string;
+  stage: string;
+  progress: number;
+  downloadedBytes: number;
+  totalBytes: number | null;
+  error: string | null;
+}
+
 export interface TaskHudPayload {
   slots: { slot: number; taskId: string | null; name: string | null; title: string | null }[];
 }

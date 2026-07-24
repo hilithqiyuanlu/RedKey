@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run build:bundle",
     "frontendDist": "../dist"
   },
   "app": {
@@ -78,7 +78,7 @@
       "../workers/ocr_worker.py": "workers/ocr_worker.py",
       "resources/models/FunASR": "models/FunASR",
       "resources/models/RapidOCR": "models/RapidOCR",
-      "resources/python-embed": "python-embed"
+      "resources/runtime-manifest.json": "runtime-manifest.json"
     },
     "targets": ["nsis", "app", "dmg"],
     "icon": [
