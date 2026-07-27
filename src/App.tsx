@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { getCurrentWindow, LogicalPosition } from "@tauri-apps/api/window";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import {
@@ -793,6 +794,15 @@ function ImageCardView({ card, readOnly, editing, onEditing, onRefresh, onDelete
 
   useEffect(() => { setContent(card.content); savedRef.current = card.content; }, [card.id, card.content]);
 
+  useEffect(() => {
+    if (!lightbox) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setLightbox(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [lightbox]);
+
   // auto-save on edit
   useEffect(() => {
     if (!editing || content === savedRef.current) return;
@@ -849,7 +859,12 @@ function ImageCardView({ card, readOnly, editing, onEditing, onRefresh, onDelete
       <p>{card.content || "点击插入图片或用 CTRL + V 直接粘贴图片"}</p>
       {!readOnly && <input ref={fileInputRef} type="file" accept="image/*" style={{ display: "none" }} onChange={(event) => { const file = event.target.files?.[0]; if (file) handleFile(file); event.target.value = ""; }} />}
     </div>)}
-    {lightbox && <div className="lightbox" onClick={() => setLightbox(false)}><img src={src} alt={card.filename} onClick={(e) => e.stopPropagation()} /></div>}
+    {lightbox && createPortal(
+      <div className="lightbox" role="dialog" aria-modal="true" aria-label={`${card.filename} 图片预览`} onClick={() => setLightbox(false)}>
+        <img src={src} alt={card.filename} onClick={(event) => event.stopPropagation()} />
+      </div>,
+      document.body,
+    )}
     {confirmDelete && <ConfirmDialog
       title="删除这张图片卡？"
       description="删除后无法恢复。"
