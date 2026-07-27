@@ -96,6 +96,13 @@ select:focus-visible {
   background: var(--bg);
   animation: fade-in 0.2s ease-out;
 }
+/* 设置页没有底部 slot-nav-bar，去掉为它预留的 96px 底部空间，避免出现遮挡样的大块空白 */
+.main-view:has(.settings-page) {
+  padding-bottom: 24px;
+}
+.main-view:has(.settings-page) .settings-page {
+  padding-bottom: 0;
+}
 
 .active-view {
   display: flex;
@@ -1022,6 +1029,32 @@ select:focus-visible {
   font-size: 13px;
   line-height: 1.5;
 }
+.recording-card:not(.editing) .summary-overview,
+.recording-card:not(.editing) .summary-section {
+  cursor: text;
+}
+.recording-summary-textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 220px;
+  resize: vertical;
+  padding: 13px 14px;
+  border: 1px solid var(--accent);
+  border-left-width: 3px;
+  border-radius: 0;
+  outline: none;
+  color: var(--fg);
+  background: var(--bg);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+.recording-summary-textarea:focus,
+.recording-summary-textarea:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+}
 
 .summary-section {
   min-width: 0;
@@ -1936,7 +1969,6 @@ button.primary:hover,
 }
 .active-list-empty svg { width: 28px; height: 28px; color: var(--muted); }
 .active-list-empty strong { color: var(--fg); font-size: 13px; }
-.summary-editor { width: min(650px, 100%); }
 .overflow-dialog { width: min(620px, 100%); }
 .confirm-dialog { width: min(420px, 100%); gap: 16px; }
 .confirm-dialog > header { margin-bottom: -2px; }
@@ -2070,6 +2102,7 @@ button.primary:hover,
   margin-bottom: 14px;
 }
 .section-heading > div { display: grid; gap: 5px; min-width: 0; overflow: hidden; }
+.section-heading > .section-actions { display: flex; gap: 8px; min-width: 0; overflow: visible; }
 .section-heading h2 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .section-heading p { margin: 0; color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
@@ -2196,13 +2229,14 @@ button.primary:hover,
 
 .model-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 12px;
   min-height: 58px;
   border-top: 1px solid var(--border-l1);
 }
 .model-row > div { display: grid; gap: 4px; }
+.model-row > .model-status { display: flex; gap: 8px; }
 .model-row strong { font-size: 12px; font-weight: 500; }
 .model-row small { color: var(--muted); font-size: 10px; }
 
@@ -2246,9 +2280,11 @@ button.primary:hover,
 .model-row progress:indeterminate { background: var(--surface-alt); }
 
 .model-status {
-  display: grid;
-  gap: 4px;
-  justify-items: end;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: flex-end;
+  flex-wrap: wrap;
 }
 .model-status button.status-badge {
   cursor: pointer;
@@ -2317,6 +2353,20 @@ button.primary:hover,
 }
 .model-row > button:hover { background: var(--bg-secondary); }
 .model-row > button svg { width: 14px; }
+
+.runtime-details { display: grid; gap: 4px; min-width: 0; }
+.runtime-details strong { font-size: 12px; font-weight: 500; }
+.runtime-details small { color: var(--muted); font-size: 10px; overflow-wrap: anywhere; }
+.runtime-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 16px;
+  min-height: 64px;
+  border-top: 1px solid var(--border-l1);
+}
+.runtime-actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; flex-wrap: wrap; }
+.runtime-details .model-progress-line { width: min(380px, 100%); }
 
 /* ----------------------------------------------------------
    Toggle Cards Row
@@ -2840,6 +2890,34 @@ button.primary:hover,
   animation: pet-breathe 3s ease-in-out infinite;
 }
 
+/* AI Summary: rotating background diamond + static face overlay */
+.pet-ai-summary {
+  position: relative;
+  width: 56px;
+  height: 56px;
+  pointer-events: none;
+}
+.pet-ai-summary-bg,
+.pet-ai-summary-face {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  pointer-events: none;
+}
+.pet-ai-summary-bg {
+  animation: ai-summary-spin 2.6s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+}
+.pet-shell.pressed .pet-ai-summary {
+  transform: scale(0.95);
+}
+
+@keyframes ai-summary-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
 /* ----------------------------------------------------------
    HUD Windows
    ---------------------------------------------------------- */
@@ -3113,5 +3191,22 @@ button.primary:hover,
     grid-template-columns: repeat(5, minmax(0, 1fr));
     grid-template-rows: auto auto;
   }
+  /* 设置页：窄窗口下标题与操作按钮不再挤压 */
+  .section-heading {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+  }
+  .section-heading p { white-space: normal; }
+  .section-actions { width: 100%; justify-content: flex-end; flex-wrap: wrap; }
+  /* 模型行：信息块与操作区垂直堆叠，避免撞列 */
+  .model-row {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+  .model-status { justify-content: flex-start; width: 100%; }
+  .model-progress { width: 100%; }
+  .runtime-row { grid-template-columns: 1fr; gap: 10px; padding: 12px 0; }
+  .runtime-actions { justify-content: flex-start; }
 }
 

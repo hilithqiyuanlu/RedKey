@@ -9,6 +9,12 @@ import {
 import { api, inTauri, onAsrModelDownloadProgress, onLinkDrop, onNewTask, onPetMode, onQuickPanelShown, onRecordingToggle, onRuntimeProgress, onTaskHud } from "./api";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { extractHttpUrl, petState, slotLabel } from "./domain";
+import {
+  isUnifiedRecordingSummary,
+  parseRecordingSummaryEditor,
+  recordingSummaryEditorText,
+  recordingSummaryPreviewItems,
+} from "./recordingSummary";
 import type {
   AsrModelStatus, DeepSeekSettings, ImageCard, Recording, RecordingDetail, RecordingSummary, RuntimeStatus, Settings,
   Snapshot, Task, TaskDocument, TaskHudPayload, TextCard,
@@ -16,6 +22,50 @@ import type {
 import { useSnapshot } from "./useSnapshot";
 
 type View = "active" | "completed" | "settings";
+
+const ASR_MODEL_IDS = ["SenseVoiceSmall", "FSMN-VAD", "CT-Transformer", "CAM++"];
+// OCR 使用运行时自带的 mobile 模型，除 Python 运行时外无需额外下载。
+const OCR_MODEL_IDS: string[] = [];
+const fmtMb = (n: number) => (n / 1024 / 1024).toFixed(0);
+let asrPromptShown = false;
+
+async function prepareAiOrPrompt(kind: "ocr" | "asr", notify: (message: string) => void): Promise<boolean> {
+  if (!inTauri()) return true;
+  let runtime: RuntimeStatus;
+  let models: AsrModelStatus[];
+  try {
+    [runtime, models] = await Promise.all([api.runtimeStatus(), api.asrModelStatuses()]);
+  } catch {
+    return true;
+  }
+
+  const needIds = kind === "ocr" ? OCR_MODEL_IDS : ASR_MODEL_IDS;
+  const missingModels = models.filter((model) => needIds.includes(model.id) && !model.ready);
+  const feature = kind === "ocr" ? "文字识别（OCR）" : "语音转写";
+  if (runtime.ready && missingModels.length === 0) return true;
+  if (runtime.downloading || missingModels.some((model) => model.downloading)) {
+    notify(`${feature}所需组件正在下载，完成后请重试`);
+    return false;
+  }
+
+  const runtimeBytes = runtime.ready ? 0 : (runtime.sizeBytes ?? 0);
+  const totalBytes = runtimeBytes + missingModels.reduce((sum, model) => sum + model.sizeBytes, 0);
+  const items = [
+    ...(!runtime.ready ? [`CPU 运行环境${runtimeBytes ? `（${fmtMb(runtimeBytes)} MB）` : ""}`] : []),
+    ...missingModels.map((model) => `${model.name}（${fmtMb(model.sizeBytes)} MB）`),
+  ];
+  if (!window.confirm(`${feature}需要下载以下组件${totalBytes ? `（共 ${fmtMb(totalBytes)} MB）` : ""}：\n\n${items.join("\n")}\n\n是否现在下载？`)) {
+    return false;
+  }
+  if (!runtime.ready) {
+    try { await api.downloadRuntime(); } catch (error) { notify(String(error)); }
+  }
+  for (const model of missingModels) {
+    try { await api.downloadModel(model.id); } catch (error) { notify(String(error)); }
+  }
+  notify(`${feature}组件已开始下载，可在设置页查看进度`);
+  return false;
+}
 
 function windowView() { return new URLSearchParams(window.location.search).get("view") ?? "console"; }
 function initialView(): View { return windowView() === "settings" ? "settings" : "active"; }
@@ -66,14 +116,6 @@ function ConsoleApp() {
     }
     setSelectedId(candidates[0].id);
   }, [snapshot, view, selectedId, activeTasks, completedTasks]);
-
-  useEffect(() => {
-    if (!inTauri()) return;
-    // 首次启动自动拉取本地模型运行时（不阻塞基础录音）。
-    void api.runtimeStatus().then((status) => {
-      if (!status.ready && !status.downloading) void api.downloadRuntime().catch(() => undefined);
-    }).catch(() => undefined);
-  }, []);
 
   useEffect(() => {
     let cleanup: (() => void) | undefined;
@@ -139,6 +181,8 @@ function ConsoleApp() {
       if (taskId) setSnapshot(await api.setCurrentTask(taskId, false));
       recordingIdRef.current = await api.startNativeRecording(); nativeRecordingRef.current = true;
       recordingStartedRef.current = Date.now(); startClock(); setIsRecording(true); notify("已开始录音"); setDocumentVersion((value) => value + 1);
+      // 录音本身不依赖 AI 组件；仅在缺失时提示一次转写所需下载（不阻塞录音）。
+      if (!asrPromptShown) { asrPromptShown = true; void prepareAiOrPrompt("asr", notify); }
     } catch (reason) {
       recordingIdRef.current = null; setIsRecording(false); setDocumentVersion((value) => value + 1);
       notify(`无法开始录音：${String(reason)}`);
@@ -214,7 +258,7 @@ function ConsoleApp() {
   </div>;
 }
 
-function useTaskDocument(taskId: string | null, _snapshot: Snapshot | null, version: number) {
+function useTaskDocument(taskId: string | null, snapshot: Snapshot | null, version: number) {
   const [document, setDocument] = useState<TaskDocument | null>(null);
   const [loading, setLoading] = useState(false);
   useEffect(() => {
@@ -223,7 +267,7 @@ function useTaskDocument(taskId: string | null, _snapshot: Snapshot | null, vers
     setLoading(true);
     void api.taskDocument(taskId).then((value) => { if (active) { setDocument(value); setLoading(false); } }).catch(() => { if (active) { setDocument(null); setLoading(false); } });
     return () => { active = false; };
-  }, [taskId, version]);
+  }, [taskId, snapshot, version]);
   return { document, loading };
 }
 
@@ -370,11 +414,13 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
       audioPath: null,
       updatedAt: new Date().toISOString(),
     } : null;
+    const optimisticTextIds = new Set(optimisticCards.text.map((card) => card.id));
+    const optimisticImageIds = new Set(optimisticCards.image.map((card) => card.id));
     return [
       ...optimisticCards.text.filter((c) => !deletedCardIds.has(c.id)).map((card) => ({ type: "text" as const, updatedAt: card.updatedAt, card })),
       ...optimisticCards.image.filter((c) => !deletedCardIds.has(c.id)).map((card) => ({ type: "image" as const, updatedAt: card.updatedAt, card })),
-      ...document.textCards.filter((c) => !deletedCardIds.has(c.id)).map((card) => ({ type: "text" as const, updatedAt: card.updatedAt, card })),
-      ...document.imageCards.filter((c) => !deletedCardIds.has(c.id)).map((card) => ({ type: "image" as const, updatedAt: card.updatedAt, card })),
+      ...document.textCards.filter((c) => !deletedCardIds.has(c.id) && !optimisticTextIds.has(c.id)).map((card) => ({ type: "text" as const, updatedAt: card.updatedAt, card })),
+      ...document.imageCards.filter((c) => !deletedCardIds.has(c.id) && !optimisticImageIds.has(c.id)).map((card) => ({ type: "image" as const, updatedAt: card.updatedAt, card })),
       ...(optimisticRecording ? [{ type: "recording" as const, updatedAt: optimisticRecording.updatedAt, recording: optimisticRecording, optimistic: true }] : []),
       ...document.recordings.map((recording) => ({ type: "recording" as const, updatedAt: recording.updatedAt, recording, optimistic: false })),
     ].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
@@ -411,6 +457,7 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
       const file = event.clipboardData?.files?.[0];
       if (file && file.type.startsWith("image/")) {
         event.preventDefault();
+        void (async () => {
         const tempId = `temp-${Date.now()}`;
         const now = new Date().toISOString();
         const tempCard: ImageCard = { id: tempId, taskId: task.id, filename: file.name || "paste.png", mimeType: file.type, data: "", content: "识别中…", createdAt: now, updatedAt: now };
@@ -418,20 +465,38 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
         const reader = new FileReader();
         reader.onload = () => {
           const base64 = (reader.result as string).split(",")[1];
+          setOptimisticCards((prev) => ({
+            ...prev,
+            image: prev.image.map((card) => card.id === tempId ? { ...card, data: base64 } : card),
+          }));
           void api.createImageCard(task.id, file.name || "paste.png", file.type, base64, "识别中…").then(async (card) => {
             setOptimisticCards((prev) => ({
               ...prev,
-              image: prev.image.map((c) => c.id === tempId ? { ...card, id: tempId, content: "识别中…" } : c),
+              image: prev.image.map((c) => c.id === tempId ? { ...card, content: "识别中…" } : c),
             }));
             try {
+              if (!(await prepareAiOrPrompt("ocr", notify))) {
+                const message = "等待 OCR 组件下载后点击刷新重试";
+                await api.updateImageCardContent(card.id, message);
+                setOptimisticCards((prev) => ({
+                  ...prev,
+                  image: prev.image.map((c) => c.id === card.id ? { ...c, content: message } : c),
+                }));
+                return;
+              }
               const text = await api.ocrImageCard(card.id);
-              await api.updateImageCard(card.id, card.filename, card.mimeType, card.data, text);
-              setOptimisticCards((prev) => ({ ...prev, image: prev.image.filter((c) => c.id !== tempId) }));
-              onRefresh();
+              setOptimisticCards((prev) => ({
+                ...prev,
+                image: prev.image.map((c) => c.id === card.id ? { ...c, content: text } : c),
+              }));
               notify("OCR 识别完成");
             } catch (reason) {
-              setOptimisticCards((prev) => ({ ...prev, image: prev.image.filter((c) => c.id !== tempId) }));
-              onRefresh();
+              const message = "OCR 识别失败，可点击刷新重试";
+              void api.updateImageCardContent(card.id, message);
+              setOptimisticCards((prev) => ({
+                ...prev,
+                image: prev.image.map((c) => c.id === card.id ? { ...c, content: message } : c),
+              }));
               notify(String(reason));
             }
           }).catch((reason) => {
@@ -440,6 +505,7 @@ function DocumentWorkspace({ document, snapshot, setSnapshot, recordingElapsed, 
           });
         };
         reader.readAsDataURL(file);
+        })();
         return;
       }
       void api.pasteFromClipboard(task.id).then(() => onRefresh()).catch((reason) => notify(String(reason)));
@@ -730,12 +796,12 @@ function ImageCardView({ card, readOnly, editing, onEditing, onRefresh, onDelete
   // auto-save on edit
   useEffect(() => {
     if (!editing || content === savedRef.current) return;
-    const timer = window.setTimeout(() => { void api.updateImageCard(card.id, card.filename, card.mimeType, card.data, content).then(() => { savedRef.current = content; }).catch((reason) => notify(String(reason))); }, 600);
+    const timer = window.setTimeout(() => { void api.updateImageCardContent(card.id, content).then(() => { savedRef.current = content; }).catch((reason) => notify(String(reason))); }, 600);
     return () => {
       window.clearTimeout(timer);
-      if (content !== savedRef.current) { savedRef.current = content; void api.updateImageCard(card.id, card.filename, card.mimeType, card.data, content).catch((reason) => notify(String(reason))); }
+      if (content !== savedRef.current) { savedRef.current = content; void api.updateImageCardContent(card.id, content).catch((reason) => notify(String(reason))); }
     };
-  }, [content, editing, card.id, card.filename, card.mimeType, card.data, notify]);
+  }, [content, editing, card.id, notify]);
 
   function handleFile(file: File) {
     const reader = new FileReader();
@@ -748,8 +814,9 @@ function ImageCardView({ card, readOnly, editing, onEditing, onRefresh, onDelete
   }
 
   async function doOcr() {
+    if (!(await prepareAiOrPrompt("ocr", notify))) return;
     setOcrLoading(true);
-    try { const text = await api.ocrImageCard(card.id); setContent(text); onRefresh(); notify("OCR 识别完成"); }
+    try { const text = await api.ocrImageCard(card.id); setContent(text); notify("OCR 识别完成"); }
     catch (reason) { notify(String(reason)); }
     finally { setOcrLoading(false); }
   }
@@ -773,7 +840,7 @@ function ImageCardView({ card, readOnly, editing, onEditing, onRefresh, onDelete
     draggable={!editing}
     onDragStart={(event) => { if (editing) { event.preventDefault(); return; } event.dataTransfer.setData("application/redkey-card", JSON.stringify({ type: "image", id: card.id })); event.dataTransfer.effectAllowed = "move"; }}
   >
-    <header onClick={() => !editing && setExpanded((v) => !v)} style={{ cursor: editing ? undefined : "pointer" }}><span>{formatDate(card.createdAt)}</span><div onClick={(e) => e.stopPropagation()}>{hasImage && !readOnly && <IconButton label="重新识别文字" disabled={ocrLoading} onClick={() => void doOcr()}>{ocrLoading ? <LoaderCircle /> : <RefreshCw />}</IconButton>}{!readOnly && <IconButton label="编辑文本" onClick={() => editing ? stopEditing() : startEditing()}><Pencil /></IconButton>}{!readOnly && <IconButton danger label="删除图片" onClick={() => setConfirmDelete(true)}><Trash2 /></IconButton>}<IconButton label={expanded ? "收起" : "展开"} onClick={() => !editing && setExpanded((v) => !v)}>{expanded ? <ChevronDown /> : <ChevronRight />}</IconButton></div></header>
+    <header onClick={() => !editing && setExpanded((v) => !v)} style={{ cursor: editing ? undefined : "pointer" }}><div className="card-header-title">{formatDate(card.createdAt)}</div><div onClick={(e) => e.stopPropagation()}>{hasImage && !readOnly && <IconButton label="重新识别文字" disabled={ocrLoading} onClick={() => void doOcr()}>{ocrLoading ? <LoaderCircle /> : <RefreshCw />}</IconButton>}{!readOnly && <IconButton label="编辑文本" onClick={() => editing ? stopEditing() : startEditing()}><Pencil /></IconButton>}{!readOnly && <IconButton danger label="删除图片" onClick={() => setConfirmDelete(true)}><Trash2 /></IconButton>}<IconButton label={expanded ? "收起" : "展开"} onClick={() => !editing && setExpanded((v) => !v)}>{expanded ? <ChevronDown /> : <ChevronRight />}</IconButton></div></header>
     {expanded && (hasImage ? <div className="image-card-body">
       <div className="image-card-thumb" onClick={() => setLightbox(true)}><img src={src} alt={card.filename} /></div>
       {editing ? <textarea className="image-card-textarea" autoFocus value={content} placeholder="输入补充信息…" onChange={(event) => setContent(event.target.value)} onBlur={stopEditing} /> : <div className="image-card-text" onDoubleClick={startEditing}>{content || (ocrModelOk ? <span className="placeholder">点击上方刷新按钮进行 OCR 识别</span> : <span className="placeholder">请先安装本地 OCR 模型再点击上方刷新按钮来重新识别</span>)}</div>}
@@ -801,6 +868,8 @@ function RecordingCard({ recording, summary, activeElapsed, activeLevel, readOnl
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [confirmResummarize, setConfirmResummarize] = useState(false);
+  const [summaryText, setSummaryText] = useState("");
+  const savedSummaryTextRef = useRef("");
   useEffect(() => {
     if (!expanded || recording.status === "recording") return;
     let live = true;
@@ -809,6 +878,28 @@ function RecordingCard({ recording, summary, activeElapsed, activeLevel, readOnl
     return () => { live = false; };
   }, [expanded, recording.id, recording.status]);
   useEffect(() => () => { if (audioUrl) URL.revokeObjectURL(audioUrl); }, [audioUrl]);
+  useEffect(() => {
+    if (editing || !summary) return;
+    const value = recordingSummaryEditorText(summary);
+    setSummaryText(value);
+    savedSummaryTextRef.current = value;
+  }, [editing, summary]);
+  function saveSummary(value: string) {
+    if (!summary || value === savedSummaryTextRef.current) return;
+    const previousValue = savedSummaryTextRef.current;
+    savedSummaryTextRef.current = value;
+    void api.updateRecordingSummary(recording.id, parseRecordingSummaryEditor(summary, value))
+      .then(onRefresh)
+      .catch((reason) => {
+        if (savedSummaryTextRef.current === value) savedSummaryTextRef.current = previousValue;
+        notify(String(reason));
+      });
+  }
+  useEffect(() => {
+    if (!editing || !summary || summaryText === savedSummaryTextRef.current) return;
+    const timer = window.setTimeout(() => saveSummary(summaryText), 600);
+    return () => window.clearTimeout(timer);
+  }, [editing, summary, summaryText]);
 
   if (recording.status === "recording") return <article className="content-card recording-card recording-live">
     <header><div className="recording-live-meta"><span className="status-badge recording"><i />正在录音</span><strong>{formatDuration(activeElapsed)}</strong><AudioMeter level={activeLevel} /></div><button className="stop-recording" onClick={onStop}><MicOff />停止录音</button></header>
@@ -816,22 +907,34 @@ function RecordingCard({ recording, summary, activeElapsed, activeLevel, readOnl
   </article>;
 
   const status = displayRecordingStatus(recording, summary);
+  const transcriptionFailed = recording.status === "error" || recording.processingStatus.includes("error");
+  const startSummaryEditing = () => {
+    if (readOnly || !summary) return;
+    const value = recordingSummaryEditorText(summary);
+    savedSummaryTextRef.current = value;
+    setSummaryText(value);
+    setExpanded(true);
+    setEditing(true);
+  };
   return <article
-    className={`content-card recording-card ${expanded ? "expanded" : ""}`}
-    draggable
-    onDragStart={(event) => { event.dataTransfer.setData("application/redkey-card", JSON.stringify({ type: "recording", id: recording.id })); event.dataTransfer.effectAllowed = "move"; }}
+    className={`content-card recording-card ${expanded ? "expanded" : ""}${editing ? " editing" : ""}`}
+    draggable={!editing}
+    onDragStart={(event) => { if (editing) { event.preventDefault(); return; } event.dataTransfer.setData("application/redkey-card", JSON.stringify({ type: "recording", id: recording.id })); event.dataTransfer.effectAllowed = "move"; }}
   >
-    <header onClick={() => setExpanded((value) => !value)}>
-      <div className="recording-meta"><time>{formatDate(recording.createdAt)}</time>{status.tone === "success" ? <span className={`status-badge ${status.tone}`}>{status.loading && <LoaderCircle />}{status.label}</span> : <span className={`status-badge ${status.tone}`}>{status.loading && <LoaderCircle />}{status.label}</span>}</div>
+    <header onClick={() => !editing && setExpanded((value) => !value)} style={{ cursor: editing ? undefined : "pointer" }}>
+      <div className="recording-meta"><div className="card-header-title">{formatDate(recording.createdAt)}</div><span className={`status-badge ${status.tone}`}>{status.loading && <LoaderCircle />}{status.label}</span></div>
       <div className="recording-actions" onClick={(event) => event.stopPropagation()}>
-        {!readOnly && summary && <IconButton label="编辑 AI 总结" onClick={() => setEditing(true)}><Pencil /></IconButton>}
+        {!readOnly && transcriptionFailed && <IconButton label="重新转写" onClick={() => {
+          void api.retryTranscription(recording.id).then(() => { notify("已重新加入转写队列"); onRefresh(); }).catch((reason) => notify(String(reason)));
+        }}><RefreshCw /></IconButton>}
+        {!readOnly && summary && <IconButton label="编辑 AI 总结" onClick={startSummaryEditing}><Pencil /></IconButton>}
         {!readOnly && <IconButton danger label="删除录音" onClick={() => setConfirmDelete(true)}><Trash2 /></IconButton>}
-        <IconButton label={expanded ? "收起" : "展开"} onClick={() => setExpanded((value) => !value)}>{expanded ? <ChevronDown /> : <ChevronRight />}</IconButton>
+        <IconButton label={expanded ? "收起" : "展开"} disabled={editing} onClick={() => setExpanded((value) => !value)}>{expanded ? <ChevronDown /> : <ChevronRight />}</IconButton>
       </div>
     </header>
-    {!expanded && <div className="recording-collapsed" onDoubleClick={() => !readOnly && summary && setEditing(true)}><strong>{summary?.overview || recording.transcript || recording.errorMessage || "等待生成对接结论"}</strong>{summary?.pendingItems.length ? <ul>{summary.pendingItems.slice(0, 3).map((item) => <li key={item}>{item}</li>)}</ul> : <span>暂无待处理事项</span>}</div>}
+    {!expanded && <div className="recording-collapsed"><strong>{summary?.overview || recording.transcript || recording.errorMessage || "等待生成对接结论"}</strong>{summary && recordingSummaryPreviewItems(summary).length ? <ul>{recordingSummaryPreviewItems(summary).map((item) => <li key={item}>{item}</li>)}</ul> : <span>暂无待办行动</span>}</div>}
     {expanded && <div className="recording-expanded">
-      <SummaryView summary={summary} />
+      <SummaryView summary={summary} editing={editing} summaryText={summaryText} readOnly={readOnly} onChange={setSummaryText} onStartEditing={startSummaryEditing} onFinishEditing={() => { saveSummary(summaryText); setEditing(false); }} />
       {(summary?.status === "error" || summary?.status === "stale" || !summary) && recording.transcript && <button className="summary-trigger" onClick={() => {
         if (summary?.userEdited) { setConfirmResummarize(true); return; }
         if (!snapshot.settings.cloudApiEnabled) {
@@ -847,7 +950,6 @@ function RecordingCard({ recording, summary, activeElapsed, activeLevel, readOnl
       <SpeakerTranscript detail={detail} fallback={recording.transcript} />
       {audioUrl && <AudioPlayer src={audioUrl} />}
     </div>}
-    {editing && summary && <SummaryEditor summary={summary} onClose={() => setEditing(false)} onSave={(next) => void api.updateRecordingSummary(recording.id, next).then(() => { setEditing(false); onRefresh(); }).catch((reason) => notify(String(reason)))} />}
     {confirmDelete && <ConfirmDialog
       title="删除这条录音？"
       description="录音文件、转写文本和 AI 总结都会被删除，无法恢复。"
@@ -866,30 +968,31 @@ function RecordingCard({ recording, summary, activeElapsed, activeLevel, readOnl
   </article>;
 }
 
-function SummaryView({ summary }: { summary: RecordingSummary | null }) {
+function SummaryView({ summary, editing, summaryText, readOnly, onChange, onStartEditing, onFinishEditing }: {
+  summary: RecordingSummary | null; editing: boolean; summaryText: string; readOnly: boolean;
+  onChange: (value: string) => void; onStartEditing: () => void; onFinishEditing: () => void;
+}) {
   if (!summary) return <section className="summary-empty"><LoaderCircle /><span>等待 AI 梳理</span></section>;
   if (summary.status === "summarizing") return <section className="summary-empty"><LoaderCircle /><span>正在梳理对接内容</span></section>;
   if (summary.status === "error") return <section className="summary-empty error"><CircleAlert /><span>{summary.errorMessage || "AI 梳理失败"}</span></section>;
-  return <section className="ai-summary">
+  if (editing) return <textarea className="recording-summary-textarea" autoFocus value={summaryText} onChange={(event) => onChange(event.target.value)} onBlur={onFinishEditing} aria-label="编辑录音总结" />;
+  if (!isUnifiedRecordingSummary(summary)) return <section className="ai-summary legacy-summary" onDoubleClick={() => !readOnly && onStartEditing()}>
     <div className="summary-overview"><small>对接结论</small><strong>{summary.overview || "暂无明确结论"}</strong></div>
     <SummaryList title="待处理" items={summary.pendingItems} />
     <SummaryList title="已确认" items={summary.confirmedDecisions} />
     <SummaryList title="任务变化" items={summary.requestedChanges} />
     <SummaryList title="未解决问题" items={summary.openQuestions} />
-    {summary.actionItems.length > 0 && <div className="summary-section"><h4>行动项</h4><ul>{summary.actionItems.map((item, index) => <li key={`${item.text}-${index}`}>{item.text}{item.owner && <span>{item.owner}</span>}{item.due && <time>{item.due}</time>}</li>)}</ul></div>}
+    <ActionItems items={summary.actionItems} />
+  </section>;
+  return <section className="ai-summary">
+    <div className="summary-overview" onDoubleClick={() => !readOnly && onStartEditing()}><small>对接结论</small><strong>{summary.overview || "暂无明确结论"}</strong></div>
+    <ActionItems items={summary.actionItems} title="待办行动" onDoubleClick={() => !readOnly && onStartEditing()} />
   </section>;
 }
 
 function SummaryList({ title, items }: { title: string; items: string[] }) { return items.length ? <div className="summary-section"><h4>{title}</h4><ul>{items.map((item) => <li key={item}>{item}</li>)}</ul></div> : null; }
-
-function SummaryEditor({ summary, onClose, onSave }: { summary: RecordingSummary; onClose: () => void; onSave: (summary: RecordingSummary) => void }) {
-  const [overview, setOverview] = useState(summary.overview);
-  const [pending, setPending] = useState(summary.pendingItems.join("\n"));
-  const [decisions, setDecisions] = useState(summary.confirmedDecisions.join("\n"));
-  const [changes, setChanges] = useState(summary.requestedChanges.join("\n"));
-  const [questions, setQuestions] = useState(summary.openQuestions.join("\n"));
-  const lines = (value: string) => value.split("\n").map((item) => item.trim()).filter(Boolean);
-  return <div className="modal-backdrop" onClick={onClose}><section className="modal summary-editor" onClick={(event) => event.stopPropagation()}><header><strong>编辑录音总结</strong><IconButton label="关闭" onClick={onClose}><X /></IconButton></header><label>对接结论<textarea value={overview} onChange={(event) => setOverview(event.target.value)} /></label><label>待处理事项<textarea value={pending} onChange={(event) => setPending(event.target.value)} /></label><label>已确认事项<textarea value={decisions} onChange={(event) => setDecisions(event.target.value)} /></label><label>任务变化<textarea value={changes} onChange={(event) => setChanges(event.target.value)} /></label><label>未解决问题<textarea value={questions} onChange={(event) => setQuestions(event.target.value)} /></label><footer><button onClick={onClose}>取消</button><button className="primary" onClick={() => onSave({ ...summary, overview: overview.trim(), pendingItems: lines(pending), confirmedDecisions: lines(decisions), requestedChanges: lines(changes), openQuestions: lines(questions) })}>保存</button></footer></section></div>;
+function ActionItems({ items, title = "行动项", onDoubleClick }: { items: RecordingSummary["actionItems"]; title?: string; onDoubleClick?: () => void }) {
+  return items.length ? <div className="summary-section" onDoubleClick={onDoubleClick}><h4>{title}</h4><ul>{items.map((item, index) => <li key={`${item.text}-${index}`}>{item.text}{item.owner && <span>{item.owner}</span>}{item.due && <time>{item.due}</time>}</li>)}</ul></div> : null;
 }
 
 function AudioPlayer({ src }: { src: string }) {
@@ -1122,68 +1225,60 @@ function DeepSeekPanel({ notify }: { notify: (message: string) => void }) {
 function RuntimeManager({ notify }: { notify: (message: string) => void }) {
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
 
+  async function refresh() {
+    try { setStatus(await api.runtimeStatus()); }
+    catch (error) { notify(String(error)); }
+  }
+
   useEffect(() => {
-    void api.runtimeStatus().then(setStatus).catch(() => undefined);
+    void refresh();
     let cleanup: (() => void) | undefined;
     void onRuntimeProgress(setStatus).then((stop) => { cleanup = stop; });
     return () => cleanup?.();
   }, []);
 
-  async function refresh() {
-    try { setStatus(await api.runtimeStatus()); } catch { /* ignore */ }
-  }
-
   async function importLocal() {
     try {
-      const picked = await openFileDialog({ multiple: false, filters: [{ name: "运行时压缩包", extensions: ["zip"] }] });
+      const picked = await openFileDialog({ multiple: false, filters: [{ name: "运行环境压缩包", extensions: ["zip"] }] });
       if (typeof picked === "string") await api.importRuntime(picked);
-    } catch (reason) { notify(String(reason)); }
+    } catch (error) { notify(String(error)); }
   }
 
   const ready = status?.ready ?? false;
   const downloading = status?.downloading ?? false;
   const progress = status?.progress ?? 0;
-  const mb = (n: number) => (n / 1024 / 1024).toFixed(0);
 
   return (
     <section className="settings-section">
       <div className="section-heading">
-        <div>
-          <h2>本地运行时</h2>
-          <p>OCR 与语音转写需要 Python 运行时；首次启动会自动下载。基础录音不受影响。</p>
-        </div>
+        <div><h2>本地运行环境</h2><p>OCR 与语音转写使用 CPU 运行环境；普通录音、播放和保存不受影响。</p></div>
         <div className="section-actions">
-          <button onClick={() => void refresh()}>刷新</button>
+          <button onClick={() => void refresh()}><RefreshCw size={14} />刷新</button>
           {ready ? (
-            <span className="status-badge success"><CircleCheck size={14} /> 已就绪</span>
+            <span className="status-badge success"><CircleCheck size={14} />已就绪</span>
           ) : downloading ? (
             <button onClick={() => void api.cancelRuntimeDownload()}>取消</button>
           ) : (
-            <button className="primary" onClick={() => void api.downloadRuntime()}>
-              {status?.error ? "重试下载" : "下载运行时"}
+            <button className="primary" onClick={() => void api.downloadRuntime().catch((error) => notify(String(error)))}>
+              {status?.error ? "重试下载" : "下载运行环境"}
             </button>
           )}
         </div>
       </div>
       {downloading && (
         <div className="model-progress">
-          <span>
-            {status?.stage} {progress}%
-            {status?.totalBytes ? ` · ${mb(status.downloadedBytes)}/${mb(status.totalBytes)} MB` : ""}
-          </span>
+          <span>{status?.stage} {progress}%{status?.totalBytes ? ` · ${fmtMb(status.downloadedBytes)}/${fmtMb(status.totalBytes)} MB` : ""}</span>
           <div className="progress-bar"><div style={{ width: `${progress}%` }} /></div>
         </div>
       )}
-      {!ready && !downloading && status?.error && (
-        <small className="model-error">{status.error}</small>
-      )}
+      {!ready && !downloading && status?.error && <small className="model-error">{status.error}</small>}
       {!downloading && (
         <div className="model-row">
           <div>
             <strong>离线导入</strong>
-            <small>已有 python-runtime-win-x64-v1.zip 时可直接导入，仍会校验 SHA-256</small>
+            <small>{status?.filename ?? "python-runtime-win-x64-v1.zip"}{status?.sizeBytes ? ` · ${fmtMb(status.sizeBytes)} MB` : ""}，导入时仍会校验 SHA-256</small>
           </div>
-          <button onClick={() => void importLocal()} disabled={ready}>选择文件…</button>
+          <button onClick={() => void importLocal()}>选择文件…</button>
         </div>
       )}
     </section>
@@ -1194,6 +1289,7 @@ function LocalModels({ notify }: { notify: (message: string) => void }) {
   const [models, setModels] = useState<AsrModelStatus[]>([]);
   const [loading, setLoading] = useState(false);
   const [releasing, setReleasing] = useState(false);
+  const [busy, setBusy] = useState<Record<string, boolean>>({});
 
   async function releaseModels() {
     setReleasing(true);
@@ -1215,9 +1311,10 @@ function LocalModels({ notify }: { notify: (message: string) => void }) {
     void onAsrModelDownloadProgress((payload) => {
       setModels((prev) => prev.map((m) => {
         if (m.id !== payload.id) return m;
+        const downloading = ["下载中", "准备中", "连接中", "校验中", "解压中"].includes(payload.stage) || payload.stage.includes("重试");
         return {
           ...m,
-          downloading: payload.stage === "下载中" || payload.stage === "准备中" || payload.stage === "连接中" || payload.stage === "解压中",
+          downloading,
           progress: payload.progress,
           stage: payload.stage,
           error: payload.error,
@@ -1231,18 +1328,49 @@ function LocalModels({ notify }: { notify: (message: string) => void }) {
   async function download(id: string) {
     setModels((prev) => prev.map((m) => m.id === id ? { ...m, downloading: true, stage: "准备中", error: null } : m));
     try {
-      await api.downloadAsrModel(id);
+      await api.downloadModel(id);
     } catch (reason) {
       setModels((prev) => prev.map((m) => m.id === id ? { ...m, downloading: false, stage: "下载失败", error: String(reason) } : m));
     }
   }
+
+  async function repair(id: string) {
+    setBusy((b) => ({ ...b, [id]: true }));
+    try {
+      await api.deleteModel(id);
+      await download(id);
+    } catch (reason) {
+      notify(String(reason));
+    } finally {
+      setBusy((b) => ({ ...b, [id]: false }));
+    }
+  }
+
+  async function remove(id: string) {
+    if (!window.confirm("确认删除该组件？删除后使用相关功能需重新下载。")) return;
+    setBusy((b) => ({ ...b, [id]: true }));
+    try {
+      await api.deleteModel(id);
+      await refresh();
+      notify("已删除组件");
+    } catch (reason) {
+      notify(String(reason));
+    } finally {
+      setBusy((b) => ({ ...b, [id]: false }));
+    }
+  }
+
+  const mb = (n: number) => (n / 1024 / 1024).toFixed(0);
+  const groups: { key: string; title: string }[] = [
+    { key: "asr", title: "语音转写" },
+  ];
 
   return (
     <section className="settings-section">
       <div className="section-heading">
         <div>
           <h2>本地模型</h2>
-          <p>FunASR 大模型首次使用前需下载，小模型与 OCR 已内置。</p>
+          <p>语音转写模型按需下载到用户数据目录；OCR 使用运行时自带模型。未安装时不影响基础录音、播放与保存。</p>
         </div>
         <div className="section-actions">
           <button onClick={() => void releaseModels()} disabled={releasing}>
@@ -1253,27 +1381,39 @@ function LocalModels({ notify }: { notify: (message: string) => void }) {
           </button>
         </div>
       </div>
-      {models.map((model) => (
-        <div className="model-row" key={model.id}>
-          <div>
-            <strong>{model.name}</strong>
-            <small>{model.id}{model.bundled ? " · 已内置" : " · 首次使用需下载"}</small>
-          </div>
-          <div className="model-status">
-            {model.ready ? (
-              <span className="status-badge success"><CircleCheck size={14} /> 已就绪</span>
-            ) : model.downloading ? (
-              <div className="model-progress">
-                <span>{model.stage} {model.progress}%</span>
-                <div className="progress-bar"><div style={{ width: `${model.progress}%` }} /></div>
+      {groups.map((g) => (
+        <div key={g.key} className="model-group">
+          <h3 className="model-group-title">{g.title}</h3>
+          {models.filter((m) => m.group === g.key).map((model) => (
+            <div className="model-row" key={model.id}>
+              <div>
+                <strong>{model.name}</strong>
+                <small>{model.id} · 约 {mb(model.sizeBytes)} MB</small>
               </div>
-            ) : (
-              <button className="status-badge" onClick={() => void download(model.id)} disabled={model.downloading}>
-                {model.error ? "重试" : "下载"}
-              </button>
-            )}
-            {model.error && <small className="model-error">{model.error}</small>}
-          </div>
+              <div className="model-status">
+                {model.downloading ? (
+                  <div className="model-progress">
+                    <span>{model.stage} {model.progress}%</span>
+                    <div className="progress-bar"><div style={{ width: `${model.progress}%` }} /></div>
+                  </div>
+                ) : model.ready ? (
+                  <>
+                    <span className="status-badge success"><CircleCheck size={14} /> 已就绪</span>
+                    <button onClick={() => void repair(model.id)} disabled={busy[model.id]}>修复</button>
+                    <button onClick={() => void remove(model.id)} disabled={busy[model.id]}>删除</button>
+                  </>
+                ) : (
+                  <>
+                    <span className="status-badge">{model.error ? "失败" : "未安装"}</span>
+                    <button className="primary" onClick={() => void download(model.id)} disabled={busy[model.id]}>
+                      {model.error ? "重试" : "下载"}
+                    </button>
+                  </>
+                )}
+                {model.error && !model.downloading && <small className="model-error">{model.error}</small>}
+              </div>
+            </div>
+          ))}
         </div>
       ))}
     </section>
@@ -1377,10 +1517,17 @@ function Pet() {
     window.addEventListener("pointerup", handleUp);
     dragRef.current = { offsetX, offsetY, raf: null, moveListener: handleMove, upListener: handleUp };
   }
-  const imageSrc = petMode === "edit" ? "/pet/edit.png" : petMode === "recording" ? "/pet/recording.png" : petMode === "ai-summary" ? "/pet/ai-summary.png" : "/pet/default.png";
+  const imageSrc = petMode === "edit" ? "/pet/edit.png" : petMode === "recording" ? "/pet/recording.png" : "/pet/default.png";
   const state = petState(currentTask);
   return <div className={`pet-shell ${state} ${pressed ? "pressed" : ""}`} onPointerDown={(e) => void handlePointerDown(e)} onContextMenu={(event) => { event.preventDefault(); void api.showConsole(); }}>
-    <img className="pet-image" src={imageSrc} alt="Pet" draggable={false} />
+    {petMode === "ai-summary" ? (
+      <div className="pet-ai-summary">
+        <img className="pet-ai-summary-bg" src="/pet/ai-summary-bg.png" alt="" draggable={false} />
+        <img className="pet-ai-summary-face" src="/pet/ai-summary-face.png" alt="Pet" draggable={false} />
+      </div>
+    ) : (
+      <img className="pet-image" src={imageSrc} alt="Pet" draggable={false} />
+    )}
   </div>;
 }
 

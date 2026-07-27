@@ -1,0 +1,11 @@
+{
+    "version":  "v1",
+    "platforms":  {
+                      "win-x64":  {
+                                      "filename":  "python-runtime-win-x64-v1.zip",
+                                      "url":  "https://github.com/hilithqiyuanlu/RedKey/releases/download/runtime-v1/python-runtime-win-x64-v1.zip",
+                                      "sha256":  "9ce1726ab67482b0c8651dcc3ee0e72fe0aef7ea1bc75c1c616ac6f25e80af90",
+                                      "size_bytes":  347274775
+                                  }
+                  }
+}

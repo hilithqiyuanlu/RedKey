@@ -76,8 +76,6 @@
     "resources": {
       "../workers/funasr_asr_worker.py": "workers/funasr_asr_worker.py",
       "../workers/ocr_worker.py": "workers/ocr_worker.py",
-      "resources/models/FunASR": "models/FunASR",
-      "resources/models/RapidOCR": "models/RapidOCR",
       "resources/runtime-manifest.json": "runtime-manifest.json"
     },
     "targets": ["nsis", "app", "dmg"],

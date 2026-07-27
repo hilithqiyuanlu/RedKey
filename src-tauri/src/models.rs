@@ -42,17 +42,26 @@ pub struct ShortcutSettings {
     pub task_prefix: String,
 }
 
-fn default_task_prefix() -> String { "CapsLock+Alt".into() }
+fn default_task_prefix() -> String {
+    "CapsLock+Alt".into()
+}
 
 impl Default for ShortcutSettings {
     fn default() -> Self {
-        Self { task_prefix: default_task_prefix() }
+        Self {
+            task_prefix: default_task_prefix(),
+        }
     }
 }
 
 impl ShortcutSettings {
     pub fn validate(&self) -> anyhow::Result<()> {
-        let values = self.task_prefix.split('+').map(str::trim).filter(|value| !value.is_empty()).collect::<Vec<_>>();
+        let values = self
+            .task_prefix
+            .split('+')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
         anyhow::ensure!(!values.is_empty(), "前缀不能为空");
         anyhow::ensure!(values.len() <= 4, "前缀最多包含四个按键");
         Ok(())
@@ -72,9 +81,15 @@ pub struct Settings {
     pub shortcuts: ShortcutSettings,
 }
 
-fn default_multi_group_enabled() -> bool { true }
-fn default_pet_visible() -> bool { true }
-fn default_cloud_api_enabled() -> bool { true }
+fn default_multi_group_enabled() -> bool {
+    true
+}
+fn default_pet_visible() -> bool {
+    true
+}
+fn default_cloud_api_enabled() -> bool {
+    true
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -136,7 +151,9 @@ pub struct TextCard {
     pub updated_at: String,
 }
 
-fn default_text_card_source() -> String { "manual".into() }
+fn default_text_card_source() -> String {
+    "manual".into()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -200,11 +217,17 @@ pub struct DeepSeekSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SpeakerSegment { pub speaker: String, pub text: String }
+pub struct SpeakerSegment {
+    pub speaker: String,
+    pub text: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RecordingDetail { pub recording: Recording, pub segments: Vec<SpeakerSegment> }
+pub struct RecordingDetail {
+    pub recording: Recording,
+    pub segments: Vec<SpeakerSegment>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -228,13 +251,17 @@ pub struct ModelStatus {
     pub verified: bool,
 }
 
-fn default_progress_kind() -> String { "idle".into() }
+fn default_progress_kind() -> String {
+    "idle".into()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AsrModelStatus {
     pub id: String,
     pub name: String,
+    pub group: String,
+    pub size_bytes: u64,
     pub bundled: bool,
     pub ready: bool,
     pub downloading: bool,
@@ -361,7 +388,9 @@ pub struct ExportBinding {
     pub task_id: String,
 }
 
-fn default_group() -> String { "red".into() }
+fn default_group() -> String {
+    "red".into()
+}
 
 #[cfg(test)]
 mod tests {
@@ -380,4 +409,5 @@ mod tests {
         shortcuts.task_prefix = "Control+T".into();
         assert!(shortcuts.validate().is_ok());
     }
+
 }

@@ -1,5 +1,5 @@
 use crate::no_window;
-use crate::speech::{append_log, ensure_runtime, python_path};
+use crate::speech::append_log;
 use anyhow::{bail, Context, Result};
 use serde_json::json;
 use std::{
@@ -7,7 +7,10 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    sync::{atomic::{AtomicU64, Ordering}, mpsc, Arc},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, Arc,
+    },
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Manager};
@@ -81,7 +84,7 @@ fn spawn_stderr_reader(app: &AppHandle, stderr: std::process::ChildStderr) -> Re
                                 file,
                                 "{} [OCR] {line}",
                                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-);
+                            );
                         }
                     }
                 }
@@ -94,8 +97,8 @@ fn spawn_stderr_reader(app: &AppHandle, stderr: std::process::ChildStderr) -> Re
 
 impl OcrWorker {
     pub fn start(app: &AppHandle) -> Result<Self> {
-        ensure_runtime(app)?;
-        let python = python_path(app)?;
+        crate::runtime::ensure_ready(app)?;
+        let python = crate::runtime::python_path(app)?;
         let mut child = no_window(
             &mut Command::new(&python)
                 .arg(ocr_worker_path(app)?)
@@ -126,6 +129,11 @@ impl OcrWorker {
                 "{}",
                 loaded["message"].as_str().unwrap_or("OCR 模型加载失败")
             )
+        }
+        if loaded["device"].as_str() != Some("cpu")
+            || loaded["provider"].as_str() != Some("CPUExecutionProvider")
+        {
+            bail!("OCR worker 未使用 CPUExecutionProvider")
         }
         Ok(worker)
     }
@@ -212,5 +220,5 @@ pub fn perform_ocr(app: AppHandle, image_path: String) -> Result<String, String>
     if result.is_err() {
         state.release_ocr_worker();
     }
-    result.map_err(|e| e.to_string())
+    result.map_err(|error| error.to_string())
 }

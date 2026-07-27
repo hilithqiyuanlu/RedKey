@@ -15,21 +15,21 @@ use crate::db::Database;
 use crate::models::*;
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use tauri_plugin_clipboard_manager::ClipboardExt;
 #[cfg(target_os = "macos")]
 use std::io::{BufRead, BufReader, Write};
 #[cfg(target_os = "macos")]
-use std::sync::mpsc;
-#[cfg(target_os = "macos")]
 use std::process::{Child, ChildStdin, Command, Stdio};
+#[cfg(target_os = "macos")]
+use std::sync::mpsc;
 use std::time::Duration;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{
-    AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, PhysicalSize, Position, RunEvent, Size,
-    WindowEvent,
+    AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, PhysicalSize, Position, RunEvent,
+    Size, WindowEvent,
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt as AutostartExt};
+use tauri_plugin_clipboard_manager::ClipboardExt;
 
 #[cfg(target_os = "macos")]
 extern "C" {
@@ -83,9 +83,7 @@ impl RuntimeState {
                 *guard = Some(memory_db);
             }
         }
-        parking_lot::MutexGuard::map(guard, |opt| {
-            opt.as_mut().expect("Database not initialized")
-        })
+        parking_lot::MutexGuard::map(guard, |opt| opt.as_mut().expect("Database not initialized"))
     }
 
     fn transcription_queue(
@@ -101,7 +99,10 @@ impl RuntimeState {
         })
     }
 
-    fn ocr_worker(&self, app: &AppHandle) -> Result<parking_lot::MappedMutexGuard<'_, ocr::OcrWorker>, String> {
+    fn ocr_worker(
+        &self,
+        app: &AppHandle,
+    ) -> Result<parking_lot::MappedMutexGuard<'_, ocr::OcrWorker>, String> {
         let mut guard = self.ocr_worker.lock();
         if guard.is_none() {
             let worker = ocr::OcrWorker::start(app).map_err(|e| e.to_string())?;
@@ -118,7 +119,13 @@ impl RuntimeState {
 }
 
 #[cfg(target_os = "macos")]
-struct NativeRecording { id: String, path: std::path::PathBuf, started: std::time::Instant, child: Child, input: ChildStdin }
+struct NativeRecording {
+    id: String,
+    path: std::path::PathBuf,
+    started: std::time::Instant,
+    child: Child,
+    input: ChildStdin,
+}
 #[cfg(windows)]
 type NativeRecording = recording_windows::NativeRecording;
 #[cfg(target_os = "macos")]
@@ -134,13 +141,20 @@ type KeyboardMonitor = keyboard_windows::KeyboardMonitor;
 
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy)]
-struct PrefixConfig { required: core_graphics::event::CGEventFlags }
+struct PrefixConfig {
+    required: core_graphics::event::CGEventFlags,
+}
 
 #[cfg(target_os = "macos")]
-enum KeyboardEvent { Prefix(bool), Action(AppAction) }
+enum KeyboardEvent {
+    Prefix(bool),
+    Action(AppAction),
+}
 
 #[derive(Default)]
-struct HudState { prefix_held: bool }
+struct HudState {
+    prefix_held: bool,
+}
 
 #[derive(Default)]
 struct HoverRegions {
@@ -149,7 +163,6 @@ struct HoverRegions {
     dragging: bool,
     generation: u64,
 }
-
 
 fn err(error: impl std::fmt::Display) -> String {
     error.to_string()
@@ -163,7 +176,9 @@ pub(crate) fn no_window(cmd: &mut std::process::Command) -> &mut std::process::C
     cmd.creation_flags(0x08000000)
 }
 #[cfg(not(windows))]
-pub(crate) fn no_window(cmd: &mut std::process::Command) -> &mut std::process::Command { cmd }
+pub(crate) fn no_window(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    cmd
+}
 
 fn snapshot(app: &AppHandle) -> Result<Snapshot> {
     app.state::<RuntimeState>().db().snapshot()
@@ -183,20 +198,54 @@ fn spawn_recording_summary_with_force(app: &AppHandle, recording_id: &str, force
     let app = app.clone();
     let recording_id = recording_id.to_string();
     tauri::async_runtime::spawn(async move {
-        if !llm::settings().map(|settings| settings.configured).unwrap_or(false) { return; }
-        let document = match app.state::<RuntimeState>().db().task_document_for_recording(&recording_id) {
+        if !llm::settings()
+            .map(|settings| settings.configured)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let document = match app
+            .state::<RuntimeState>()
+            .db()
+            .task_document_for_recording(&recording_id)
+        {
             Ok(document) => document,
-            Err(error) => { let _ = app.state::<RuntimeState>().db().set_recording_summary_status(&recording_id, "error", Some(&error.to_string())); let _ = emit_snapshot(&app); return; }
+            Err(error) => {
+                let _ = app
+                    .state::<RuntimeState>()
+                    .db()
+                    .set_recording_summary_status(&recording_id, "error", Some(&error.to_string()));
+                let _ = emit_snapshot(&app);
+                return;
+            }
         };
-        if !force && document.summaries.iter().any(|summary| summary.recording_id == recording_id && summary.user_edited) {
+        if !force
+            && document
+                .summaries
+                .iter()
+                .any(|summary| summary.recording_id == recording_id && summary.user_edited)
+        {
             let _ = emit_snapshot(&app);
             return;
         }
-        let _ = app.state::<RuntimeState>().db().set_recording_summary_status(&recording_id, "summarizing", None);
+        let _ = app
+            .state::<RuntimeState>()
+            .db()
+            .set_recording_summary_status(&recording_id, "summarizing", None);
         let _ = emit_snapshot(&app);
         match llm::summarize(&document, &recording_id).await {
-            Ok(summary) => { let _ = app.state::<RuntimeState>().db().save_recording_summary(&summary); }
-            Err(error) => { let _ = app.state::<RuntimeState>().db().set_recording_summary_status(&recording_id, "error", Some(&error.to_string())); }
+            Ok(summary) => {
+                let _ = app
+                    .state::<RuntimeState>()
+                    .db()
+                    .save_recording_summary(&summary);
+            }
+            Err(error) => {
+                let _ = app
+                    .state::<RuntimeState>()
+                    .db()
+                    .set_recording_summary_status(&recording_id, "error", Some(&error.to_string()));
+            }
         }
         let _ = emit_snapshot(&app);
     });
@@ -309,7 +358,13 @@ fn prefix_config(value: &str) -> PrefixConfig {
     use core_graphics::event::CGEventFlags;
     let mut required = CGEventFlags::default();
     for item in value.split('+').map(str::trim) {
-        required |= match item { "Control" => CGEventFlags::CGEventFlagControl, "Alt" | "Option" => CGEventFlags::CGEventFlagAlternate, "Shift" => CGEventFlags::CGEventFlagShift, "Command" => CGEventFlags::CGEventFlagCommand, _ => CGEventFlags::default() };
+        required |= match item {
+            "Control" => CGEventFlags::CGEventFlagControl,
+            "Alt" | "Option" => CGEventFlags::CGEventFlagAlternate,
+            "Shift" => CGEventFlags::CGEventFlagShift,
+            "Command" => CGEventFlags::CGEventFlagCommand,
+            _ => CGEventFlags::default(),
+        };
     }
     PrefixConfig { required }
 }
@@ -317,9 +372,15 @@ fn prefix_config(value: &str) -> PrefixConfig {
 #[cfg(target_os = "macos")]
 fn keyboard_action(key_code: i64) -> Option<AppAction> {
     Some(match key_code {
-        18 => AppAction::ActivateSlot { slot: 0 }, 19 => AppAction::ActivateSlot { slot: 1 }, 20 => AppAction::ActivateSlot { slot: 2 },
-        21 => AppAction::ActivateSlot { slot: 3 }, 23 => AppAction::ActivateSlot { slot: 4 }, 22 => AppAction::ActivateSlot { slot: 5 },
-        26 => AppAction::ActivateSlot { slot: 6 }, 28 => AppAction::ActivateSlot { slot: 7 }, 25 => AppAction::ActivateSlot { slot: 8 },
+        18 => AppAction::ActivateSlot { slot: 0 },
+        19 => AppAction::ActivateSlot { slot: 1 },
+        20 => AppAction::ActivateSlot { slot: 2 },
+        21 => AppAction::ActivateSlot { slot: 3 },
+        23 => AppAction::ActivateSlot { slot: 4 },
+        22 => AppAction::ActivateSlot { slot: 5 },
+        26 => AppAction::ActivateSlot { slot: 6 },
+        28 => AppAction::ActivateSlot { slot: 7 },
+        25 => AppAction::ActivateSlot { slot: 8 },
         29 => AppAction::ActivateSlot { slot: 9 },
         17 => AppAction::ToggleRecording,
         _ => return None,
@@ -328,33 +389,69 @@ fn keyboard_action(key_code: i64) -> Option<AppAction> {
 
 #[cfg(target_os = "macos")]
 fn install_keyboard_tap(app: &AppHandle, monitor: &KeyboardMonitor) {
-    use core_graphics::event::{CallbackResult, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType, EventField};
     use core_foundation::runloop::CFRunLoop;
-    if monitor.running.swap(true, std::sync::atomic::Ordering::SeqCst) { return; }
+    use core_graphics::event::{
+        CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+        CGEventType, CallbackResult, EventField,
+    };
+    if monitor
+        .running
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return;
+    }
     let config = monitor.config.clone();
     let error = monitor.error.clone();
     let running = monitor.running.clone();
     let sender = monitor.sender.clone();
     let _app = app.clone();
     std::thread::spawn(move || {
-        let result = CGEventTap::with_enabled(CGEventTapLocation::Session, CGEventTapPlacement::HeadInsertEventTap, CGEventTapOptions::Default, vec![CGEventType::KeyDown, CGEventType::KeyUp, CGEventType::FlagsChanged], {
-            let prefix_active = std::sync::atomic::AtomicBool::new(false);
-            move |_proxy, event_type, event| {
-                let settings = *config.lock();
-                let flags = event.get_flags();
-                let modifier_flags = CGEventFlags::CGEventFlagShift | CGEventFlags::CGEventFlagControl | CGEventFlags::CGEventFlagAlternate | CGEventFlags::CGEventFlagCommand;
-                let required = settings.required;
-                let has_required = !required.is_empty() && flags.intersection(required) == required;
-                let clean = has_required && flags.intersection(modifier_flags) == required;
-                if clean != prefix_active.swap(clean, std::sync::atomic::Ordering::SeqCst) { let _ = sender.send(KeyboardEvent::Prefix(clean)); }
-                if !matches!(event_type, CGEventType::KeyDown) || !has_required { return CallbackResult::Keep; }
-                let Some(action) = keyboard_action(event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE)) else { return CallbackResult::Keep; };
-                let extras = flags.intersection(modifier_flags).difference(required);
-                if extras.is_empty() { let _ = sender.send(KeyboardEvent::Action(action)); return CallbackResult::Drop; }
-                CallbackResult::Keep
-            }
-        }, CFRunLoop::run_current);
-        if result.is_err() { *error.lock() = Some("missing accessibility permission".into()); }
+        let result = CGEventTap::with_enabled(
+            CGEventTapLocation::Session,
+            CGEventTapPlacement::HeadInsertEventTap,
+            CGEventTapOptions::Default,
+            vec![
+                CGEventType::KeyDown,
+                CGEventType::KeyUp,
+                CGEventType::FlagsChanged,
+            ],
+            {
+                let prefix_active = std::sync::atomic::AtomicBool::new(false);
+                move |_proxy, event_type, event| {
+                    let settings = *config.lock();
+                    let flags = event.get_flags();
+                    let modifier_flags = CGEventFlags::CGEventFlagShift
+                        | CGEventFlags::CGEventFlagControl
+                        | CGEventFlags::CGEventFlagAlternate
+                        | CGEventFlags::CGEventFlagCommand;
+                    let required = settings.required;
+                    let has_required =
+                        !required.is_empty() && flags.intersection(required) == required;
+                    let clean = has_required && flags.intersection(modifier_flags) == required;
+                    if clean != prefix_active.swap(clean, std::sync::atomic::Ordering::SeqCst) {
+                        let _ = sender.send(KeyboardEvent::Prefix(clean));
+                    }
+                    if !matches!(event_type, CGEventType::KeyDown) || !has_required {
+                        return CallbackResult::Keep;
+                    }
+                    let Some(action) = keyboard_action(
+                        event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE),
+                    ) else {
+                        return CallbackResult::Keep;
+                    };
+                    let extras = flags.intersection(modifier_flags).difference(required);
+                    if extras.is_empty() {
+                        let _ = sender.send(KeyboardEvent::Action(action));
+                        return CallbackResult::Drop;
+                    }
+                    CallbackResult::Keep
+                }
+            },
+            CFRunLoop::run_current,
+        );
+        if result.is_err() {
+            *error.lock() = Some("missing accessibility permission".into());
+        }
         running.store(false, std::sync::atomic::Ordering::SeqCst);
     });
 }
@@ -366,14 +463,27 @@ fn start_keyboard_monitor(app: &AppHandle, settings: &ShortcutSettings) -> Keybo
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (sender, receiver) = mpsc::channel();
     let app_handle = app.clone();
-    std::thread::spawn(move || for event in receiver {
-        match event {
-            KeyboardEvent::Prefix(active) => { let _ = set_task_hud_visible(&app_handle, active); }
-            KeyboardEvent::Action(AppAction::ActivateSlot { slot }) => { let _ = dispatch_internal(&app_handle, AppAction::ActivateSlot { slot }); }
-            KeyboardEvent::Action(action) => { let _ = dispatch_internal(&app_handle, action); }
+    std::thread::spawn(move || {
+        for event in receiver {
+            match event {
+                KeyboardEvent::Prefix(active) => {
+                    let _ = set_task_hud_visible(&app_handle, active);
+                }
+                KeyboardEvent::Action(AppAction::ActivateSlot { slot }) => {
+                    let _ = dispatch_internal(&app_handle, AppAction::ActivateSlot { slot });
+                }
+                KeyboardEvent::Action(action) => {
+                    let _ = dispatch_internal(&app_handle, action);
+                }
+            }
         }
     });
-    let monitor = KeyboardMonitor { config, error, running, sender };
+    let monitor = KeyboardMonitor {
+        config,
+        error,
+        running,
+        sender,
+    };
     install_keyboard_tap(app, &monitor);
     monitor
 }
@@ -396,7 +506,9 @@ fn update_keyboard_listener(app: &AppHandle, settings: &ShortcutSettings) -> Res
         }
         #[cfg(windows)]
         {
-            monitor.update_config(keyboard_windows::PrefixConfig::from_string(&settings.task_prefix));
+            monitor.update_config(keyboard_windows::PrefixConfig::from_string(
+                &settings.task_prefix,
+            ));
         }
     } else {
         *monitor = Some(start_keyboard_monitor(app, settings));
@@ -406,7 +518,11 @@ fn update_keyboard_listener(app: &AppHandle, settings: &ShortcutSettings) -> Res
 
 fn set_pet_visible_inner(app: &AppHandle, visible: bool) -> Result<()> {
     let pet = app.get_webview_window("pet").context("宠物窗口不存在")?;
-    if visible { pet.show()?; } else { pet.hide()?; }
+    if visible {
+        pet.show()?;
+    } else {
+        pet.hide()?;
+    }
     let mut settings = app.state::<RuntimeState>().db().settings()?;
     settings.pet_visible = visible;
     app.state::<RuntimeState>().db().save_settings(&settings)?;
@@ -416,7 +532,17 @@ fn set_pet_visible_inner(app: &AppHandle, visible: bool) -> Result<()> {
 fn setup_tray(app: &tauri::App) -> Result<()> {
     let show = MenuItem::with_id(app, "show", "打开控制台", true, None::<&str>)?;
     let pet_visible = app.state::<RuntimeState>().db().settings()?.pet_visible;
-    let toggle_pet = MenuItem::with_id(app, "toggle_pet", if pet_visible { "休眠宠物" } else { "唤醒宠物" }, true, None::<&str>)?;
+    let toggle_pet = MenuItem::with_id(
+        app,
+        "toggle_pet",
+        if pet_visible {
+            "休眠宠物"
+        } else {
+            "唤醒宠物"
+        },
+        true,
+        None::<&str>,
+    )?;
     let settings = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &toggle_pet, &settings, &quit])?;
@@ -442,7 +568,11 @@ fn setup_tray(app: &tauri::App) -> Result<()> {
                 if let Some(pet) = app.get_webview_window("pet") {
                     let visible = !pet.is_visible().unwrap_or(false);
                     if set_pet_visible_inner(app, visible).is_ok() {
-                        let _ = toggle_pet.set_text(if visible { "休眠宠物" } else { "唤醒宠物" });
+                        let _ = toggle_pet.set_text(if visible {
+                            "休眠宠物"
+                        } else {
+                            "唤醒宠物"
+                        });
                     }
                 }
             }
@@ -635,70 +765,153 @@ fn get_snapshot(app: AppHandle) -> Result<Snapshot, String> {
 
 #[tauri::command]
 fn get_task_document(app: AppHandle, task_id: String) -> Result<TaskDocument, String> {
-    app.state::<RuntimeState>().db().task_document(&task_id).map_err(err)
+    app.state::<RuntimeState>()
+        .db()
+        .task_document(&task_id)
+        .map_err(err)
 }
 
 #[tauri::command]
 fn create_text_card(app: AppHandle, task_id: String) -> Result<TextCard, String> {
-    let card = app.state::<RuntimeState>().db().create_text_card(&task_id, "manual").map_err(err)?;
+    let card = app
+        .state::<RuntimeState>()
+        .db()
+        .create_text_card(&task_id, "manual")
+        .map_err(err)?;
     let _ = emit_snapshot(&app);
     Ok(card)
 }
 
 #[tauri::command]
 fn update_text_card(app: AppHandle, card_id: String, content: String) -> Result<(), String> {
-    app.state::<RuntimeState>().db().update_text_card(&card_id, &content).map_err(err)
+    app.state::<RuntimeState>()
+        .db()
+        .update_text_card(&card_id, &content)
+        .map_err(err)
 }
 
 #[tauri::command]
 fn delete_text_card(app: AppHandle, card_id: String) -> Result<(), String> {
-    app.state::<RuntimeState>().db().delete_text_card(&card_id).map_err(err)?;
+    app.state::<RuntimeState>()
+        .db()
+        .delete_text_card(&card_id)
+        .map_err(err)?;
     let _ = emit_snapshot(&app);
     Ok(())
 }
 
 #[tauri::command]
-fn reassign_text_card(app: AppHandle, card_id: String, task_id: String) -> Result<Snapshot, String> {
-    app.state::<RuntimeState>().db().reassign_text_card(&card_id, &task_id).map_err(err)?;
+fn reassign_text_card(
+    app: AppHandle,
+    card_id: String,
+    task_id: String,
+) -> Result<Snapshot, String> {
+    app.state::<RuntimeState>()
+        .db()
+        .reassign_text_card(&card_id, &task_id)
+        .map_err(err)?;
     emit_snapshot(&app).map_err(err)
 }
 
 #[tauri::command]
 fn paste_text_card(app: AppHandle, task_id: String) -> Result<TextCard, String> {
     let text = app.clipboard().read_text().map_err(err)?.trim().to_string();
-    if text.is_empty() { return Err("剪切板为空".into()); }
-    if text.chars().count() > 50_000 { return Err("剪切板文本过长".into()); }
-    let card = app.state::<RuntimeState>().db().create_text_card(&task_id, "manual").map_err(err)?;
-    app.state::<RuntimeState>().db().update_text_card(&card.id, &text).map_err(err)?;
+    if text.is_empty() {
+        return Err("剪切板为空".into());
+    }
+    if text.chars().count() > 50_000 {
+        return Err("剪切板文本过长".into());
+    }
+    let card = app
+        .state::<RuntimeState>()
+        .db()
+        .create_text_card(&task_id, "manual")
+        .map_err(err)?;
+    app.state::<RuntimeState>()
+        .db()
+        .update_text_card(&card.id, &text)
+        .map_err(err)?;
     let timestamp = chrono::Utc::now().to_rfc3339();
-    let card = TextCard { id: card.id, task_id: card.task_id, content: text, source: "manual".into(), created_at: timestamp.clone(), updated_at: timestamp };
+    let card = TextCard {
+        id: card.id,
+        task_id: card.task_id,
+        content: text,
+        source: "manual".into(),
+        created_at: timestamp.clone(),
+        updated_at: timestamp,
+    };
     let _ = emit_snapshot(&app);
     Ok(card)
 }
 
 #[tauri::command]
-fn create_image_card(app: AppHandle, task_id: String, filename: String, mime_type: String, data: String, content: String) -> Result<ImageCard, String> {
-    let card = app.state::<RuntimeState>().db().create_image_card(&task_id, &filename, &mime_type, &data, &content).map_err(err)?;
+fn create_image_card(
+    app: AppHandle,
+    task_id: String,
+    filename: String,
+    mime_type: String,
+    data: String,
+    content: String,
+) -> Result<ImageCard, String> {
+    let card = app
+        .state::<RuntimeState>()
+        .db()
+        .create_image_card(&task_id, &filename, &mime_type, &data, &content)
+        .map_err(err)?;
     let _ = emit_snapshot(&app);
     Ok(card)
 }
 
 #[tauri::command]
-fn update_image_card(app: AppHandle, card_id: String, filename: String, mime_type: String, data: String, content: String) -> Result<(), String> {
-    app.state::<RuntimeState>().db().update_image_card(&card_id, &filename, &mime_type, &data, &content).map_err(err)?;
+fn update_image_card(
+    app: AppHandle,
+    card_id: String,
+    filename: String,
+    mime_type: String,
+    data: String,
+    content: String,
+) -> Result<(), String> {
+    app.state::<RuntimeState>()
+        .db()
+        .update_image_card(&card_id, &filename, &mime_type, &data, &content)
+        .map_err(err)?;
     let _ = emit_snapshot(&app);
     Ok(())
 }
 
 #[tauri::command]
-fn ocr_image_card(app: AppHandle, card_id: String) -> Result<String, String> {
+fn update_image_card_content(
+    app: AppHandle,
+    card_id: String,
+    content: String,
+) -> Result<(), String> {
+    app.state::<RuntimeState>()
+        .db()
+        .update_image_card_content(&card_id, &content)
+        .map_err(err)?;
+    let _ = emit_snapshot(&app);
+    Ok(())
+}
+
+fn ocr_image_card_blocking(app: AppHandle, card_id: String) -> Result<String> {
     use base64::Engine;
-    let card = app.state::<RuntimeState>().db().get_image_card(&card_id).map_err(err)?;
-    if card.data.is_empty() { return Err("图片卡还没有图片".into()); }
-    let bytes = base64::engine::general_purpose::STANDARD.decode(&card.data).map_err(|e| format!("图片数据解码失败：{e}"))?;
-    let ext = if card.mime_type == "image/png" { "png" } else { "jpg" };
+    let card = app
+        .state::<RuntimeState>()
+        .db()
+        .get_image_card(&card_id)?;
+    if card.data.is_empty() {
+        anyhow::bail!("图片卡还没有图片");
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&card.data)
+        .map_err(|error| anyhow::anyhow!("图片数据解码失败：{error}"))?;
+    let ext = if card.mime_type == "image/png" {
+        "png"
+    } else {
+        "jpg"
+    };
     let tmp = std::env::temp_dir().join(format!("redkey_ocr_{}.{}", card.id, ext));
-    std::fs::write(&tmp, &bytes).map_err(|e| format!("写入临时文件失败：{e}"))?;
+    std::fs::write(&tmp, &bytes).context("写入 OCR 临时文件失败")?;
     let state = app.state::<RuntimeState>();
     let result = state
         .ocr_worker(&app)
@@ -709,74 +922,160 @@ fn ocr_image_card(app: AppHandle, card_id: String) -> Result<String, String> {
         Ok(text) => text,
         Err(error) => {
             state.release_ocr_worker();
-            return Err(error.to_string());
+            return Err(error);
         }
     };
-    app.state::<RuntimeState>().db().update_image_card(&card.id, &card.filename, &card.mime_type, &card.data, &text).map_err(err)?;
+    app.state::<RuntimeState>()
+        .db()
+        .update_image_card(&card.id, &card.filename, &card.mime_type, &card.data, &text)
+        ?;
     let _ = emit_snapshot(&app);
     Ok(text)
 }
 
 #[tauri::command]
+async fn ocr_image_card(app: AppHandle, card_id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || ocr_image_card_blocking(app, card_id))
+        .await
+        .map_err(|error| format!("OCR 后台任务异常：{error}"))?
+        .map_err(err)
+}
+
+#[tauri::command]
 fn delete_image_card(app: AppHandle, card_id: String) -> Result<(), String> {
-    app.state::<RuntimeState>().db().delete_image_card(&card_id).map_err(err)?;
+    app.state::<RuntimeState>()
+        .db()
+        .delete_image_card(&card_id)
+        .map_err(err)?;
     let _ = emit_snapshot(&app);
     Ok(())
 }
 
 #[tauri::command]
-fn reassign_image_card(app: AppHandle, card_id: String, task_id: String) -> Result<Snapshot, String> {
-    app.state::<RuntimeState>().db().reassign_image_card(&card_id, &task_id).map_err(err)?;
+fn reassign_image_card(
+    app: AppHandle,
+    card_id: String,
+    task_id: String,
+) -> Result<Snapshot, String> {
+    app.state::<RuntimeState>()
+        .db()
+        .reassign_image_card(&card_id, &task_id)
+        .map_err(err)?;
     emit_snapshot(&app).map_err(err)
 }
 
 #[tauri::command]
 fn update_task_title(app: AppHandle, task_id: String, title: String) -> Result<Snapshot, String> {
-    app.state::<RuntimeState>().db().update_task_title(&task_id, &title).map_err(err)?;
+    app.state::<RuntimeState>()
+        .db()
+        .update_task_title(&task_id, &title)
+        .map_err(err)?;
     emit_snapshot(&app).map_err(err)
 }
 
 #[tauri::command]
-fn update_task_contact(app: AppHandle, task_id: String, contact_id: Option<String>) -> Result<Snapshot, String> {
-    app.state::<RuntimeState>().db().update_task_contact(&task_id, contact_id.as_deref()).map_err(err)?;
+fn update_task_contact(
+    app: AppHandle,
+    task_id: String,
+    contact_id: Option<String>,
+) -> Result<Snapshot, String> {
+    app.state::<RuntimeState>()
+        .db()
+        .update_task_contact(&task_id, contact_id.as_deref())
+        .map_err(err)?;
     emit_snapshot(&app).map_err(err)
 }
 
 #[tauri::command]
-fn update_task_link(app: AppHandle, task_id: String, url: Option<String>) -> Result<Snapshot, String> {
-    app.state::<RuntimeState>().db().update_task_link(&task_id, url.as_deref()).map_err(err)?;
+fn update_task_link(
+    app: AppHandle,
+    task_id: String,
+    url: Option<String>,
+) -> Result<Snapshot, String> {
+    app.state::<RuntimeState>()
+        .db()
+        .update_task_link(&task_id, url.as_deref())
+        .map_err(err)?;
     emit_snapshot(&app).map_err(err)
 }
 
 #[tauri::command]
 fn delete_completed_task(app: AppHandle, task_id: String) -> Result<Snapshot, String> {
-    let paths = app.state::<RuntimeState>().db().task_document(&task_id).map_err(err)?.recordings.into_iter().filter_map(|recording| recording.audio_path).collect::<Vec<_>>();
-    app.state::<RuntimeState>().db().delete_completed_task(&task_id).map_err(err)?;
-    for path in paths { let _ = std::fs::remove_file(path); }
+    let paths = app
+        .state::<RuntimeState>()
+        .db()
+        .task_document(&task_id)
+        .map_err(err)?
+        .recordings
+        .into_iter()
+        .filter_map(|recording| recording.audio_path)
+        .collect::<Vec<_>>();
+    app.state::<RuntimeState>()
+        .db()
+        .delete_completed_task(&task_id)
+        .map_err(err)?;
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+    }
     emit_snapshot(&app).map_err(err)
 }
 
 #[tauri::command]
 fn clear_all_data(app: AppHandle) -> Result<Snapshot, String> {
-    if app.state::<RuntimeState>().native_recording.lock().is_some() || app.state::<RuntimeState>().db().snapshot().map_err(err)?.recordings.iter().any(|recording| recording.status == "recording") {
+    if app
+        .state::<RuntimeState>()
+        .native_recording
+        .lock()
+        .is_some()
+        || app
+            .state::<RuntimeState>()
+            .db()
+            .snapshot()
+            .map_err(err)?
+            .recordings
+            .iter()
+            .any(|recording| recording.status == "recording")
+    {
         return Err("录音进行中，无法清除数据".into());
     }
-    let audio_paths: Vec<String> = app.state::<RuntimeState>().db().snapshot().map_err(err)?.recordings.iter().filter_map(|r| r.audio_path.clone()).collect();
-    app.state::<RuntimeState>().db().clear_all_data().map_err(err)?;
-    for path in audio_paths { let _ = std::fs::remove_file(&path); }
+    let audio_paths: Vec<String> = app
+        .state::<RuntimeState>()
+        .db()
+        .snapshot()
+        .map_err(err)?
+        .recordings
+        .iter()
+        .filter_map(|r| r.audio_path.clone())
+        .collect();
+    app.state::<RuntimeState>()
+        .db()
+        .clear_all_data()
+        .map_err(err)?;
+    for path in audio_paths {
+        let _ = std::fs::remove_file(&path);
+    }
     let settings = app.state::<RuntimeState>().db().settings().map_err(err)?;
-    if settings.autostart { app.autolaunch().enable().map_err(|error| format!("无法恢复开机启动：{error}"))?; }
+    if settings.autostart {
+        app.autolaunch()
+            .enable()
+            .map_err(|error| format!("无法恢复开机启动：{error}"))?;
+    }
     emit_snapshot(&app).map_err(err)
 }
 
 #[tauri::command]
 fn resolve_task_overflow(app: AppHandle, keep_ids: Vec<String>) -> Result<Snapshot, String> {
-    app.state::<RuntimeState>().db().resolve_task_overflow(&keep_ids).map_err(err)?;
+    app.state::<RuntimeState>()
+        .db()
+        .resolve_task_overflow(&keep_ids)
+        .map_err(err)?;
     emit_snapshot(&app).map_err(err)
 }
 
 #[tauri::command]
-fn get_deepseek_settings() -> Result<DeepSeekSettings, String> { llm::settings().map_err(err) }
+fn get_deepseek_settings() -> Result<DeepSeekSettings, String> {
+    llm::settings().map_err(err)
+}
 
 #[tauri::command]
 fn save_deepseek_api_key(api_key: String) -> Result<DeepSeekSettings, String> {
@@ -791,50 +1090,95 @@ fn delete_deepseek_api_key() -> Result<DeepSeekSettings, String> {
 }
 
 #[tauri::command]
-async fn test_deepseek_connection() -> Result<(), String> { llm::test_connection().await.map_err(err) }
+async fn test_deepseek_connection() -> Result<(), String> {
+    llm::test_connection().await.map_err(err)
+}
 
 #[tauri::command]
 async fn summarize_task(app: AppHandle, task_id: String) -> Result<TextCard, String> {
-    let document = app.state::<RuntimeState>().db().task_document(&task_id).map_err(err)?;
+    let document = app
+        .state::<RuntimeState>()
+        .db()
+        .task_document(&task_id)
+        .map_err(err)?;
     let summary = llm::summarize_task(&document).await.map_err(err)?;
-    let card = app.state::<RuntimeState>().db().create_text_card(&task_id, "ai").map_err(err)?;
-    app.state::<RuntimeState>().db().update_text_card(&card.id, &summary).map_err(err)?;
+    let card = app
+        .state::<RuntimeState>()
+        .db()
+        .create_text_card(&task_id, "ai")
+        .map_err(err)?;
+    app.state::<RuntimeState>()
+        .db()
+        .update_text_card(&card.id, &summary)
+        .map_err(err)?;
     let _ = emit_snapshot(&app);
-    Ok(TextCard { content: summary, ..card })
+    Ok(TextCard {
+        content: summary,
+        ..card
+    })
 }
 
 #[tauri::command]
 fn summarize_recording(app: AppHandle, recording_id: String) -> Result<(), String> {
-    let document = app.state::<RuntimeState>().db().task_document_for_recording(&recording_id).map_err(err)?;
-    let recording = document.recordings.iter().find(|recording| recording.id == recording_id).ok_or("录音记录不存在")?;
-    if recording.transcript.trim().is_empty() && recording.raw_transcript.trim().is_empty() { return Err("录音尚未完成转写".into()); }
+    let document = app
+        .state::<RuntimeState>()
+        .db()
+        .task_document_for_recording(&recording_id)
+        .map_err(err)?;
+    let recording = document
+        .recordings
+        .iter()
+        .find(|recording| recording.id == recording_id)
+        .ok_or("录音记录不存在")?;
+    if recording.transcript.trim().is_empty() && recording.raw_transcript.trim().is_empty() {
+        return Err("录音尚未完成转写".into());
+    }
     spawn_recording_summary_with_force(&app, &recording_id, true);
     Ok(())
 }
 
 #[tauri::command]
 fn get_task_summary_prompt(app: AppHandle, task_id: String) -> Result<String, String> {
-    let document = app.state::<RuntimeState>().db().task_document(&task_id).map_err(err)?;
+    let document = app
+        .state::<RuntimeState>()
+        .db()
+        .task_document(&task_id)
+        .map_err(err)?;
     llm::task_summary_prompt(&document).map_err(err)
 }
 
 #[tauri::command]
 fn get_recording_summary_prompt(app: AppHandle, recording_id: String) -> Result<String, String> {
-    let document = app.state::<RuntimeState>().db().task_document_for_recording(&recording_id).map_err(err)?;
+    let document = app
+        .state::<RuntimeState>()
+        .db()
+        .task_document_for_recording(&recording_id)
+        .map_err(err)?;
     llm::recording_summary_prompt(&document, &recording_id).map_err(err)
 }
 
 #[tauri::command]
-fn retry_recording_summary(app: AppHandle, recording_id: String) -> Result<(), String> { summarize_recording(app, recording_id) }
+fn retry_recording_summary(app: AppHandle, recording_id: String) -> Result<(), String> {
+    summarize_recording(app, recording_id)
+}
 
 #[tauri::command]
-fn update_recording_summary(app: AppHandle, recording_id: String, mut summary: RecordingSummary) -> Result<(), String> {
-    if summary.recording_id != recording_id { return Err("录音总结归属不匹配".into()); }
+fn update_recording_summary(
+    app: AppHandle,
+    recording_id: String,
+    mut summary: RecordingSummary,
+) -> Result<(), String> {
+    if summary.recording_id != recording_id {
+        return Err("录音总结归属不匹配".into());
+    }
     summary.status = "completed".into();
     summary.error_message = None;
     summary.user_edited = true;
     summary.updated_at = chrono::Utc::now().to_rfc3339();
-    app.state::<RuntimeState>().db().save_recording_summary(&summary).map_err(err)?;
+    app.state::<RuntimeState>()
+        .db()
+        .save_recording_summary(&summary)
+        .map_err(err)?;
     let _ = emit_snapshot(&app);
     Ok(())
 }
@@ -843,7 +1187,11 @@ fn update_recording_summary(app: AppHandle, recording_id: String, mut summary: R
 fn keyboard_listener_status(app: AppHandle) -> Option<String> {
     #[cfg(any(target_os = "macos", windows))]
     {
-        app.state::<RuntimeState>().keyboard_monitor.lock().as_ref().and_then(|monitor| monitor.error.lock().clone())
+        app.state::<RuntimeState>()
+            .keyboard_monitor
+            .lock()
+            .as_ref()
+            .and_then(|monitor| monitor.error.lock().clone())
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {
@@ -893,7 +1241,12 @@ fn set_current_task(app: AppHandle, task_id: String, open: bool) -> Result<Snaps
 }
 
 #[tauri::command]
-fn bind_slot(app: AppHandle, group: String, slot: i64, task_id: Option<String>) -> Result<Snapshot, String> {
+fn bind_slot(
+    app: AppHandle,
+    group: String,
+    slot: i64,
+    task_id: Option<String>,
+) -> Result<Snapshot, String> {
     app.state::<RuntimeState>()
         .db()
         .bind_slot(&group, slot, task_id.as_deref())
@@ -912,13 +1265,19 @@ fn swap_slots(app: AppHandle, group: String, slot_a: i64, slot_b: i64) -> Result
 
 #[tauri::command]
 fn set_current_group(app: AppHandle, group: String) -> Result<Snapshot, String> {
-    app.state::<RuntimeState>().db().set_current_group(&group).map_err(err)?;
+    app.state::<RuntimeState>()
+        .db()
+        .set_current_group(&group)
+        .map_err(err)?;
     emit_snapshot(&app).map_err(err)
 }
 
 #[tauri::command]
 fn set_group_name(app: AppHandle, group: String, name: String) -> Result<Snapshot, String> {
-    app.state::<RuntimeState>().db().set_group_name(&group, &name).map_err(err)?;
+    app.state::<RuntimeState>()
+        .db()
+        .set_group_name(&group, &name)
+        .map_err(err)?;
     emit_snapshot(&app).map_err(err)
 }
 
@@ -966,11 +1325,7 @@ fn dispatch_action(app: AppHandle, action: AppAction) -> Result<Snapshot, String
 #[tauri::command]
 fn update_settings(app: AppHandle, settings: Settings) -> Result<Snapshot, String> {
     settings.validate().map_err(err)?;
-    let previous = app
-        .state::<RuntimeState>()
-        .db()
-        .settings()
-        .map_err(err)?;
+    let previous = app.state::<RuntimeState>().db().settings().map_err(err)?;
     update_keyboard_listener(&app, &settings.shortcuts).map_err(err)?;
     if settings.autostart != previous.autostart {
         let launcher = app.autolaunch();
@@ -989,19 +1344,22 @@ fn update_settings(app: AppHandle, settings: Settings) -> Result<Snapshot, Strin
         .save_settings(&settings)
         .map_err(err)?;
     if settings.pet_visible != previous.pet_visible {
-        let pet = app.get_webview_window("pet").ok_or("宠物窗口不存在").map_err(err)?;
-        if settings.pet_visible { pet.show().map_err(err)?; } else { pet.hide().map_err(err)?; }
+        let pet = app
+            .get_webview_window("pet")
+            .ok_or("宠物窗口不存在")
+            .map_err(err)?;
+        if settings.pet_visible {
+            pet.show().map_err(err)?;
+        } else {
+            pet.hide().map_err(err)?;
+        }
     }
     emit_snapshot(&app).map_err(err)
 }
 
 #[tauri::command]
 fn set_autostart(app: AppHandle, enabled: bool) -> Result<Snapshot, String> {
-    let previous = app
-        .state::<RuntimeState>()
-        .db()
-        .settings()
-        .map_err(err)?;
+    let previous = app.state::<RuntimeState>().db().settings().map_err(err)?;
     let mut settings = previous.clone();
     settings.autostart = enabled;
     settings.validate().map_err(err)?;
@@ -1029,11 +1387,7 @@ fn set_pet_visible(app: AppHandle, visible: bool) -> Result<Snapshot, String> {
 
 #[tauri::command]
 fn save_shortcuts(app: AppHandle, shortcuts: ShortcutSettings) -> Result<Snapshot, String> {
-    let previous = app
-        .state::<RuntimeState>()
-        .db()
-        .settings()
-        .map_err(err)?;
+    let previous = app.state::<RuntimeState>().db().settings().map_err(err)?;
     let settings = Settings {
         autostart: previous.autostart,
         pet_visible: previous.pet_visible,
@@ -1053,17 +1407,29 @@ fn save_shortcuts(app: AppHandle, shortcuts: ShortcutSettings) -> Result<Snapsho
 #[tauri::command]
 fn start_recording(app: AppHandle) -> Result<String, String> {
     let snapshot = app.state::<RuntimeState>().db().snapshot().map_err(err)?;
-    let current = snapshot.current_task_id.as_deref()
-        .and_then(|id| snapshot.tasks.iter().find(|task| task.id == id && task.status == "active"));
+    let current = snapshot.current_task_id.as_deref().and_then(|id| {
+        snapshot
+            .tasks
+            .iter()
+            .find(|task| task.id == id && task.status == "active")
+    });
     let task = current.or_else(|| {
-        let mut candidates: Vec<&Task> = snapshot.tasks.iter()
+        let mut candidates: Vec<&Task> = snapshot
+            .tasks
+            .iter()
             .filter(|task| task.status == "active" && task.slot.is_some())
             .collect();
         candidates.sort_by(|a, b| b.last_opened_at.cmp(&a.last_opened_at));
         candidates.into_iter().next()
     });
-    let task_id = task.map(|task| task.id.as_str()).ok_or_else(|| "没有绑定按键的任务，无法录音".to_string())?;
-    let id = app.state::<RuntimeState>().db().start_recording(Some(task_id)).map_err(err)?;
+    let task_id = task
+        .map(|task| task.id.as_str())
+        .ok_or_else(|| "没有绑定按键的任务，无法录音".to_string())?;
+    let id = app
+        .state::<RuntimeState>()
+        .db()
+        .start_recording(Some(task_id))
+        .map_err(err)?;
     emit_snapshot(&app).map_err(err)?;
     Ok(id)
 }
@@ -1093,7 +1459,14 @@ async fn request_microphone_permission() -> Result<bool, String> {
 }
 
 fn prepare_native_recording(app: &AppHandle) -> Result<(String, std::path::PathBuf), String> {
-    if app.state::<RuntimeState>().native_recording.lock().is_some() { return Err("已经在录音".into()); }
+    if app
+        .state::<RuntimeState>()
+        .native_recording
+        .lock()
+        .is_some()
+    {
+        return Err("已经在录音".into());
+    }
     let id = start_recording(app.clone())?;
     let dir = app.path().app_data_dir().map_err(err)?.join("recordings");
     std::fs::create_dir_all(&dir).map_err(err)?;
@@ -1110,14 +1483,25 @@ fn finalize_native_recording(app: &AppHandle, recording: NativeRecording) -> Str
 #[tauri::command]
 fn start_native_recording(app: AppHandle) -> Result<String, String> {
     #[cfg(not(any(target_os = "macos", windows)))]
-    { return Err("当前版本的原生录音暂只支持 macOS 和 Windows".into()); }
+    {
+        return Err("当前版本的原生录音暂只支持 macOS 和 Windows".into());
+    }
     #[cfg(target_os = "macos")]
     {
         let (id, path) = prepare_native_recording(&app)?;
-        let mut child = match Command::new(env!("REDKEY_AUDIO_HELPER")).arg(&path).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+        let mut child = match Command::new(env!("REDKEY_AUDIO_HELPER"))
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
             Ok(c) => c,
             Err(e) => {
-                let _ = app.state::<RuntimeState>().db().fail_recording(&id, &format!("音频进程启动失败：{e}"));
+                let _ = app
+                    .state::<RuntimeState>()
+                    .db()
+                    .fail_recording(&id, &format!("音频进程启动失败：{e}"));
                 return Err(format!("音频进程启动失败：{e}"));
             }
         };
@@ -1128,10 +1512,22 @@ fn start_native_recording(app: AppHandle) -> Result<String, String> {
         reader.read_line(&mut ready).map_err(err)?;
         if ready.trim() != "READY" {
             let _ = child.kill();
-            app.state::<RuntimeState>().db().fail_recording(&id, "无法启动系统麦克风").map_err(err)?;
+            app.state::<RuntimeState>()
+                .db()
+                .fail_recording(&id, "无法启动系统麦克风")
+                .map_err(err)?;
             return Err("无法启动系统麦克风，请检查麦克风权限".into());
         }
-        Ok(finalize_native_recording(&app, NativeRecording { id: id.clone(), path, started: std::time::Instant::now(), child, input }))
+        Ok(finalize_native_recording(
+            &app,
+            NativeRecording {
+                id: id.clone(),
+                path,
+                started: std::time::Instant::now(),
+                child,
+                input,
+            },
+        ))
     }
     #[cfg(windows)]
     {
@@ -1139,7 +1535,10 @@ fn start_native_recording(app: AppHandle) -> Result<String, String> {
         let recording = match recording_windows::start_recording(id.clone(), path.clone()) {
             Ok(r) => r,
             Err(e) => {
-                let _ = app.state::<RuntimeState>().db().fail_recording(&id, &format!("麦克风启动失败：{e}"));
+                let _ = app
+                    .state::<RuntimeState>()
+                    .db()
+                    .fail_recording(&id, &format!("麦克风启动失败：{e}"));
                 return Err(format!("麦克风启动失败：{e}"));
             }
         };
@@ -1149,14 +1548,22 @@ fn start_native_recording(app: AppHandle) -> Result<String, String> {
 
 #[tauri::command]
 fn stop_native_recording(app: AppHandle) -> Result<Snapshot, String> {
-    let mut recording = app.state::<RuntimeState>().native_recording.lock().take().ok_or("当前没有录音")?;
+    let mut recording = app
+        .state::<RuntimeState>()
+        .native_recording
+        .lock()
+        .take()
+        .ok_or("当前没有录音")?;
     #[cfg(target_os = "macos")]
     {
         writeln!(recording.input, "stop").map_err(err)?;
         recording.input.flush().map_err(err)?;
         let status = recording.child.wait().map_err(err)?;
         if !status.success() {
-            app.state::<RuntimeState>().db().fail_recording(&recording.id, "原生录音进程异常退出").map_err(err)?;
+            app.state::<RuntimeState>()
+                .db()
+                .fail_recording(&recording.id, "原生录音进程异常退出")
+                .map_err(err)?;
             return Err("录音保存失败".into());
         }
     }
@@ -1167,17 +1574,30 @@ fn stop_native_recording(app: AppHandle) -> Result<Snapshot, String> {
             .and_then(|_| recording_windows::normalize_wav(&recording.path))
         {
             let message = format!("录音保存失败：{error}");
-            let _ = app.state::<RuntimeState>().db().fail_recording(&recording.id, &message);
+            let _ = app
+                .state::<RuntimeState>()
+                .db()
+                .fail_recording(&recording.id, &message);
             let _ = emit_snapshot(&app);
             return Err(message);
         }
     }
     let duration = recording.started.elapsed().as_secs_f64();
     let audio_path = recording.path.clone();
-    app.state::<RuntimeState>().db().finish_recording(&recording.id, duration, &audio_path.to_string_lossy()).map_err(err)?;
+    app.state::<RuntimeState>()
+        .db()
+        .finish_recording(&recording.id, duration, &audio_path.to_string_lossy())
+        .map_err(err)?;
     emit_snapshot(&app).map_err(err)?;
-    if let Err(error) = app.state::<RuntimeState>().transcription_queue(&app).enqueue(recording.id.clone(), audio_path) {
-        let _ = app.state::<RuntimeState>().db().fail_recording(&recording.id, &error);
+    if let Err(error) = app
+        .state::<RuntimeState>()
+        .transcription_queue(&app)
+        .enqueue(recording.id.clone(), audio_path)
+    {
+        let _ = app
+            .state::<RuntimeState>()
+            .db()
+            .fail_recording(&recording.id, &error);
         let _ = emit_snapshot(&app);
         return Err(error);
     }
@@ -1208,7 +1628,13 @@ fn native_recording_level(app: AppHandle) -> Result<f32, String> {
 }
 
 #[tauri::command]
-fn finish_recording(app: AppHandle, recording_id: String, audio: Vec<u8>, duration: f64, _transcript: String) -> Result<Snapshot, String> {
+fn finish_recording(
+    app: AppHandle,
+    recording_id: String,
+    audio: Vec<u8>,
+    duration: f64,
+    _transcript: String,
+) -> Result<Snapshot, String> {
     let recordings_dir = app.path().app_data_dir().map_err(err)?.join("recordings");
     std::fs::create_dir_all(&recordings_dir).map_err(err)?;
     let path = recordings_dir.join(format!("{recording_id}.wav"));
@@ -1216,10 +1642,20 @@ fn finish_recording(app: AppHandle, recording_id: String, audio: Vec<u8>, durati
     #[cfg(windows)]
     recording_windows::normalize_wav(&path).map_err(err)?;
     let audio_path = path;
-    app.state::<RuntimeState>().db().finish_recording(&recording_id, duration, &audio_path.to_string_lossy()).map_err(err)?;
+    app.state::<RuntimeState>()
+        .db()
+        .finish_recording(&recording_id, duration, &audio_path.to_string_lossy())
+        .map_err(err)?;
     emit_snapshot(&app).map_err(err)?;
-    if let Err(error) = app.state::<RuntimeState>().transcription_queue(&app).enqueue(recording_id.clone(), audio_path) {
-        let _ = app.state::<RuntimeState>().db().fail_recording(&recording_id, &error);
+    if let Err(error) = app
+        .state::<RuntimeState>()
+        .transcription_queue(&app)
+        .enqueue(recording_id.clone(), audio_path)
+    {
+        let _ = app
+            .state::<RuntimeState>()
+            .db()
+            .fail_recording(&recording_id, &error);
         let _ = emit_snapshot(&app);
         return Err(error);
     }
@@ -1227,29 +1663,63 @@ fn finish_recording(app: AppHandle, recording_id: String, audio: Vec<u8>, durati
 }
 
 #[tauri::command]
-fn fail_recording(app: AppHandle, recording_id: String, message: String) -> Result<Snapshot, String> {
-    app.state::<RuntimeState>().db().fail_recording(&recording_id, &message).map_err(err)?;
+fn fail_recording(
+    app: AppHandle,
+    recording_id: String,
+    message: String,
+) -> Result<Snapshot, String> {
+    app.state::<RuntimeState>()
+        .db()
+        .fail_recording(&recording_id, &message)
+        .map_err(err)?;
     emit_snapshot(&app).map_err(err)
 }
 
 #[tauri::command]
 fn delete_recording(app: AppHandle, recording_id: String) -> Result<Snapshot, String> {
-    app.state::<RuntimeState>().transcription_queue(&app).cancel(&recording_id);
-    let recording = snapshot(&app).map_err(err)?.recordings.into_iter().find(|item| item.id == recording_id);
+    app.state::<RuntimeState>()
+        .transcription_queue(&app)
+        .cancel(&recording_id);
+    let recording = snapshot(&app)
+        .map_err(err)?
+        .recordings
+        .into_iter()
+        .find(|item| item.id == recording_id);
     if let Some(path) = recording.and_then(|r| r.audio_path) {
         let _ = std::fs::remove_file(&path);
     }
-    app.state::<RuntimeState>().db().delete_recording(&recording_id).map_err(err)?;
+    app.state::<RuntimeState>()
+        .db()
+        .delete_recording(&recording_id)
+        .map_err(err)?;
     emit_snapshot(&app).map_err(err)
 }
 
 #[tauri::command]
 fn retry_transcription(app: AppHandle, recording_id: String) -> Result<Snapshot, String> {
-    let recording = snapshot(&app).map_err(err)?.recordings.into_iter().find(|item| item.id == recording_id).ok_or("录音记录不存在")?;
-    let path = recording.audio_path.map(std::path::PathBuf::from).ok_or("录音文件不存在")?;
-    app.state::<RuntimeState>().db().finish_recording(&recording_id, recording.duration, &path.to_string_lossy()).map_err(err)?;
-    if let Err(error) = app.state::<RuntimeState>().transcription_queue(&app).enqueue(recording_id.clone(), path) {
-        let _ = app.state::<RuntimeState>().db().fail_recording(&recording_id, &error);
+    let recording = snapshot(&app)
+        .map_err(err)?
+        .recordings
+        .into_iter()
+        .find(|item| item.id == recording_id)
+        .ok_or("录音记录不存在")?;
+    let path = recording
+        .audio_path
+        .map(std::path::PathBuf::from)
+        .ok_or("录音文件不存在")?;
+    app.state::<RuntimeState>()
+        .db()
+        .finish_recording(&recording_id, recording.duration, &path.to_string_lossy())
+        .map_err(err)?;
+    if let Err(error) = app
+        .state::<RuntimeState>()
+        .transcription_queue(&app)
+        .enqueue(recording_id.clone(), path)
+    {
+        let _ = app
+            .state::<RuntimeState>()
+            .db()
+            .fail_recording(&recording_id, &error);
         return Err(error);
     }
     emit_snapshot(&app).map_err(err)
@@ -1257,35 +1727,56 @@ fn retry_transcription(app: AppHandle, recording_id: String) -> Result<Snapshot,
 
 #[tauri::command]
 fn transcription_queue_len(app: AppHandle) -> Result<usize, String> {
-    Ok(app.state::<RuntimeState>().transcription_queue(&app).queue_len())
+    Ok(app
+        .state::<RuntimeState>()
+        .transcription_queue(&app)
+        .queue_len())
 }
 
 #[tauri::command]
 fn release_speech_worker(app: AppHandle) -> Result<(), String> {
-    app.state::<RuntimeState>().transcription_queue(&app).release_worker();
+    app.state::<RuntimeState>()
+        .transcription_queue(&app)
+        .release_worker();
     app.state::<RuntimeState>().release_ocr_worker();
     Ok(())
 }
 
 #[tauri::command]
-fn reassign_recording(app: AppHandle, recording_id: String, task_id: Option<String>) -> Result<Snapshot, String> {
-    app.state::<RuntimeState>().db().reassign_recording(&recording_id, task_id.as_deref()).map_err(err)?;
+fn reassign_recording(
+    app: AppHandle,
+    recording_id: String,
+    task_id: Option<String>,
+) -> Result<Snapshot, String> {
+    app.state::<RuntimeState>()
+        .db()
+        .reassign_recording(&recording_id, task_id.as_deref())
+        .map_err(err)?;
     emit_snapshot(&app).map_err(err)
 }
 
 #[tauri::command]
-fn get_recording_detail(app: AppHandle, recording_id: String) -> Result<RecordingDetail, String> { app.state::<RuntimeState>().db().recording_detail(&recording_id).map_err(err) }
+fn get_recording_detail(app: AppHandle, recording_id: String) -> Result<RecordingDetail, String> {
+    app.state::<RuntimeState>()
+        .db()
+        .recording_detail(&recording_id)
+        .map_err(err)
+}
 
 #[tauri::command]
-fn recording_audio_data(app: AppHandle, recording_id: String) -> Result<Vec<u8>, String> { let detail = app.state::<RuntimeState>().db().recording_detail(&recording_id).map_err(err)?; let path = detail.recording.audio_path.ok_or("录音文件不存在")?; std::fs::read(path).map_err(err) }
+fn recording_audio_data(app: AppHandle, recording_id: String) -> Result<Vec<u8>, String> {
+    let detail = app
+        .state::<RuntimeState>()
+        .db()
+        .recording_detail(&recording_id)
+        .map_err(err)?;
+    let path = detail.recording.audio_path.ok_or("录音文件不存在")?;
+    std::fs::read(path).map_err(err)
+}
 
 #[tauri::command]
 fn export_data(app: AppHandle) -> Result<String, String> {
-    let bundle = app
-        .state::<RuntimeState>()
-        .db()
-        .export()
-        .map_err(err)?;
+    let bundle = app.state::<RuntimeState>().db().export().map_err(err)?;
     serde_json::to_string_pretty(&bundle).map_err(err)
 }
 
@@ -1414,7 +1905,10 @@ pub fn run() {
         .join(context.config().identifier.clone());
     let database = match Database::open(&data_dir.join("redkey.sqlite3")) {
         Ok(db) => {
-            eprintln!("Database opened successfully from {:?}", data_dir.join("redkey.sqlite3"));
+            eprintln!(
+                "Database opened successfully from {:?}",
+                data_dir.join("redkey.sqlite3")
+            );
             db
         }
         Err(e) => {
@@ -1444,8 +1938,14 @@ pub fn run() {
             tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec!["--background"]))
         })
         .setup(|app| {
-            let settings = app.state::<RuntimeState>().db().settings().unwrap_or_default();
-            if settings.autostart { let _ = app.autolaunch().enable(); }
+            let settings = app
+                .state::<RuntimeState>()
+                .db()
+                .settings()
+                .unwrap_or_default();
+            if settings.autostart {
+                let _ = app.autolaunch().enable();
+            }
             eprintln!("Database initialized, emitting snapshot");
             let _ = emit_snapshot(app.handle());
             eprintln!("Snapshot emitted successfully");
@@ -1456,7 +1956,9 @@ pub fn run() {
                 eprintln!("Failed to setup tray: {e}");
             }
             if !settings.pet_visible {
-                if let Some(pet) = app.get_webview_window("pet") { let _ = pet.hide(); }
+                if let Some(pet) = app.get_webview_window("pet") {
+                    let _ = pet.hide();
+                }
             }
             // Defensive reset: the HUD should always start hidden and click-through.
             // Without this, a HUD left visible from an unclean previous exit (or a
@@ -1467,7 +1969,9 @@ pub fn run() {
                 let _ = hud.hide();
             }
             // Force non-overlay scrollbar on macOS WebKit
-            if let Some(window) = app.get_webview_window("console") { let _ = window.eval("document.documentElement.style.scrollbarGutter='stable'"); }
+            if let Some(window) = app.get_webview_window("console") {
+                let _ = window.eval("document.documentElement.style.scrollbarGutter='stable'");
+            }
             if std::env::args().any(|argument| argument == "--background") {
                 if let Some(console) = app.get_webview_window("console") {
                     let _ = console.hide();
@@ -1492,6 +1996,7 @@ pub fn run() {
             paste_text_card,
             create_image_card,
             update_image_card,
+            update_image_card_content,
             ocr_image_card,
             delete_image_card,
             reassign_image_card,
@@ -1557,20 +2062,20 @@ pub fn run() {
             resolve_link_title,
             crate::ocr::perform_ocr,
             speech::asr_model_statuses,
-            speech::download_asr_model,
+            speech::download_model,
+            speech::delete_model,
             runtime::runtime_status,
             runtime::download_runtime,
             runtime::cancel_runtime_download,
             runtime::import_runtime,
         ]);
 
-    let app = builder
-        .build(context)
-        .expect("failed to build RedKey");
+    let app = builder.build(context).expect("failed to build RedKey");
     app.run(|app, event| {
         if matches!(event, RunEvent::ExitRequested { .. }) {
             // 退出前停止正在进行的录音，确保 WAV 正常收尾
-            if let Some(mut recording) = app.state::<RuntimeState>().native_recording.lock().take() {
+            if let Some(mut recording) = app.state::<RuntimeState>().native_recording.lock().take()
+            {
                 #[cfg(windows)]
                 let _ = recording.stop();
                 #[cfg(target_os = "macos")]
@@ -1581,7 +2086,9 @@ pub fn run() {
                 }
             }
             // 优雅关闭 SpeechWorker/OCR worker，触发子进程 shutdown 而非被系统强制终止
-            app.state::<RuntimeState>().transcription_queue(app.app_handle()).release_worker();
+            app.state::<RuntimeState>()
+                .transcription_queue(app.app_handle())
+                .release_worker();
             app.state::<RuntimeState>().release_ocr_worker();
         }
     });

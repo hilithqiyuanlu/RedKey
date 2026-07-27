@@ -9,6 +9,10 @@ coverage/
 workers/__pycache__/
 *.py[cod]
 *.pfx
+.codex-wip-backup/
+release-assets/
+src-tauri/resources/python-embed-gpu/
+*.sha256
 
 # 本地构建产物与测试安装目录
 .trae/

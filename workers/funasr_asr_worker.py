@@ -4,8 +4,9 @@
 生命周期和数据库，不直接依赖 Python 包。
 
 模型来源：
-- 内置（随安装包分发）：CAM++、FSMN-VAD
-- 下载（首次使用时从 GitHub Release 下载）：CT-Transformer、SenseVoiceSmall
+- 全部按需下载到用户数据目录（首次使用时从 GitHub Release 下载）：
+  SenseVoiceSmall、FSMN-VAD、CT-Transformer、CAM++
+- 目录通过环境变量 BUNDLE_MODEL_DIR / DATA_MODEL_DIR 指定。
 """
 
 import json
@@ -79,7 +80,9 @@ def format_speaker_segments(result):
         return []
 
     item = result[0] if isinstance(result, list) else result
-    text = item.get("text", "")
+    from funasr.utils.postprocess_utils import rich_transcription_postprocess
+
+    text = rich_transcription_postprocess(item.get("text", "")).strip()
     if not text:
         return []
 
@@ -92,7 +95,7 @@ def format_speaker_segments(result):
             if spk is None:
                 spk = sentence.get("speaker")
             speaker = f"SPEAKER_{spk}" if isinstance(spk, int) else (str(spk) if spk else "SPEAKER_0")
-            seg_text = sentence.get("text", "").strip()
+            seg_text = rich_transcription_postprocess(sentence.get("text", "")).strip()
             if seg_text:
                 segments.append({"speaker": speaker, "text": seg_text})
         return segments
@@ -108,19 +111,25 @@ def main():
             request = json.loads(line)
             action = request.get("action")
             if action == "health":
-                emit(request, {"event": "ready", "backend": "funasr"})
+                emit(request, {"event": "ready", "backend": "funasr", "device": "cpu", "provider": "PyTorch CPU"})
                 continue
             if action == "load":
                 with redirect_stdout(sys.stderr):
                     model = load_model()
-                emit(request, {"event": "loaded"})
+                emit(request, {"event": "loaded", "device": "cpu", "provider": "PyTorch CPU"})
                 continue
             if action == "transcribe":
                 if model is None:
                     raise RuntimeError("ASR 模型尚未加载")
                 audio_path = request["audioPath"]
                 with redirect_stdout(sys.stderr):
-                    result = model.generate(input=audio_path, batch_size_s=300)
+                    # SenseVoice does not emit word timestamps. FunASR's speaker-result
+                    # post-processing requires them and otherwise raises KeyError("timestamp").
+                    result = model.generate(
+                        input=audio_path,
+                        batch_size_s=300,
+                        return_spk_res=False,
+                    )
                 segments = format_speaker_segments(result)
                 emit(request, {"event": "final", "segments": segments})
                 continue

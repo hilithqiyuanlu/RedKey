@@ -1,169 +1,132 @@
-# RedKey
+# AlphaKey
 
-RedKey 是一个跨平台的桌面工作台，用键盘快捷键将需求任务绑定到数字键上，支持录音、转写、发言人分离、AI 梳理和图片 OCR，适用于设计评审、需求对接等协作场景。
+AlphaKey 是一个跨平台桌面工作台，用全局快捷键把正在推进的任务绑定到数字槽位，并集中管理任务资料、录音、转写、图片 OCR 和 AI 总结。
+
+## 主要功能
+
+- 10 个稳定数字槽位，通过可配置前缀键快速切换任务。
+- 任务文档、联系人、链接、文本卡和图片卡统一归档。
+- Windows 原生录音，录音结束后进入本地语音转写队列。
+- SenseVoice 转写、FSMN-VAD、CT-Transformer 标点和 CAM++ 发言人识别。
+- RapidOCR 本地图片文字识别。
+- DeepSeek 任务总结；关闭云端 API 后可改为复制 prompt。
+- 桌面宠物、快捷面板、HUD、系统托盘和开机启动。
+- SQLite 本地持久化，以及 JSON 数据备份与恢复。
+
+## 本地 AI 组件
+
+Windows 安装包不再内置大型 Python 目录和语音模型，以避免安装包体积过大或损坏。
+
+- CPU Python runtime 在首次使用本地 AI 时下载，当前 Windows x64 版本约 347 MB。
+- SenseVoiceSmall、FSMN-VAD、CT-Transformer 和 CAM++ 按需下载，可在设置页单独管理。
+- OCR 使用 CPU runtime 中 RapidOCR 自带的 PP-OCRv4 mobile 模型。
+- 下载完成后，OCR、录音转写和发言人识别均可离线运行。
+- 普通录音、播放和保存不依赖 Python runtime 或模型。
+
+Runtime 和模型来自本仓库的 GitHub Releases，客户端会校验 SHA-256、ZIP 路径和解压结果，校验通过后才会启用。
+
+## 安装
+
+朋友直接使用的简明说明见 [Windows 使用说明](docs/windows-quick-start.md)。
+
+使用条件：Windows 10 或 Windows 11、64 位系统；第一次使用本地 AI 功能时需要联网下载组件。无需自行安装 Python、Node.js 或其他开发环境。
+
+Windows 构建产物为：
+
+```text
+src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/AlphaKey_0.1.0_x64-setup.exe
+```
+
+双击安装即可。首次使用 OCR 或语音转写时，应用会提示下载所需组件。安装包尚未做正式代码签名，因此 Windows SmartScreen 可能提示确认；仅应安装来自可信来源的安装包。
+
+应用数据目录：
+
+```text
+%APPDATA%\com.hilith.alphakey
+```
+
+下载的 runtime 和模型也保存在该应用数据目录中。关闭控制台窗口只会隐藏窗口；需要从系统托盘选择“退出 AlphaKey”才能完全结束进程。
 
 ## 技术栈
 
 | 层级 | 技术 |
-|------|------|
+| --- | --- |
 | 桌面框架 | Tauri 2 |
-| 前端 | React 19 + TypeScript |
+| 前端 | React 19、TypeScript、Vite |
 | 后端 | Rust |
 | 数据库 | SQLite |
-| 录音 (macOS) | Swift AVFoundation helper |
-| 录音 (Windows) | cpal + hound (WAV) |
-| Python 运行时 | 便携式 embeddable Python（内置模型，免安装） |
-| 全局快捷键 (macOS) | CoreGraphics Event Tap |
-| 全局快捷键 (Windows) | GetAsyncKeyState polling (50Hz) |
-| 实时转写 | SenseVoice-Small (Python worker) |
-| 发言人分离 | 3D-Speaker / CAM++ (Python worker) |
-| OCR 图片识别 | RapidOCR (Python worker) |
-| AI 总结 | DeepSeek API |
-
-## 功能
-
-### 需求管理
-- 10 个稳定数字槽位 (Control+1~0)，排序不改变键位绑定
-- 需求文档、联系人、链接、文本卡，支持最近使用排序
-- 完成任务后释放键位，返工时重新分配
-- SQLite 本地持久化，完整 JSON 备份与恢复
-
-### 录音与语音处理
-- 原生录音（macOS 使用 AVFoundation，Windows 使用 cpal），输出 WAV 格式
-- 录音结束后自动进行本地转写（SenseVoice）与发言人分离（二人场景精确切分 A/B 对话）
-- 转写队列串行处理，支持录音完成后排队等待转写，无需用户干预
-- 转写时间对齐，支持点击分段回放对应音频区间
-- 可修改 Speaker A/B 名称，修正转写文本
-- 异常恢复：应用退出时未完成的转写会在下次启动时自动标记为失败，用户可重试
-
-### OCR 图片识别
-- 本地 RapidOCR 引擎，无需联网
-- 支持截图或拖入图片进行文字识别
-- 识别结果直接作为文本卡保存到当前任务
-
-### AI 梳理
-- DeepSeek 根据完整对话生成需求对齐总结，输出需求、决策、待办和风险
-- 支持任务级总结：汇总所有对接记录、笔记和 OCR 图片文字，生成任务状态概览
-- API Key 加密保存在系统钥匙串，不暴露给前端
-- 总结可追溯到原始转写版本
-- 云端 API 开关：关闭后不调用 DeepSeek，改为复制 prompt 到剪贴板，方便在其他 AI 平台使用
-
-### 桌面交互
-- 全局快捷键：按下修饰键（默认 Control）显示 HUD 悬浮提示条，松开隐藏
-- 透明置顶键帽宠物，可拖拽，悬浮显示快捷面板
-- 快捷面板支持快速切换任务、拖入链接创建新任务
-- 系统托盘：打开控制台、休眠/唤醒宠物、设置、退出
-- 开机启动
-- Figma URL 自动提取标题
-
-## 安装与使用
-
-下载对应平台的安装包，双击安装即可使用，无需安装任何依赖。
-
-- **Windows**：`AlphaKey_0.1.0_x64-setup.exe`（NSIS 安装包）
-- **macOS**：`AlphaKey.app`（拖入 Applications 文件夹）
-
-安装包已内置固定版本的 Python 运行环境和 OCR/语音处理依赖，用户端不需要安装 Python、pip 或 ffmpeg。语音识别所需的 SenseVoiceSmall 和 CT-Transformer 模型需在设置中首次下载（约 500MB），下载完成后录音转写全程离线运行。
+| Windows 录音 | cpal、hound |
+| 本地语音 | FunASR、PyTorch、CAM++ |
+| 本地 OCR | RapidOCR、ONNX Runtime |
+| 云端总结 | DeepSeek API |
 
 ## 本地开发
 
-> 以下仅面向开发者，普通用户无需关注。
-
-### 环境要求
+环境要求：
 
 - Node.js 20+
 - Rust stable
-- macOS: Xcode（含 Command Line Tools）
-- Windows: Visual Studio 2022 Build Tools（含 C++ 桌面开发工作负载）
+- Windows: Visual Studio 2022 Build Tools，包含 C++ 桌面开发工作负载
+- 构建 Windows runtime 时需要 7-Zip
 
-### 快速开始
+安装依赖并启动开发环境：
 
 ```bash
 npm install
 npm run tauri dev
 ```
 
-仅预览前端（不启动 Rust 后端）：
+只启动前端：
 
 ```bash
 npm run dev
 ```
 
-### 测试与构建
+## 测试
 
 ```bash
-# 类型检查 + 测试
+# TypeScript 类型检查和前端测试
 npm run check
 
 # Rust 测试
-cd src-tauri && cargo test
+cargo test --manifest-path src-tauri/Cargo.toml
 
-# macOS 构建
-npm run tauri build -- --bundles app
+# 校验本机构建用 CPU runtime
+npm run verify:runtime
+```
 
-# Windows 构建 (NSIS 安装包，含便携 Python 和模型)
+## Windows 构建
+
+```powershell
 .\scripts\build-windows-x64.ps1
 ```
 
-构建产物位于 `src-tauri/target/release/bundle/`。
+构建脚本会：
 
-### 项目结构
+1. 校验或准备固定版本的便携 Python 依赖。
+2. 生成并测试 `python-runtime-win-x64-v1.zip`。
+3. 写入 runtime manifest 和 SHA-256 文件。
+4. 构建 React 前端和 Tauri NSIS 安装包。
+5. 使用 `7z t` 检查最终安装包完整性。
 
-```
-├── src/                    # React 前端
-│   ├── App.tsx             # 主视图路由 (console / pet / quick / hud / settings)
-│   ├── api.ts              # Tauri invoke 封装
-│   ├── useSnapshot.ts      # 快照功能 Hook（截图 + OCR 管线）
-│   ├── domain.ts           # 领域模型与状态管理
-│   └── types.ts            # TypeScript 类型定义
-├── src-tauri/              # Tauri + Rust 后端
-│   ├── src/
-│   │   ├── lib.rs          # 主入口，命令注册，录音/转写/分离管线
-│   │   ├── db.rs           # SQLite 持久层
-│   │   ├── models.rs       # 数据模型
-│   │   ├── speech.rs       # 语音处理 worker 管理
-│   │   ├── llm.rs          # DeepSeek API 调用
-│   │   ├── keyboard_windows.rs   # Windows 全局键盘钩子
-│   │   ├── recording_windows.rs  # Windows 原生录音 (cpal)
-│   │   ├── ocr.rs               # OCR 图片识别 (RapidOCR worker 管理)
-│   │   └── transcription.rs     # 转写文本数据结构与处理
-│   └── tauri.conf.json     # Tauri 配置（窗口、打包、权限）
-├── workers/                # Python 语音与图像 worker
-│   ├── funasr_asr_worker.py        # SenseVoice 实时转写 + CAM++ 发言人分离
-│   └── ocr_worker.py               # RapidOCR 图片文字识别
-├── scripts/                # 构建脚本
-│   ├── build-windows-x64.ps1       # Windows 构建（含便携 Python 打包）
-│   ├── build-macos-aarch64.sh      # macOS 构建
-│   └── download_python.ps1         # 旧版 Python 下载脚本（仅供兼容）
-├── runtime/                        # 构建阶段使用的固定 Python 依赖清单
-│   └── requirements.lock
+runtime ZIP 不会进入安装包，需要将 ZIP 和对应的 `.sha256` 上传到 `runtime-v1` Release。
+
+## 项目结构
+
+```text
+src/                              React 前端
+src-tauri/src/                    Tauri/Rust 后端
+src-tauri/src/runtime.rs          Python runtime 下载与校验
+src-tauri/src/speech.rs           语音模型与 worker 管理
+src-tauri/src/ocr.rs              OCR worker 管理
+workers/                          Python 语音和 OCR worker
+runtime/requirements.lock         固定 Python 依赖
+scripts/build-windows-x64.ps1     Windows 构建脚本
+scripts/verify-runtime.mjs        构建前 runtime 检查
 ```
 
-### 窗口说明
+## 当前限制
 
-| 窗口标签 | 用途 |
-|----------|------|
-| `console` | 主控制台，需求管理、对接记录、设置 |
-| `pet` | 透明置顶宠物，悬浮快捷面板入口 |
-| `quick-panel` | 快捷面板，快速切换任务、链接拖入 |
-| `hud` | 悬浮提示条，修饰键按下时显示槽位任务概览 |
-
-### 数据存储
-
-SQLite 数据库位于系统应用数据目录下的 `com.hilith.redkey/redkey.sqlite3`。关闭控制台窗口只是隐藏；从系统托盘选择"退出 RedKey"才会完全结束进程。
-
-## 默认快捷键
-
-| 动作 | 快捷键 |
-|------|--------|
-| 槽位 1–0 | `Control+1` 至 `Control+0` |
-
-快捷键可在设置中修改。若新快捷键冲突，RedKey 会拒绝保存并恢复原配置。
-
-## 暂未实现
-
-- Figma Desktop 深链接
-- 多群组管理
-- 自然语言 Shortcut workflow
-- 实体硬件串口连接
-- 应用签名与正式分发
+- Windows 本地 AI 当前只使用 CPU。
+- OCR 首次加载及超大图片识别可能耗时较长，但识别会在后台执行，不应阻塞界面。
+- Windows 安装包尚未进行正式代码签名。

@@ -12,22 +12,16 @@ use std::time::Duration;
 pub const MODEL: &str = "deepseek-v4-flash";
 const KEY_SERVICE: &str = "com.hilith.redkey";
 const KEY_ACCOUNT: &str = "deepseek-api-key";
-const PROMPT_VERSION: &str = "recording-summary-v2";
+const PROMPT_VERSION: &str = "recording-summary-v3";
 
 const RECORDING_SYSTEM: &str = r#"从对话转写中提取待办事项和关键信息。
-- 只根据转写内容提取明确事实，不猜测未提及的文档内容
-- 不确定的信息放入 openQuestions
-- 没有内容的字段返回空数组，不要凑数
-- pendingItems 只保留简短、可执行或需要确认的事项，用于卡片收起态展示
-- confirmedDecisions 仅列出影响后续工作的关键决策，无关紧要的不要列
+- 只根据转写内容提取明确事实，不猜测未提及的文档内容。
+- 只保留两组信息：对接结论与待办行动；没有明确内容时使用空字符串或空数组，不要凑数。
+- 待办行动包含需要执行、跟进或确认的事项；能确定负责人和截止时间时分别填写，无法确定则为 null。
 
 只返回 JSON，不要 Markdown，不要额外解释。字段：
-- overview(string)：一句话结论，没有明确结论则留空字符串
-- pendingItems(string[])：待办事项
-- openQuestions(string[])：需要确认但尚未明确的问题
-- actionItems(array of {text:string,owner:string|null,due:string|null})：具体行动项
-- confirmedDecisions(string[])：关键决策
-- requestedChanges(string[])：明确提出的修改需求"#;
+- overview(string)：简洁的对接结论
+- actionItems(array of {text:string,owner:string|null,due:string|null})：待办行动"#;
 
 const TASK_SYSTEM: &str = r#"从以下材料中提取待办事项，生成简洁的总结。
 - 待办为主：列出需要去做或需要确认的事，每条一行
@@ -161,10 +155,6 @@ fn json_content(value: &str) -> Result<Value> {
     serde_json::from_str(trimmed).context("AI 总结不是有效 JSON")
 }
 
-fn string_vec(value: Option<&Value>) -> Vec<String> {
-    value.and_then(Value::as_array).map(|items| items.iter().filter_map(Value::as_str).map(str::trim).filter(|item| !item.is_empty()).map(ToOwned::to_owned).take(20).collect()).unwrap_or_default()
-}
-
 fn action_items(value: Option<&Value>) -> Vec<ActionItem> {
     value.and_then(Value::as_array).map(|items| items.iter().filter_map(|item| {
         let text = item.get("text")?.as_str()?.trim().to_string();
@@ -194,11 +184,11 @@ pub async fn summarize(document: &TaskDocument, recording_id: &str) -> Result<Re
     Ok(RecordingSummary {
         recording_id: recording_id.into(),
         overview: value.get("overview").and_then(Value::as_str).unwrap_or("").trim().to_string(),
-        pending_items: string_vec(value.get("pendingItems")),
-        confirmed_decisions: string_vec(value.get("confirmedDecisions")),
-        requested_changes: string_vec(value.get("requestedChanges")),
+        pending_items: Vec::new(),
+        confirmed_decisions: Vec::new(),
+        requested_changes: Vec::new(),
         action_items: action_items(value.get("actionItems")),
-        open_questions: string_vec(value.get("openQuestions")),
+        open_questions: Vec::new(),
         source_transcript_hash: Some(transcript_hash(transcript)),
         model: Some(MODEL.into()),
         prompt_version: PROMPT_VERSION.into(),

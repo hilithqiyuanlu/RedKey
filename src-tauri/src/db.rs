@@ -592,6 +592,20 @@ impl Database {
         Ok(())
     }
 
+    pub fn update_image_card_content(&self, card_id: &str, content: &str) -> Result<()> {
+        let task_id: String = self
+            .conn
+            .query_row("SELECT task_id FROM task_image_cards WHERE id=?1", [card_id], |row| row.get(0))
+            .context("图片卡不存在")?;
+        self.ensure_active_task(&task_id)?;
+        anyhow::ensure!(content.chars().count() <= 50_000, "图片文字内容过长");
+        self.conn.execute(
+            "UPDATE task_image_cards SET content=?2,updated_at=?3 WHERE id=?1",
+            params![card_id, content.trim_end(), now()],
+        )?;
+        Ok(())
+    }
+
     pub fn get_image_card(&self, card_id: &str) -> Result<ImageCard> {
         self.conn.query_row(
             "SELECT id,task_id,filename,mime_type,data,content,created_at,updated_at FROM task_image_cards WHERE id=?1",
@@ -1786,6 +1800,22 @@ mod tests {
         let document = db.task_document(&task_id).unwrap();
         assert_eq!(document.text_cards[0].content, "补充异常状态");
         assert_eq!(document.summaries[0].overview, "保留两步流程");
+    }
+
+    #[test]
+    fn updating_image_ocr_text_does_not_rewrite_image_data() {
+        let mut db = Database::memory().unwrap();
+        db.create_task(sample_task(0)).unwrap();
+        let task_id = db.snapshot().unwrap().tasks[0].id.clone();
+        let card = db
+            .create_image_card(&task_id, "paste.png", "image/png", "large-base64-image", "识别中…")
+            .unwrap();
+
+        db.update_image_card_content(&card.id, "识别出的文字").unwrap();
+
+        let updated = db.get_image_card(&card.id).unwrap();
+        assert_eq!(updated.data, "large-base64-image");
+        assert_eq!(updated.content, "识别出的文字");
     }
 
     #[test]

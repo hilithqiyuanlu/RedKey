@@ -110,6 +110,8 @@ export interface ModelStatus {
 export interface AsrModelStatus {
   id: string;
   name: string;
+  group: string;
+  sizeBytes: number;
   bundled: boolean;
   ready: boolean;
   downloading: boolean;
@@ -128,6 +130,8 @@ export interface RuntimeStatus {
   downloadedBytes: number;
   totalBytes: number | null;
   error: string | null;
+  filename: string | null;
+  sizeBytes: number | null;
 }
 
 export interface TaskHudPayload {
