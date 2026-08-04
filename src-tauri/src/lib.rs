@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 #[cfg(target_os = "macos")]
 use std::io::{BufRead, BufReader, Write};
 #[cfg(target_os = "macos")]
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
 #[cfg(target_os = "macos")]
 use std::sync::mpsc;
 use std::time::Duration;
@@ -125,6 +125,9 @@ struct NativeRecording {
     started: std::time::Instant,
     child: Child,
     input: ChildStdin,
+    stderr: Option<ChildStderr>,
+    level: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    level_thread: Option<std::thread::JoinHandle<()>>,
 }
 #[cfg(windows)]
 type NativeRecording = recording_windows::NativeRecording;
@@ -363,6 +366,7 @@ fn prefix_config(value: &str) -> PrefixConfig {
             "Alt" | "Option" => CGEventFlags::CGEventFlagAlternate,
             "Shift" => CGEventFlags::CGEventFlagShift,
             "Command" => CGEventFlags::CGEventFlagCommand,
+            "CapsLock" => CGEventFlags::CGEventFlagAlphaShift,
             _ => CGEventFlags::default(),
         };
     }
@@ -423,7 +427,8 @@ fn install_keyboard_tap(app: &AppHandle, monitor: &KeyboardMonitor) {
                     let modifier_flags = CGEventFlags::CGEventFlagShift
                         | CGEventFlags::CGEventFlagControl
                         | CGEventFlags::CGEventFlagAlternate
-                        | CGEventFlags::CGEventFlagCommand;
+                        | CGEventFlags::CGEventFlagCommand
+                        | CGEventFlags::CGEventFlagAlphaShift;
                     let required = settings.required;
                     let has_required =
                         !required.is_empty() && flags.intersection(required) == required;
@@ -463,11 +468,14 @@ fn start_keyboard_monitor(app: &AppHandle, settings: &ShortcutSettings) -> Keybo
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (sender, receiver) = mpsc::channel();
     let app_handle = app.clone();
+    let error_for_events = error.clone();
     std::thread::spawn(move || {
         for event in receiver {
             match event {
                 KeyboardEvent::Prefix(active) => {
-                    let _ = set_task_hud_visible(&app_handle, active);
+                    if let Err(error) = set_task_hud_visible(&app_handle, active) {
+                        *error_for_events.lock() = Some(format!("HUD 显示失败：{error}"));
+                    }
                 }
                 KeyboardEvent::Action(AppAction::ActivateSlot { slot }) => {
                     let _ = dispatch_internal(&app_handle, AppAction::ActivateSlot { slot });
@@ -1201,6 +1209,12 @@ fn keyboard_listener_status(app: AppHandle) -> Option<String> {
 }
 
 #[tauri::command]
+fn restart_keyboard_listener(app: AppHandle) -> Result<(), String> {
+    let settings = app.state::<RuntimeState>().db().settings().map_err(err)?;
+    update_keyboard_listener(&app, &settings.shortcuts).map_err(err)
+}
+
+#[tauri::command]
 fn create_task(app: AppHandle, input: CreateTaskInput) -> Result<Snapshot, String> {
     app.state::<RuntimeState>()
         .db()
@@ -1507,17 +1521,47 @@ fn start_native_recording(app: AppHandle) -> Result<String, String> {
         };
         let input = child.stdin.take().ok_or("无法连接录音进程")?;
         let stdout = child.stdout.take().ok_or("无法读取录音进程")?;
+        let mut stderr = child.stderr.take();
         let mut reader = BufReader::new(stdout);
         let mut ready = String::new();
         reader.read_line(&mut ready).map_err(err)?;
         if ready.trim() != "READY" {
             let _ = child.kill();
+            let _ = child.wait();
+            let mut stderr_output = String::new();
+            if let Some(mut stream) = stderr.take() {
+                use std::io::Read;
+                let _ = stream.read_to_string(&mut stderr_output);
+            }
+            let detail = stderr_output.lines().find(|line| !line.trim().is_empty());
+            let message = detail
+                .map(|line| format!("无法启动系统麦克风：{}", line.trim()))
+                .unwrap_or_else(|| "无法启动系统麦克风，请检查麦克风权限和输入设备".into());
             app.state::<RuntimeState>()
                 .db()
-                .fail_recording(&id, "无法启动系统麦克风")
+                .fail_recording(&id, &message)
                 .map_err(err)?;
-            return Err("无法启动系统麦克风，请检查麦克风权限".into());
+            return Err(message);
         }
+        let level = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let level_for_thread = level.clone();
+        let level_thread = std::thread::spawn(move || {
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => {
+                        if let Some(value) = line.strip_prefix("LEVEL:") {
+                            if let Ok(value) = value.trim().parse::<f32>() {
+                                level_for_thread.store(
+                                    value.to_bits(),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
         Ok(finalize_native_recording(
             &app,
             NativeRecording {
@@ -1526,6 +1570,9 @@ fn start_native_recording(app: AppHandle) -> Result<String, String> {
                 started: std::time::Instant::now(),
                 child,
                 input,
+                stderr,
+                level,
+                level_thread: Some(level_thread),
             },
         ))
     }
@@ -1558,13 +1605,32 @@ fn stop_native_recording(app: AppHandle) -> Result<Snapshot, String> {
     {
         writeln!(recording.input, "stop").map_err(err)?;
         recording.input.flush().map_err(err)?;
+        let stderr_handle = recording.stderr.take();
+        let stderr_thread = std::thread::spawn(move || {
+            let mut buf = String::new();
+            if let Some(mut s) = stderr_handle {
+                use std::io::Read;
+                let _ = s.read_to_string(&mut buf);
+            }
+            buf
+        });
         let status = recording.child.wait().map_err(err)?;
+        if let Some(handle) = recording.level_thread.take() {
+            let _ = handle.join();
+        }
+        let stderr_output = stderr_thread.join().unwrap_or_default();
         if !status.success() {
+            let detail = stderr_output.lines().find(|line| !line.trim().is_empty());
+            let message = if let Some(detail) = detail {
+                format!("原生录音进程异常退出：{}", detail.trim())
+            } else {
+                "原生录音进程异常退出".to_string()
+            };
             app.state::<RuntimeState>()
                 .db()
-                .fail_recording(&recording.id, "原生录音进程异常退出")
+                .fail_recording(&recording.id, &message)
                 .map_err(err)?;
-            return Err("录音保存失败".into());
+            return Err(message);
         }
     }
     #[cfg(windows)]
@@ -1616,7 +1682,10 @@ fn native_recording_level(app: AppHandle) -> Result<f32, String> {
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = recording;
+        if let Some(rec) = recording.as_ref() {
+            let bits = rec.level.load(std::sync::atomic::Ordering::Relaxed);
+            return Ok(f32::from_bits(bits));
+        }
         return Ok(0.0);
     }
     #[cfg(not(any(windows, target_os = "macos")))]
@@ -2017,6 +2086,7 @@ pub fn run() {
             get_task_summary_prompt,
             get_recording_summary_prompt,
             keyboard_listener_status,
+            restart_keyboard_listener,
             create_task,
             update_task,
             delete_task,

@@ -59,7 +59,7 @@ async function prepareAiOrPrompt(kind: "ocr" | "asr", notify: (message: string) 
     return false;
   }
   if (!runtime.ready) {
-    try { await api.downloadRuntime(); } catch (error) { notify(String(error)); }
+    try { await api.downloadRuntime(); await api.runtimeStatus(); } catch (error) { notify(String(error)); }
   }
   for (const model of missingModels) {
     try { await api.downloadModel(model.id); } catch (error) { notify(String(error)); }
@@ -97,6 +97,7 @@ function ConsoleApp() {
   const [isRecording, setIsRecording] = useState(false);
   const [queueLen, setQueueLen] = useState(0);
   const clockRef = useRef<number | null>(null);
+  const downloads = useDownloadActivity();
 
   const activeTasks = useMemo(() => sortRecent(snapshot?.tasks.filter((task) => task.status === "active" && task.group === "red") ?? []), [snapshot]);
   const overflowTasks = useMemo(() => sortRecent(snapshot?.tasks.filter((task) => task.status === "active") ?? []), [snapshot]);
@@ -180,6 +181,7 @@ function ConsoleApp() {
     }
     try {
       if (taskId) setSnapshot(await api.setCurrentTask(taskId, false));
+      if (!(await api.requestMicrophonePermission())) throw new Error("未获得麦克风权限，请在系统设置中允许 AlphaKey 使用麦克风");
       recordingIdRef.current = await api.startNativeRecording(); nativeRecordingRef.current = true;
       recordingStartedRef.current = Date.now(); startClock(); setIsRecording(true); notify("已开始录音"); setDocumentVersion((value) => value + 1);
       // 录音本身不依赖 AI 组件；仅在缺失时提示一次转写所需下载（不阻塞录音）。
@@ -212,7 +214,7 @@ function ConsoleApp() {
 
   if (!snapshot) return <LoadingState error={error} />;
 
-  return <div className="app-shell">
+  return <div className={`app-shell ${downloads.length ? "has-download" : ""}`}>
     <aside className="sidebar">
       <div className="brand-mark"><span>A</span><div><strong>AlphaKey</strong><small>任务工作台</small></div></div>
       <nav>
@@ -254,9 +256,114 @@ function ConsoleApp() {
     </main>
     {creating && <CreateTaskDialog snapshot={snapshot} setSnapshot={setSnapshot} initialUrl={prefillUrl} initialSlot={prefillSlot} onClose={() => { setCreating(false); setPrefillSlot(null); }} onCreated={(next) => { setSnapshot(next); setCreating(false); setPrefillUrl(""); setPrefillSlot(null); setView("active"); setSelectedId(next.currentTaskId); }} notify={notify} />}
     {overflowTasks.length > 10 && <TaskOverflowDialog tasks={overflowTasks} onResolved={(next) => { setSnapshot(next); setView("active"); setSelectedId(next.currentTaskId); }} notify={notify} />}
+    {downloads.length > 0 && <DownloadStatusBar downloads={downloads} onOpenSettings={() => setView("settings")} />}
     {queueLen > 0 && <div className="toast queue-toast">转写排队中：{queueLen} 个录音</div>}
     {notice && <div className="toast">{notice}</div>}
   </div>;
+}
+
+interface DownloadActivity {
+  id: string;
+  name: string;
+  stage: string;
+  progress: number;
+  sizeBytes: number;
+}
+
+const RUNTIME_ACTIVE_PHASES = new Set(["importing", "downloading", "verifying", "extracting", "checking", "enabling"]);
+
+function normalizeRuntimeStatus(status: RuntimeStatus): RuntimeStatus {
+  return {
+    ...status,
+    downloading: status.downloading || RUNTIME_ACTIVE_PHASES.has(status.phase),
+  };
+}
+
+function useDownloadActivity(): DownloadActivity[] {
+  const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
+  const [models, setModels] = useState<AsrModelStatus[]>([]);
+
+  useEffect(() => {
+    if (!inTauri()) return;
+    let active = true;
+    let stopRuntime: (() => void) | undefined;
+    let stopModels: (() => void) | undefined;
+
+    const refreshRuntime = () => {
+      void api.runtimeStatus().then((value) => {
+        if (active) setRuntime(normalizeRuntimeStatus(value));
+      }).catch(() => undefined);
+    };
+
+    void onRuntimeProgress((value) => { if (active) setRuntime(normalizeRuntimeStatus(value)); }).then((stop) => {
+      if (active) stopRuntime = stop;
+      else stop();
+    });
+    void onAsrModelDownloadProgress((payload) => {
+      if (!active) return;
+      setModels((current) => current.map((model) => model.id === payload.id ? {
+        ...model,
+        downloading: ["下载中", "准备中", "连接中", "校验中", "解压中"].includes(payload.stage) || payload.stage.includes("重试"),
+        progress: payload.progress,
+        stage: payload.stage,
+        error: payload.error,
+        ready: payload.stage === "已就绪",
+      } : model));
+    }).then((stop) => {
+      if (active) stopModels = stop;
+      else stop();
+    });
+    refreshRuntime();
+    void api.asrModelStatuses().then((modelStatuses) => {
+      if (active) setModels(modelStatuses);
+    }).catch(() => undefined);
+    const runtimeTimer = window.setInterval(refreshRuntime, 1000);
+
+    return () => {
+      active = false;
+      window.clearInterval(runtimeTimer);
+      stopRuntime?.();
+      stopModels?.();
+    };
+  }, []);
+
+  return [
+    ...(runtime?.downloading ? [{
+      id: "runtime",
+      name: "CPU 运行环境",
+      stage: runtime.stage,
+      progress: runtime.progress,
+      sizeBytes: runtime.totalBytes ?? runtime.sizeBytes ?? 0,
+    }] : []),
+    ...models.filter((model) => model.downloading).map((model) => ({
+      id: model.id,
+      name: model.name,
+      stage: model.stage,
+      progress: model.progress,
+      sizeBytes: model.sizeBytes,
+    })),
+  ];
+}
+
+function DownloadStatusBar({ downloads, onOpenSettings }: { downloads: DownloadActivity[]; onOpenSettings: () => void }) {
+  const totalSize = downloads.reduce((sum, item) => sum + Math.max(item.sizeBytes, 1), 0);
+  const progress = Math.round(downloads.reduce((sum, item) => sum + item.progress * Math.max(item.sizeBytes, 1), 0) / totalSize);
+  const title = downloads.length === 1
+    ? `${downloads[0].name} · ${downloads[0].stage}`
+    : `${downloads.length} 个本地组件正在下载`;
+  const detail = downloads.map((item) => `${item.name} ${item.progress}%`).join(" · ");
+
+  return <section className="download-status" aria-label="本地组件下载进度">
+    <LoaderCircle className="spin" aria-hidden="true" />
+    <div className="download-status-copy">
+      <div><strong>{title}</strong><span>{progress}%</span></div>
+      <small title={detail}>{detail}</small>
+    </div>
+    <div className="download-status-progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}>
+      <span style={{ width: `${progress}%` }} />
+    </div>
+    <IconButton label="查看下载详情" onClick={onOpenSettings}><SettingsIcon /></IconButton>
+  </section>;
 }
 
 function useTaskDocument(taskId: string | null, snapshot: Snapshot | null, version: number) {
@@ -1194,7 +1301,15 @@ function SettingsView({ snapshot, setSnapshot, notify }: { snapshot: Snapshot; s
 
 function ShortcutPrefix({ value, onSaved, notify }: { value: string; onSaved: (value: Snapshot) => void; notify: (message: string) => void }) {
   const [draft, setDraft] = useState(value); const [capturing, setCapturing] = useState(false); const timer = useRef<number | null>(null);
+  const [listenerError, setListenerError] = useState<string | null>(null);
   useEffect(() => setDraft(value), [value]);
+  useEffect(() => {
+    let active = true;
+    const refresh = () => { void api.keyboardListenerStatus().then((error) => { if (active) setListenerError(error); }).catch(() => undefined); };
+    refresh();
+    const interval = window.setInterval(refresh, 2000);
+    return () => { active = false; window.clearInterval(interval); };
+  }, []);
   function capture(event: React.KeyboardEvent<HTMLButtonElement>) {
     const names: string[] = [];
     if (event.ctrlKey || event.key === "Control") names.push("Control");
@@ -1210,7 +1325,10 @@ function ShortcutPrefix({ value, onSaved, notify }: { value: string; onSaved: (v
     if (timer.current != null) window.clearTimeout(timer.current);
     timer.current = window.setTimeout(() => { void api.saveShortcuts({ taskPrefix: next }).then(onSaved).then(() => notify(`快捷键前缀已设为 ${next}`)).catch((reason) => notify(String(reason))); setCapturing(false); }, 250);
   }
-  return <div className="shortcut-prefix"><span><strong>快捷键前缀</strong><small>点击后按下组合键，支持任意按键</small></span><button className={`shortcut-capture ${capturing ? "capturing" : ""}`} onKeyDown={capture} onKeyUp={() => setCapturing(false)} onClick={(event) => (event.currentTarget as HTMLButtonElement).focus()}>{capturing ? "按下组合键…" : draft || "CapsLock+Alt"}</button></div>;
+  return <>
+    <div className="shortcut-prefix"><span><strong>快捷键前缀</strong><small>点击后按下组合键，支持任意按键</small></span><button className={`shortcut-capture ${capturing ? "capturing" : ""}`} onKeyDown={capture} onKeyUp={() => setCapturing(false)} onClick={(event) => (event.currentTarget as HTMLButtonElement).focus()}>{capturing ? "按下组合键…" : draft || "CapsLock+Alt"}</button></div>
+    {listenerError && <div className="shortcut-error"><CircleAlert /><span><strong>全局快捷键不可用</strong><small>{listenerError.includes("accessibility") ? "请在系统设置的“隐私与安全性 → 辅助功能”中允许 AlphaKey。" : listenerError}</small></span><button onClick={() => void api.restartKeyboardListener().then(() => api.keyboardListenerStatus()).then(setListenerError).then(() => notify("已重新连接全局快捷键")).catch((reason) => notify(String(reason)))}>重新连接</button></div>}
+  </>;
 }
 
 function SnapshotTools({ setSnapshot, notify }: { setSnapshot: (value: Snapshot) => void; notify: (message: string) => void }) {
@@ -1249,7 +1367,8 @@ function RuntimeManager({ notify }: { notify: (message: string) => void }) {
     void refresh();
     let cleanup: (() => void) | undefined;
     void onRuntimeProgress(setStatus).then((stop) => { cleanup = stop; });
-    return () => cleanup?.();
+    const timer = setInterval(() => { void refresh(); }, 2000);
+    return () => { cleanup?.(); clearInterval(timer); };
   }, []);
 
   async function importLocal() {
@@ -1274,7 +1393,7 @@ function RuntimeManager({ notify }: { notify: (message: string) => void }) {
           ) : downloading ? (
             <button onClick={() => void api.cancelRuntimeDownload()}>取消</button>
           ) : (
-            <button className="primary" onClick={() => void api.downloadRuntime().catch((error) => notify(String(error)))}>
+            <button className="primary" onClick={() => void api.downloadRuntime().then(() => refresh()).catch((error) => notify(String(error)))}>
               {status?.error ? "重试下载" : "下载运行环境"}
             </button>
           )}

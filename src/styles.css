@@ -73,9 +73,14 @@ select:focus-visible {
 .app-shell {
   display: grid;
   grid-template-columns: 188px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   width: 100%;
   height: 100%;
   background: var(--bg);
+}
+
+.app-shell.has-download {
+  grid-template-rows: minmax(0, 1fr) auto;
 }
 
 .sidebar {
@@ -103,6 +108,72 @@ select:focus-visible {
 .main-view:has(.settings-page) .settings-page {
   padding-bottom: 0;
 }
+
+.download-status {
+  z-index: 80;
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: 18px minmax(180px, 1fr) minmax(120px, 32vw) 32px;
+  align-items: center;
+  gap: 12px;
+  min-height: 58px;
+  padding: 8px 16px;
+  border-top: 1px solid var(--border-l3);
+  background: var(--bg-secondary);
+  box-shadow: 0 -2px 0 rgba(0, 0, 0, 0.45);
+}
+.download-status > svg {
+  width: 17px;
+  height: 17px;
+  color: var(--accent);
+}
+.download-status-copy {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+.download-status-copy > div {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+.download-status-copy strong {
+  overflow: hidden;
+  font-size: 11px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.download-status-copy span,
+.download-status-copy small {
+  color: var(--muted);
+  font-size: 10px;
+}
+.download-status-copy span { flex-shrink: 0; }
+.download-status-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.download-status-progress {
+  height: 6px;
+  overflow: hidden;
+  background: var(--surface-alt);
+}
+.download-status-progress > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+.download-status .icon-button {
+  width: 32px;
+  height: 32px;
+}
+.download-status .icon-button svg { width: 15px; height: 15px; }
+.app-shell.has-download .slot-nav-bar { bottom: 78px; }
+.app-shell.has-download .toast { bottom: 162px; }
 
 .active-view {
   display: flex;
@@ -2186,6 +2257,20 @@ button.primary:hover,
   min-height: 57px;
   border-top: 1px solid var(--border-l1);
 }
+.shortcut-error {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 10px;
+  padding: 9px 10px;
+  border: 1px solid rgba(239, 68, 68, 0.55);
+  background: var(--red-soft);
+}
+.shortcut-error > svg { flex-shrink: 0; color: var(--destructive); width: 16px; }
+.shortcut-error > span { display: grid; min-width: 0; gap: 3px; flex: 1; }
+.shortcut-error strong { font-size: 11px; font-weight: 500; }
+.shortcut-error small { color: var(--muted); font-size: 10px; line-height: 1.4; }
+.shortcut-error button { flex-shrink: 0; }
 .shortcut-prefix > span { display: grid; gap: 3px; }
 .shortcut-prefix strong { font-size: 12px; font-weight: 500; }
 .shortcut-prefix small { color: var(--muted); font-size: 10px; }
@@ -3208,5 +3293,10 @@ button.primary:hover,
   .model-progress { width: 100%; }
   .runtime-row { grid-template-columns: 1fr; gap: 10px; padding: 12px 0; }
   .runtime-actions { justify-content: flex-start; }
+  .download-status {
+    grid-template-columns: 18px minmax(0, 1fr) 32px;
+    gap: 9px;
+    padding-inline: 10px;
+  }
+  .download-status-progress { grid-column: 1 / -1; width: 100%; }
 }
-

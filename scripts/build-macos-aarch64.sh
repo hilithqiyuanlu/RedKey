@@ -55,7 +55,7 @@ if [ ! -f "$runtime_stamp" ]; then
   "$python" -m pip --version >/dev/null 2>&1 || error "便携 Python 缺少 pip，请重新下载完整 runtime"
   "$python" -m pip install --disable-pip-version-check --no-input --no-cache-dir -r "$requirements" \
     || error "安装固定 Python 依赖失败"
-  "$python" -c 'import funasr, torch, torchaudio, modelscope, sentencepiece, soundfile, numpy, rapidocr_onnxruntime' \
+  "$python" -c 'import funasr, torch, torchaudio, modelscope, sentencepiece, soundfile, numpy, cv2, rapidocr_onnxruntime, onnxruntime' \
     || error "Python 依赖健康检查失败"
   find "$python_root" -maxdepth 1 \( -name '.dependencies-*' -o -name '.alphakey-runtime-*' \) -delete
   touch "$runtime_stamp"

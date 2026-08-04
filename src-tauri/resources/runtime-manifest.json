@@ -6,6 +6,12 @@
                                       "url":  "https://github.com/hilithqiyuanlu/RedKey/releases/download/runtime-v1/python-runtime-win-x64-v1.zip",
                                       "sha256":  "9ce1726ab67482b0c8651dcc3ee0e72fe0aef7ea1bc75c1c616ac6f25e80af90",
                                       "size_bytes":  347274775
-                                  }
+                                  },
+                      "mac-aarch64":  {
+                                          "filename":  "python-runtime-mac-aarch64-v1.zip",
+                                          "url":  "https://github.com/hilithqiyuanlu/RedKey/releases/download/runtime-v1/python-runtime-mac-aarch64-v1.zip",
+                                          "sha256":  "f2621e0048a7e1b32720263e3fe829761fd11d5a5cea21ae6f024d72bb606fdc",
+                                          "size_bytes":  398455054
+                                      }
                   }
 }

@@ -102,6 +102,7 @@ fn python_in(dir: &Path) -> Option<PathBuf> {
         vec![dir.join("python/python.exe"), dir.join("python.exe")]
     } else {
         vec![
+            dir.join("python/bin/python3.11"),
             dir.join("python/bin/python3"),
             dir.join("python/bin/python"),
         ]
@@ -109,8 +110,8 @@ fn python_in(dir: &Path) -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
-fn run_python_check(python: &Path) -> bool {
-    crate::no_window(
+fn run_python_check(python: &Path) -> std::result::Result<(), String> {
+    let output = crate::no_window(
         Command::new(python)
             .args(["-c", IMPORT_CHECK])
             .env("PYTHONUTF8", "1")
@@ -118,8 +119,14 @@ fn run_python_check(python: &Path) -> bool {
             .env("PYTHONUNBUFFERED", "1"),
     )
     .output()
-    .map(|output| output.status.success())
-    .unwrap_or(false)
+    .map_err(|error| format!("无法启动 {}：{error}", python.display()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() { stderr } else if !stdout.is_empty() { stdout } else { format!("退出状态 {}", output.status) };
+    Err(format!("{}：{detail}", python.display()))
 }
 
 fn find_system_python() -> Result<PathBuf> {
@@ -168,7 +175,7 @@ fn verified_python_path(app: &AppHandle) -> Result<PathBuf> {
     }
 
     if let Some(python) = installed_python(app) {
-        if run_python_check(&python) {
+        if run_python_check(&python).is_ok() {
             *READY_CACHE.lock().unwrap() = Some(true);
             return Ok(python);
         }
@@ -177,7 +184,7 @@ fn verified_python_path(app: &AppHandle) -> Result<PathBuf> {
 
     if cfg!(debug_assertions) {
         let python = find_system_python()?;
-        if run_python_check(&python) {
+        if run_python_check(&python).is_ok() {
             *READY_CACHE.lock().unwrap() = Some(true);
             return Ok(python);
         }
@@ -232,9 +239,11 @@ static CANCEL: LazyLock<Mutex<Option<Arc<AtomicBool>>>> =
     LazyLock::new(|| Mutex::new(None));
 
 fn set_progress(app: &AppHandle, mutate: impl FnOnce(&mut RuntimeStatus)) {
+    let downloading = CANCEL.lock().unwrap().is_some();
     let snapshot = {
         let mut status = PROGRESS.lock().unwrap();
         mutate(&mut status);
+        status.downloading = downloading;
         status.clone()
     };
     let _ = app.emit(PROGRESS_EVENT, snapshot);
@@ -337,6 +346,7 @@ async fn install_flow(
     let download_dir = base.join(".download");
     fs::create_dir_all(&download_dir).context("无法创建下载缓存目录")?;
     let zip_path = download_dir.join(&entry.filename);
+    let expected = entry.sha256.trim().to_lowercase();
 
     let digest = if let Some(local) = local_zip {
         set_progress(app, |status| {
@@ -346,6 +356,19 @@ async fn install_flow(
         });
         fs::copy(local, &zip_path).context("复制导入的运行环境失败")?;
         hash_file(&zip_path, &cancel)?
+    } else if zip_path.is_file() {
+        set_progress(app, |status| {
+            status.phase = "verifying".into();
+            status.stage = "校验下载缓存".into();
+            status.progress = 100;
+        });
+        let cached_digest = hash_file(&zip_path, &cancel)?;
+        if cached_digest == expected {
+            cached_digest
+        } else {
+            let _ = fs::remove_file(&zip_path);
+            download_with_retry(app, &entry, &zip_path, &cancel).await?
+        }
     } else {
         download_with_retry(app, &entry, &zip_path, &cancel).await?
     };
@@ -355,7 +378,6 @@ async fn install_flow(
         status.phase = "verifying".into();
         status.stage = "校验完整性".into();
     });
-    let expected = entry.sha256.trim().to_lowercase();
     if digest != expected {
         let _ = fs::remove_file(&zip_path);
         bail!("运行环境 SHA-256 校验失败：期望 {expected}，实际 {digest}");
@@ -379,12 +401,21 @@ async fn install_flow(
         status.stage = "运行环境自检".into();
     });
     let staged_python = python_in(&staging).context("解压后未找到 Python")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&staged_python)
+            .context("读取 Python 文件权限失败")?
+            .permissions();
+        permissions.set_mode(permissions.mode() | 0o755);
+        fs::set_permissions(&staged_python, permissions).context("设置 Python 可执行权限失败")?;
+    }
     if !marker_path(&staging).is_file() {
         fs::write(marker_path(&staging), RUNTIME_VERSION).context("写入运行环境标记失败")?;
     }
-    if !run_python_check(&staged_python) {
+    if let Err(message) = run_python_check(&staged_python) {
         let _ = fs::remove_dir_all(long_path(&staging));
-        bail!("CPU 运行环境自检失败");
+        bail!("CPU 运行环境自检失败：{message}");
     }
 
     set_progress(app, |status| {
@@ -475,33 +506,71 @@ async fn download_once(
 ) -> Result<String> {
     use tokio::io::AsyncWriteExt;
 
+    let partial = zip_path.with_extension("zip.partial");
+    let mut downloaded = fs::metadata(&partial).map(|metadata| metadata.len()).unwrap_or(0);
+    if entry.size_bytes.is_some_and(|total| downloaded > total) {
+        let _ = fs::remove_file(&partial);
+        downloaded = 0;
+    }
+    if entry.size_bytes == Some(downloaded) && downloaded > 0 {
+        if zip_path.exists() {
+            let _ = fs::remove_file(zip_path);
+        }
+        fs::rename(&partial, zip_path).context("启用已完成的下载缓存失败")?;
+        return hash_file(zip_path, cancel);
+    }
     set_progress(app, |status| {
         status.phase = "downloading".into();
-        status.stage = "下载中".into();
+        status.stage = if downloaded > 0 { "继续下载".into() } else { "下载中".into() };
+        status.downloaded_bytes = downloaded;
+        status.total_bytes = entry.size_bytes;
+        status.progress = entry
+            .size_bytes
+            .filter(|total| *total > 0)
+            .map_or(0, |total| (downloaded.saturating_mul(100) / total) as u8);
     });
-    let mut response = reqwest::Client::new()
-        .get(&entry.url)
-        .send()
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .build()
+        .context("无法创建下载客户端")?;
+    let mut request = client.get(&entry.url);
+    if downloaded > 0 {
+        request = request.header(reqwest::header::RANGE, format!("bytes={downloaded}-"));
+    }
+    let mut response = tokio::time::timeout(Duration::from_secs(30), request.send())
         .await
+        .context("连接下载服务器超时")?
         .context("无法连接下载服务器")?;
     if !response.status().is_success() {
         bail!("下载服务器返回 {}", response.status());
     }
-    let total = response.content_length().or(entry.size_bytes);
-    let partial = zip_path.with_extension("zip.partial");
-    let mut file = tokio::fs::File::create(&partial)
+    let resumed = downloaded > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    if downloaded > 0 && !resumed {
+        downloaded = 0;
+    }
+    let total = entry
+        .size_bytes
+        .or_else(|| response.content_length().map(|length| length + downloaded));
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(resumed)
+        .truncate(!resumed)
+        .open(&partial)
         .await
-        .context("无法创建临时文件")?;
-    let mut hasher = Sha256::new();
-    let mut downloaded = 0u64;
-    while let Some(chunk) = response.chunk().await.context("下载中断")? {
+        .context("无法打开下载临时文件")?;
+    loop {
+        let chunk = tokio::time::timeout(Duration::from_secs(30), response.chunk())
+            .await
+            .context("下载 30 秒无数据，准备重试")?
+            .context("下载中断")?;
+        let Some(chunk) = chunk else { break };
         if cancel.load(Ordering::Acquire) {
             drop(file);
             let _ = tokio::fs::remove_file(&partial).await;
             bail!("已取消");
         }
         file.write_all(&chunk).await.context("写入临时文件失败")?;
-        hasher.update(&chunk);
         downloaded += chunk.len() as u64;
         let progress = total
             .filter(|total| *total > 0)
@@ -514,7 +583,7 @@ async fn download_once(
     }
     file.flush().await.context("刷新临时文件失败")?;
     drop(file);
-    if let Some(total) = response.content_length() {
+    if let Some(total) = total {
         if downloaded != total {
             bail!("下载不完整：预期 {total} 字节，实际 {downloaded} 字节");
         }
@@ -523,7 +592,7 @@ async fn download_once(
         let _ = fs::remove_file(zip_path);
     }
     fs::rename(&partial, zip_path).context("启用下载文件失败")?;
-    Ok(hex(hasher.finalize().as_slice()))
+    hash_file(zip_path, cancel)
 }
 
 fn hash_file(path: &Path, cancel: &Arc<AtomicBool>) -> Result<String> {
@@ -563,8 +632,27 @@ fn extract_zip_verified(
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(long_path(parent)).context("创建父目录失败")?;
             }
+            #[cfg(unix)]
+            if entry.is_symlink() {
+                use std::os::unix::fs::symlink;
+                let mut link = String::new();
+                entry.read_to_string(&mut link).context("读取符号链接失败")?;
+                let link = Path::new(link.trim_end_matches('\0'));
+                if link.is_absolute() || link.components().any(|component| matches!(component, std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_))) {
+                    bail!("压缩包包含非法符号链接：{}", target.display());
+                }
+                symlink(link, long_path(&target)).context("创建符号链接失败")?;
+                continue;
+            }
             let mut output = fs::File::create(long_path(&target)).context("创建解压文件失败")?;
             io::copy(&mut entry, &mut output).context("解压失败（可能 CRC 校验不通过）")?;
+            drop(output);
+            #[cfg(unix)]
+            if let Some(mode) = entry.unix_mode() {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(long_path(&target), fs::Permissions::from_mode(mode & 0o777))
+                    .context("恢复文件权限失败")?;
+            }
         }
         if index % 200 == 0 || index + 1 == total {
             set_progress(app, |status| {

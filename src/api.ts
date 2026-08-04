@@ -83,6 +83,7 @@ export const api = {
   setPetVisible: (visible: boolean) => invoke<Snapshot>("set_pet_visible", { visible }),
   saveShortcuts: (shortcuts: ShortcutSettings) => invoke<Snapshot>("save_shortcuts", { shortcuts }),
   keyboardListenerStatus: () => invoke<string | null>("keyboard_listener_status"),
+  restartKeyboardListener: () => invoke<void>("restart_keyboard_listener"),
   requestMicrophonePermission: () => invoke<boolean>("request_microphone_permission"),
   startNativeRecording: () => invoke<string>("start_native_recording"),
   stopNativeRecording: () => invoke<Snapshot>("stop_native_recording"),
